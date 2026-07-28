@@ -1,11 +1,16 @@
-//! Binary Treemap 算法
+//! Binary Treemap 算法 — 两遍扫描 + 最小矩形保护
 //!
-//! 递归二分分割：找到累计面积的中点，垂直或水平分割，再递归处理两侧。
-//! 相比 squarified 产生更错落有致的矩形分布，接近 SpaceSniffer 效果。
-//! 参考：Speedy37/streemap-rs (MIT)
+//! 1) 第一遍：按比例二分分割，计算所有子矩形。
+//! 2) 检查：任何宽或高 < MIN_BLOCK_PX 的块被标记为"不渲染"。
+//! 3) 剔除不渲染块的面积，按比例重新分配给剩余块。
+//! 4) 重复 1-3 直到所有剩余块 >= MIN_BLOCK_PX。
+//!
+//! 这样保证画出来的每个块都是可见可点击的，不会出现细条或点状块。
+//! 参考：Speedy37/streemap-rs Binary 算法 + 两遍扫描思路
 
-/// 间距（像素），算法层统一处理
 pub const LAYOUT_PAD: f32 = 2.0;
+/// 最小可见块边长（像素）。小于此值的块在算法层就被剔除，不占用空间。
+const MIN_BLOCK_PX: f32 = 6.0;
 
 fn shrink(r: egui::Rect, pad: f32) -> egui::Rect {
     let h = pad * 0.5;
@@ -15,7 +20,7 @@ fn shrink(r: egui::Rect, pad: f32) -> egui::Rect {
     )
 }
 
-/// 递归二分分割
+/// 二分分割（核心布局）
 fn binary_split(
     rect: egui::Rect,
     indices: &mut [usize],
@@ -32,7 +37,6 @@ fn binary_split(
         return;
     }
 
-    // 计算前缀和
     let mut prefix = Vec::with_capacity(n);
     let mut total = 0.0_f32;
     for &idx in indices.iter() {
@@ -40,17 +44,21 @@ fn binary_split(
         prefix.push(total);
     }
 
-    // 找中点：累计面积达到 total/2 的位置
     let target = total * 0.5;
-    let mid = match prefix.binary_search_by(|&p| p.partial_cmp(&target).unwrap_or(std::cmp::Ordering::Less)) {
+    let mid = match prefix.binary_search_by(|&p| {
+        if p > target {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        }
+    }) {
         Ok(i) => i + 1,
-        Err(i) => i.max(1),
-    };
-    let mid = mid.min(n - 1); // 保证两侧都至少有 1 个
+        Err(0) => 1,
+        Err(i) => i,
+    }
+    .min(n - 1);
 
-    // 根据宽高比决定分割方向
     if rect.width() >= rect.height() {
-        // 垂直分割（左右）
         let left_frac = prefix[mid - 1] / total;
         let xm = rect.min.x + rect.width() * left_frac;
         let left = egui::Rect::from_min_max(rect.min, egui::pos2(xm, rect.max.y));
@@ -58,7 +66,6 @@ fn binary_split(
         binary_split(left, &mut indices[..mid], scaled, out, pad);
         binary_split(right, &mut indices[mid..], scaled, out, pad);
     } else {
-        // 水平分割（上下）
         let top_frac = prefix[mid - 1] / total;
         let ym = rect.min.y + rect.height() * top_frac;
         let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, ym));
@@ -68,12 +75,13 @@ fn binary_split(
     }
 }
 
-/// 计算 treemap 布局。
-/// 返回每个子项对应的 egui::Rect（已包含 LAYOUT_PAD 间距，直接用于渲染）。
+/// 计算 treemap 布局（两遍扫描 + 最小矩形保护）。
 ///
-/// 算法：将 items 按面积比例缩放到 rect 内，
-/// 然后递归二分分割，每次在累计中点处垂直或水平切开。
-/// 不去优化宽高比，而是让块按面积自然错落分布。
+/// 返回的 `Vec<Rect>` 与输入 `sizes` ——对应。
+/// - 宽 >= MIN_BLOCK_PX 且 高 >= MIN_BLOCK_PX 的块是有效矩形。
+/// - 小于此值的块返回 `Rect::NOTHING`，调用方跳过绘制即可。
+///
+/// `Rect::NOTHING` 块不占用实际像素空间（其面积已重新分配给剩余块）。
 pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
     let n = sizes.len();
     let mut out = vec![egui::Rect::NOTHING; n];
@@ -81,24 +89,96 @@ pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
         return out;
     }
 
-    let total: f64 = sizes.iter().map(|&s| s.max(1) as f64).sum();
-    let area = rect.width() as f64 * rect.height() as f64;
+    // 活跃标记：true = 参与布局，false = 已被剔除
+    let mut active: Vec<bool> = vec![true; n];
 
-    // 大文件压缩：最大项占比 >50% 时用 pow 压缩，避免极端宽高比
-    let max_frac = sizes.iter().map(|&s| s.max(1) as f64 / total).fold(0.0_f64, f64::max);
-    let scaled: Vec<f32> = if max_frac > 0.5 {
-        let pow = 0.72_f64;
-        let ct: f64 = sizes.iter().map(|&s| (s.max(1) as f64).powf(pow)).sum();
-        sizes.iter().map(|&s| ((s.max(1) as f64).powf(pow) / ct * area) as f32).collect()
-    } else {
-        let scale = area / total;
-        sizes.iter().map(|&s| (s.max(1) as f64 * scale) as f32).collect()
-    };
+    for _iter in 0..12 {
+        // 最多迭代 12 轮
 
-    // 降序排列（Binary 在此顺序下效果最好）
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]));
+        // ── 第一遍：计算总大小 & 缩放 ──
+        let total: f64 = active
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a)
+            .map(|(i, _)| sizes[i].max(1) as f64)
+            .sum();
+        if total <= 0.0 {
+            break;
+        }
+        let area = rect.width() as f64 * rect.height() as f64;
 
-    binary_split(rect, &mut order, &scaled, &mut out, LAYOUT_PAD);
+        // 大文件压缩
+        let max_frac = active
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a)
+            .map(|(i, _)| sizes[i].max(1) as f64 / total)
+            .fold(0.0_f64, f64::max);
+        let scaled: Vec<f32> = if max_frac > 0.5 {
+            let pow = 0.72_f64;
+            let ct: f64 = sizes
+                .iter()
+                .enumerate()
+                .filter(|(_, _)| true)
+                .map(|(i, _)| {
+                    if active[i] {
+                        (sizes[i].max(1) as f64).powf(pow)
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    if active[i] {
+                        ((s.max(1) as f64).powf(pow) / ct * area) as f32
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        } else {
+            let scale = area / total;
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    if active[i] {
+                        (s.max(1) as f64 * scale) as f32
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
+
+        // ── 布局：降序排列后二分分割 ──
+        let mut order: Vec<usize> = (0..n).filter(|&i| active[i]).collect();
+        order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]));
+        let mut tmp = vec![egui::Rect::NOTHING; n];
+        binary_split(rect, &mut order, &scaled, &mut tmp, LAYOUT_PAD);
+
+        // ── 第二遍：检查最小尺寸，剔除不合格项 ──
+        let mut any_small = false;
+        for &i in &order {
+            let r = tmp[i];
+            if r.width() < MIN_BLOCK_PX || r.height() < MIN_BLOCK_PX {
+                active[i] = false;
+                any_small = true;
+            }
+        }
+
+        if !any_small {
+            // 全部合格 → 输出最终结果
+            for &i in &order {
+                out[i] = tmp[i];
+            }
+            break;
+        }
+        // 有小块 → 剔除后重新迭代
+    }
+
     out
 }
