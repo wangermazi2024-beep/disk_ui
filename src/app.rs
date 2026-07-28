@@ -310,11 +310,10 @@ impl DiskUiApp {
             }
             TreeAction::ZoomTo(path) => {
                 self.zoom_path = path.clone();
-                // 放大到新层级时重置该路径上所有节点的 inline 展开状态，
-                // 避免之前手动展开的子块在新视图里继续显示嵌套色块。
-                if let Some(n) = self.root.navigate_mut(&path) {
-                    n.collapse_all();
-                }
+                // 清理整棵树所有节点的 inline 展开状态：
+                // 用户导航到新层级（无论是双击 ZoomTo 还是面包屑跳转），
+                // 希望看到干净视图，不保留之前在其他层展开的残留子块。
+                self.root.collapse_all();
                 self.selected = Some(path);
             }
         }
