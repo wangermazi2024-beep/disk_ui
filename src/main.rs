@@ -28,6 +28,8 @@ struct DiskUiApp {
     scanning: bool,
     scan_progress: f32,
     selected: Option<usize>,
+    sort_col: usize,
+    sort_asc: bool,
 }
 
 impl Default for DiskUiApp {
@@ -65,6 +67,8 @@ impl Default for DiskUiApp {
             scanning: false,
             scan_progress: 0.0,
             selected: None,
+            sort_col: 0,
+            sort_asc: true,
         }
     }
 }
@@ -407,68 +411,65 @@ impl eframe::App for DiskUiApp {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // ---------- 固定表头（不随表格滚动） ----------
+                // ---------- 表格（TableBuilder 自带固定表头 + 可滚动体） ----------
                 ui.label(RichText::new("文件明细").strong().size(14.0));
                 ui.add_space(4.0);
 
-                let header_bg = Color32::from_rgb(0x2A, 0x2C, 0x30);
-                let header_h = 22.0;
-                egui::Frame::default()
-                    .fill(header_bg)
-                    .inner_margin(egui::Margin::symmetric(6.0, 0.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // 名称列（剩余宽度）
-                            let name_w = ui.available_width() - 90.0 - 110.0;
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(name_w.max(50.0), header_h),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(RichText::new("名称").strong().size(12.5).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
-                                },
-                            );
-                            // 类型列
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(90.0, header_h),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(RichText::new("类型").strong().size(12.5).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
-                                },
-                            );
-                            // 大小列
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(110.0, header_h),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(RichText::new("大小").strong().size(12.5).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
-                                },
-                            );
-                        });
-                    });
+                // 排序：按点击的列切换排序方向
+                let mut sorted: Vec<&FileNode> = self.nodes.iter().collect();
+                match self.sort_col {
+                    0 => sorted.sort_by(|a, b| a.name.cmp(&b.name)),
+                    1 => sorted.sort_by(|a, b| a.kind.cmp(&b.kind)),
+                    2 => sorted.sort_by(|a, b| a.size.cmp(&b.size)),
+                    _ => {}
+                }
+                if !self.sort_asc {
+                    sorted.reverse();
+                }
 
-                // ---------- 表格体（可滚动） ----------
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui_extras::TableBuilder::new(ui)
-                            .striped(true)
-                            .column(egui_extras::Column::remainder().at_least(200.0))
-                            .column(egui_extras::Column::exact(90.0))
-                            .column(egui_extras::Column::exact(110.0))
-                            .body(|mut body| {
-                                for n in &self.nodes {
-                                    body.row(20.0, |mut row| {
-                                        row.col(|ui| {
-                                            let icon = if n.kind == "folder" { "📁" } else { "📄" };
-                                            ui.label(format!("{icon} {}", n.name));
-                                        });
-                                        row.col(|ui| { ui.label(n.kind); });
-                                        row.col(|ui| { ui.label(human_size(n.size)); });
-                                    });
-                                }
+                egui_extras::TableBuilder::new(ui)
+                    .striped(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(egui_extras::Column::remainder().at_least(200.0).resizable(true))
+                    .column(egui_extras::Column::exact(90.0).resizable(true))
+                    .column(egui_extras::Column::exact(110.0).resizable(true))
+                    .header(22.0, |mut header| {
+                        header.col(|ui| {
+                            let sort_ind = if self.sort_col == 0 { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                            let resp = ui.label(RichText::new(format!("名称{sort_ind}")).strong().size(12.5));
+                            if resp.clicked() {
+                                if self.sort_col == 0 { self.sort_asc = !self.sort_asc; }
+                                else { self.sort_col = 0; self.sort_asc = true; }
+                            }
+                        });
+                        header.col(|ui| {
+                            let sort_ind = if self.sort_col == 1 { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                            let resp = ui.label(RichText::new(format!("类型{sort_ind}")).strong().size(12.5));
+                            if resp.clicked() {
+                                if self.sort_col == 1 { self.sort_asc = !self.sort_asc; }
+                                else { self.sort_col = 1; self.sort_asc = true; }
+                            }
+                        });
+                        header.col(|ui| {
+                            let sort_ind = if self.sort_col == 2 { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                            let resp = ui.label(RichText::new(format!("大小{sort_ind}")).strong().size(12.5));
+                            if resp.clicked() {
+                                if self.sort_col == 2 { self.sort_asc = !self.sort_asc; }
+                                else { self.sort_col = 2; self.sort_asc = true; }
+                            }
+                        });
+                    })
+                    .body(|mut body| {
+                        for n in &sorted {
+                            body.row(20.0, |mut row| {
+                                row.col(|ui| {
+                                    let icon = if n.kind == "folder" { "📁" } else { "📄" };
+                                    ui.label(format!("{icon} {}", n.name));
+                                });
+                                row.col(|ui| { ui.label(n.kind); });
+                                row.col(|ui| { ui.label(human_size(n.size)); });
                             });
-                        // 底部留白，确保滚到最下面时最后一行完整可见、不贴边
-                        ui.add_space(16.0);
+                        }
                     });
             });
 
