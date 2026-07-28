@@ -11,7 +11,7 @@ use egui::{Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, StrokeKi
 
 use crate::format::{human_size, truncate_text};
 use crate::model::{Node, NodePath};
-use crate::treemap::{compute_treemap, LAYOUT_PAD};
+use crate::treemap::compute_treemap;
 
 use super::TreeAction;
 
@@ -35,91 +35,39 @@ pub fn show(
     base_path: &[usize],
     selected: &Option<NodePath>,
     parent_node: Option<&Node>,
-    parent_base_path: Option<&[usize]>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
 
-    // 1) 父层背景：如果有父层，先画父层颜色铺满整个 rect，
-    //    然后在父层中为当前层找一个合适的占据位置（铺满父层去掉标签后的区域）。
-    //    这样实现"双击后保留上层，当前层作为内嵌展开"的效果。
-    let children_rect = if let (Some(parent), Some(parent_base)) = (parent_node, parent_base_path) {
-        // 画父层背景
-        {
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, CornerRadius::same(2), parent.color);
-        }
-
-        // 父层标签（左上角）
-        let name_font = FontId::proportional(11.0);
-        let text_max = (rect.width() - 28.0).max(20.0);
-        let shown = truncate_text(ui.ctx(), &parent.name, name_font.clone(), text_max);
-        let label = format!("⬆ {}", shown);
+    // 双击放大后，上层作为整个 treemap 的背景填充，当前层子色块绘制在内部。
+    // 就像 inline 展开一样，只是父层变成了整个画面。
+    // 返回上层由面包屑处理，treemap 本身不渲染返回按钮。
+    let draw_rect = if let Some(parent) = parent_node {
+        // 父层背景 + 名称（像普通色块一样在左上角画标签）
         let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(2), parent.color);
+        let shown = truncate_text(ui.ctx(), &parent.name, FontId::proportional(10.0), (rect.width() - 12.0).max(20.0));
         painter.text(
-            rect.left_top() + Vec2::new(6.0, 3.0),
+            rect.left_top() + Vec2::new(4.0, 2.0),
             egui::Align2::LEFT_TOP,
-            &label,
-            name_font,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 235),
+            &shown,
+            FontId::proportional(10.0),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 200),
         );
-
-        // 点击父层背景 = 返回上一层
-        let up_id = ui.id().with("go_up");
-        let up_resp = ui.interact(rect, up_id, egui::Sense::click());
-        if up_resp.clicked() && !up_resp.double_clicked() {
-            // 只有点击父层空白区（不被子块消耗）才触发
-            if matches!(action, TreeAction::None) {
-                action = TreeAction::ZoomTo(parent_base.to_vec());
-            }
-        }
-        if ui.rect_contains_pointer(rect) {
-            show_up_tooltip(ui, up_id, parent);
-        }
-
-        // 当前层区域 = 父层 rect 去掉顶部标签高度，并留内边距
-        let pad = LAYOUT_PAD;
+        // 子层区域：父层内部去掉顶部标签空间
         Rect::from_min_max(
-            Pos2::new(rect.min.x + pad, rect.min.y + NEST_TOP + pad),
-            Pos2::new(rect.max.x - pad, rect.max.y - pad),
+            Pos2::new(rect.min.x, rect.min.y + NEST_TOP + 2.0),
+            rect.max,
         )
     } else {
         rect
     };
 
-    // 2) 画当前层背景色
-    {
-        let painter = ui.painter_at(children_rect);
-        painter.rect_filled(children_rect, CornerRadius::same(2), view_root.color);
-    }
-
-    // 3) 当前层子色块
     let mut path = base_path.to_vec();
-    draw_children(ui, children_rect, view_root, &mut path, 0, selected, &mut action);
+    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action);
     action
 }
 
-fn show_up_tooltip(ui: &egui::Ui, id: egui::Id, parent: &Node) {
-    let mouse = ui.ctx().pointer_latest_pos().unwrap_or_default();
-    egui::Area::new(id.with("tip"))
-        .fixed_pos(mouse + Vec2::new(14.0, -18.0))
-        .order(egui::Order::Tooltip)
-        .interactable(false)
-        .show(ui.ctx(), |ui| {
-            egui::Frame::default()
-                .fill(Color32::from_rgb(0x2A, 0x2C, 0x32))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x60)))
-                .corner_radius(CornerRadius::same(5))
-                .inner_margin(egui::Margin::symmetric(8, 5))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(format!("⬆ 返回 {}", parent.name)).color(Color32::WHITE));
-                    ui.label(
-                        RichText::new("单击父层区域 = 返回上一层")
-                            .size(10.5)
-                            .color(Color32::from_rgb(0xA0, 0xA0, 0xA0)),
-                    );
-                });
-        });
-}
+
 
 #[allow(clippy::too_many_arguments)]
 fn draw_children(

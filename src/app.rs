@@ -179,12 +179,12 @@ impl DiskUiApp {
                     None
                 } else {
                     let parent_path = &self.zoom_path[..self.zoom_path.len() - 1];
-                    Some((parent_path, self.root.navigate(parent_path)))
+                    self.root.navigate(parent_path)
                 };
-                let tm_action = if let Some((parent_path, Some(parent))) = parent_node {
-                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, Some(parent), Some(parent_path))
+                let tm_action = if let Some(parent) = parent_node {
+                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, Some(parent))
                 } else {
-                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, None, None)
+                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, None)
                 };
                 action.merge(tm_action);
 
