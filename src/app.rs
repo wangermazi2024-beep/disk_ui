@@ -17,9 +17,6 @@ use crate::ui::{sidebar, tree_list, treemap_view, TreeAction};
 
 pub struct DiskUiApp {
     root_path: String,
-    /// 模拟的磁盘总容量。真实的"剩余空间"需要平台相关的 API（statvfs / GetDiskFreeSpaceEx），
-    /// 为了不引入额外的平台依赖，这里按已用空间估算一个总容量用于展示比例条，
-    /// 并在界面上如实叫它"演示值"，不假装是真实磁盘剩余空间。
     total_size: u64,
 
     root: Node,
@@ -27,9 +24,6 @@ pub struct DiskUiApp {
     zoom_path: NodePath,
     /// 当前选中节点，treemap 色块和文件列表树共用同一个选中状态实现联动高亮。
     selected: Option<NodePath>,
-
-    /// 单击文件夹后延迟一帧展开，避免与双击冲突。
-    pending_toggle: Option<NodePath>,
 
     categories: Vec<crate::model::CategoryStat>,
 
@@ -50,7 +44,6 @@ impl Default for DiskUiApp {
             root,
             zoom_path: Vec::new(),
             selected: None,
-            pending_toggle: None,
             categories,
             scanning: false,
             scanned_count: 0,
@@ -68,13 +61,6 @@ fn estimate_total(used: u64) -> u64 {
 
 impl eframe::App for DiskUiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 帧前：处理上一帧的预备展开（单击文件夹）。
-        // 如果用户在上一帧双击了文件夹，ZoomTo 已在 apply_action 中清除了 pending_toggle，
-        // 这里就不会执行。
-        if let Some(path) = self.pending_toggle.take() {
-            self.apply_action(TreeAction::ToggleExpand(path));
-        }
-
         self.apply_dark_theme(ui.ctx());
         self.poll_scan();
 
@@ -141,7 +127,6 @@ impl DiskUiApp {
                     self.total_size = estimate_total(self.root.size);
                     self.zoom_path.clear();
                     self.selected = None;
-                    self.pending_toggle = None;
                     self.scanning = false;
                     finished = true;
                 }
@@ -325,11 +310,6 @@ impl DiskUiApp {
             TreeAction::Select(path) => {
                 self.selected = Some(path);
             }
-            TreeAction::PrepareToggle(path) => {
-                // 选中并标记，下一帧再执行 ToggleExpand
-                self.selected = Some(path.clone());
-                self.pending_toggle = Some(path);
-            }
             TreeAction::ToggleExpand(path) => {
                 // SpaceSniffer 独占展开：
                 // path 是绝对路径（从 root 出发），zoom_path 是当前视图根。
@@ -349,8 +329,6 @@ impl DiskUiApp {
                 self.selected = Some(path);
             }
             TreeAction::ZoomTo(path) => {
-                // 清除任何待处理的展开（双击优先于单击）
-                self.pending_toggle = None;
                 self.zoom_path = path.clone();
                 // 清理整棵树所有节点的 inline 展开状态：
                 // 用户导航到新层级（无论是双击 ZoomTo 还是面包屑跳转），

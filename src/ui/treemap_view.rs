@@ -63,7 +63,7 @@ pub fn show(
     };
 
     let mut path = base_path.to_vec();
-    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action);
+    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action, None);
     action
 }
 
@@ -78,6 +78,8 @@ fn draw_children(
     depth: u32,
     selected: &Option<NodePath>,
     action: &mut TreeAction,
+    // 当前块所在的已展开父块路径（双击时重定向 ZoomTo 到该父块）
+    expanded_ancestor: Option<&NodePath>,
 ) {
     if node.children.is_empty() { return; }
     if rect.width() < 2.0 || rect.height() < 2.0 { return; }
@@ -130,22 +132,30 @@ fn draw_children(
                 r.max,
             );
             if nested.width() > 4.0 && nested.height() > 4.0 {
-                draw_children(ui, nested, child, path, depth + 1, selected, action);
+                // 进入已展开子块：传递当前路径副本作为 expanded_ancestor，
+                // 当子块检测到双击时，ZoomTo 将重定向到该父块路径。
+                let ancestor_path = path.clone();
+                draw_children(ui, nested, child, path, depth + 1, selected, action, Some(&ancestor_path));
             }
         }
 
         if was_clicked && matches!(*action, TreeAction::None) {
             if was_dbl {
                 if !child.children.is_empty() {
-                    *action = TreeAction::ZoomTo(path.clone());
+                    // 如果当前块在已展开父块内部（expanded_ancestor），
+                    // 双击应放大该父块而非子块自身。
+                    if let Some(ancestor) = expanded_ancestor {
+                        *action = TreeAction::ZoomTo(ancestor.to_vec());
+                    } else {
+                        *action = TreeAction::ZoomTo(path.clone());
+                    }
                 }
             } else if is_file {
                 *action = TreeAction::Select(path.clone());
             } else if r.width() < MIN_EXPAND_W || r.height() < MIN_EXPAND_H {
                 *action = TreeAction::Select(path.clone());
             } else {
-                // 文件夹单击：先选中，下一帧再展开（避免双击第一帧触发展开）
-                *action = TreeAction::PrepareToggle(path.clone());
+                *action = TreeAction::ToggleExpand(path.clone());
             }
         }
 
