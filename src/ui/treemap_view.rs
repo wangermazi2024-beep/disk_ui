@@ -20,11 +20,10 @@ const BLOCK_PAD: f32 = 0.5;
 const NEST_TOP: f32 = 14.0;
 const MAX_DEPTH: u32 = 6;
 /// 子块小于此尺寸时不展开嵌套（提示双击进入）
-const MIN_INLINE_SIZE: f32 = 80.0;
-const MIN_RENDER_SIZE: f32 = 12.0;
+const MIN_INLINE_SIZE: f32 = 42.0;
 const FILE_COLOR: Color32 = Color32::from_rgb(0x5A, 0x6B, 0x7C);
 const FILE_BORDER: Color32 = Color32::from_rgb(0x6A, 0x7B, 0x8C);
-const UP_COLOR: Color32 = Color32::from_rgb(0x40, 0x42, 0x46);
+
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -33,27 +32,12 @@ pub fn show(
     base_path: &[usize],
     selected: &Option<NodePath>,
     parent_node: Option<&Node>,
-    _parent_base_path: Option<&[usize]>,
+    parent_base_path: Option<&[usize]>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
 
-    // SpaceSniffer 风格：放大后保留上一层色块作为容器，不显示返回按钮。
-    let mut draw_rect = rect;
-    if let Some(parent) = parent_node {
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(4), parent.color);
-        painter.text(
-            rect.left_top() + Vec2::new(6.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            &parent.name,
-            FontId::proportional(11.0),
-            Color32::WHITE,
-        );
-        draw_rect = rect.shrink2(Vec2::new(8.0, 20.0));
-    }
-
     let mut path = base_path.to_vec();
-    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action);
+    draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
     action
 }
 
@@ -75,7 +59,7 @@ fn draw_children(
 
     for (i, (r, child)) in rects.iter().zip(node.children.iter()).enumerate() {
         let inset = r.shrink(BLOCK_PAD);
-        if inset.width() < MIN_RENDER_SIZE || inset.height() < MIN_RENDER_SIZE {
+        if inset.width() < 2.0 || inset.height() < 2.0 {
             continue;
         }
         path.push(i);
@@ -158,7 +142,7 @@ fn draw_label(ui: &egui::Ui, painter: &egui::Painter, inset: egui::Rect, node: &
     let name_font = FontId::proportional(9.0);
     let shown = truncate_text(ui.ctx(), &node.name, name_font.clone(), text_max_w);
     if !shown.is_empty() && inset.height() > 12.0 {
-        let y_top = 2.0;
+        let y_top = if expanded { NEST_TOP - 2.0 } else { 2.0 };
         painter.text(
             inset.left_top() + Vec2::new(pad, y_top),
             egui::Align2::LEFT_TOP,
