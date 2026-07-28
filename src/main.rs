@@ -381,9 +381,11 @@ impl eframe::App for DiskUiApp {
                     let id = ui.id().with(("treemap_block", i));
                     let resp = ui.interact(inset, id, egui::Sense::click());
                     if ui.rect_contains_pointer(inset) {
+                        let tip_pos = ui.ctx().pointer_latest_pos().unwrap_or(inset.left_bottom());
                         egui::Area::new(id.with("tip"))
-                            .fixed_pos(ui.ctx().pointer_latest_pos().unwrap_or(inset.left_bottom()))
+                            .fixed_pos(tip_pos + Vec2::new(14.0, 0.0))
                             .order(egui::Order::Tooltip)
+                            .interactable(false)
                             .show(ui.ctx(), |ui| {
                                 egui::Frame::default()
                                     .fill(Color32::from_rgb(0x33, 0x33, 0x38))
