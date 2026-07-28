@@ -343,7 +343,7 @@ impl eframe::App for DiskUiApp {
                     let painter = ui.painter_at(inset);
                     painter.rect_filled(inset, Rounding::same(4.0), n.color);
                     if is_sel {
-                        painter.rect_stroke(inset, Rounding::same(4.0), Stroke::new(2.0, Color32::WHITE));
+                        painter.rect_stroke(inset, Rounding::same(4.0), Stroke::new(2.0_f32, Color32::WHITE));
                     }
 
                     // 文字按可用宽度截断（超出部分省略号代替），而不是超过阈值就整段隐藏，
@@ -385,17 +385,15 @@ impl eframe::App for DiskUiApp {
                             .fixed_pos(ui.ctx().pointer_latest_pos().unwrap_or(inset.left_bottom()))
                             .order(egui::Order::Tooltip)
                             .show(ui.ctx(), |ui| {
-                                ui.add(
-                                    egui::Frame::default()
-                                        .fill(Color32::from_rgb(0x33, 0x33, 0x38))
-                                        .rounding(4.0)
-                                        .inner_margin(egui::Margin::same(6.0))
-                                        .show(ui, |ui| {
-                                            ui.label(RichText::new(
-                                                format!("{} · {}", n.name, human_size(n.size))
-                                            ).color(Color32::WHITE))
-                                        }).inner
-                                );
+                                egui::Frame::default()
+                                    .fill(Color32::from_rgb(0x33, 0x33, 0x38))
+                                    .rounding(4.0)
+                                    .inner_margin(egui::Margin::same(6.0))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(
+                                            format!("{} · {}", n.name, human_size(n.size))
+                                        ).color(Color32::WHITE));
+                                    });
                             });
                     }
                     if resp.clicked() {
