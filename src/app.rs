@@ -303,8 +303,20 @@ impl DiskUiApp {
                 self.selected = Some(path);
             }
             TreeAction::ToggleExpand(path) => {
-                if let Some(node) = self.root.navigate_mut(&path) {
-                    node.expanded = !node.expanded;
+                // SpaceSniffer 独占展开：
+                // path 是绝对路径（从 root 出发），zoom_path 是当前视图根。
+                // exclusive_toggle 需要「相对于视图根」的路径，这样才能
+                // 把同层兄弟节点的展开状态一并清理。
+                //
+                // 例如：zoom_path=[0]，path=[0,2,1]
+                // → 相对路径 = [2,1]，视图根节点 = root.children[0]
+                // exclusive_toggle 在 root.children[0].children[2] 这一层
+                // 折叠所有兄弟，只展开 [2]，再递归进去。
+                if path.starts_with(&self.zoom_path) {
+                    let rel = &path[self.zoom_path.len()..];
+                    if let Some(view_root) = self.root.navigate_mut(&self.zoom_path) {
+                        view_root.exclusive_toggle(rel);
+                    }
                 }
                 self.selected = Some(path);
             }
