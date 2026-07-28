@@ -22,17 +22,17 @@ pub struct TopbarState<'a> {
     pub total_size: u64,
 }
 
-pub fn show(ctx: &egui::Context, state: TopbarState) -> TopbarAction {
+pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
     let mut action = TopbarAction::None;
 
-    egui::TopBottomPanel::top("top_bar")
-        .exact_height(56.0)
+    egui::Panel::top("top_bar")
+        .exact_size(56.0)
         .frame(
             egui::Frame::default()
                 .fill(Color32::from_rgb(0x25, 0x27, 0x2B))
-                .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
+                .inner_margin(egui::Margin::symmetric(16, 8)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(RichText::new("⛁ DiskLens").size(18.0).strong().color(Color32::from_rgb(0x6F, 0xA8, 0xFF)));
                 ui.add_space(16.0);

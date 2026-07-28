@@ -20,7 +20,7 @@ pub fn human_size(bytes: u64) -> String {
 /// 按可用宽度截断文字，超出部分用省略号代替，而不是让文字溢出块外。
 pub fn truncate_text(ctx: &egui::Context, text: &str, font: FontId, max_width: f32) -> String {
     let measure = |s: &str| -> f32 {
-        ctx.fonts(|f| f.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x)
+        ctx.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x)
     };
     if measure(text) <= max_width {
         return text.to_owned();

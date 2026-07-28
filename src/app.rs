@@ -64,12 +64,11 @@ fn estimate_total(used: u64) -> u64 {
 
 impl eframe::App for DiskUiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx();
-        self.apply_dark_theme(ctx);
+        self.apply_dark_theme(ui.ctx());
         self.poll_scan();
 
         let topbar_action = topbar::show(
-            ctx,
+            ui,
             TopbarState {
                 root_path: &mut self.root_path,
                 scanning: self.scanning,
@@ -83,12 +82,12 @@ impl eframe::App for DiskUiApp {
             self.start_scan();
         }
 
-        sidebar::show(ctx, self.root.size, self.total_size, self.total_size.saturating_sub(self.root.size), &self.categories);
+        sidebar::show(ui, self.root.size, self.total_size, self.total_size.saturating_sub(self.root.size), &self.categories);
 
-        let action = self.show_central_panel(ctx);
+        let action = self.show_central_panel(ui);
         self.apply_action(action);
 
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
     }
 }
 
@@ -149,14 +148,14 @@ impl DiskUiApp {
     /// 中央面板：面包屑导航 + treemap 色块 + 递归文件列表树。
     /// 所有交互统一收敛成一个 `TreeAction`，画完之后再统一应用到状态上，
     /// 避免在 egui 的画图闭包内部同时持有 `self` 的多处可变借用。
-    fn show_central_panel(&self, ctx: &egui::Context) -> TreeAction {
+    fn show_central_panel(&self, ui: &mut egui::Ui) -> TreeAction {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
                     .fill(Color32::from_rgb(0x1E, 0x1F, 0x22))
-                    .inner_margin(egui::Margin::same(16.0)),
+                    .inner_margin(egui::Margin::same(16)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let mut action = TreeAction::None;
 
                 // 当前层名称（一行截断显示）
@@ -230,7 +229,7 @@ impl DiskUiApp {
         // 用 egui 测量字符串像素宽度
         let measure_str = |s: &str| -> f32 {
             let font = egui::FontId::proportional(12.5);
-            ui.ctx().fonts(|f| f.layout_no_wrap(s.to_owned(), font, Color32::WHITE).size().x)
+            ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font, Color32::WHITE).size().x)
         };
         let sep_w = measure_str(" / ");
         let ellipsis_w = measure_str("…");

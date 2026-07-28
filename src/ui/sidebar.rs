@@ -8,16 +8,16 @@ use egui::{Color32, CornerRadius, FontId, RichText, Vec2};
 use crate::format::human_size;
 use crate::model::CategoryStat;
 
-pub fn show(ctx: &egui::Context, used_size: u64, total_size: u64, free_size: u64, categories: &[CategoryStat]) {
-    egui::SidePanel::left("stats_panel")
+pub fn show(ui: &mut egui::Ui, used_size: u64, total_size: u64, free_size: u64, categories: &[CategoryStat]) {
+    egui::Panel::left("stats_panel")
         .resizable(false)
-        .exact_width(230.0)
+        .exact_size(230.0)
         .frame(
             egui::Frame::default()
                 .fill(Color32::from_rgb(0x23, 0x24, 0x28))
-                .inner_margin(egui::Margin::same(14.0)),
+                .inner_margin(egui::Margin::same(14)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.label(RichText::new("磁盘概览").strong().size(15.0));
             ui.add_space(10.0);
 

@@ -13,7 +13,7 @@
 //! - 从最深层往外找：最里层的子块优先响应点击，父块只在未被子块消费时响应。
 //!   用 `action` 的"一旦非 None 就不再覆盖"来实现优先级。
 
-use egui::{Color32, CornerRadius, FontId, RichText, Stroke, Vec2, Pos2};
+use egui::{Color32, CornerRadius, FontId, RichText, Stroke, StrokeKind, Vec2, Pos2};
 
 use crate::format::{human_size, truncate_text};
 use crate::model::{Node, NodePath};
@@ -111,10 +111,10 @@ fn draw_children<'a>(
         let painter = ui.painter_at(inset);
         painter.rect_filled(inset, CornerRadius::same(4), block_color);
         if is_file {
-            painter.rect_stroke(inset, CornerRadius::same(4), Stroke::new(1.0_f32, FILE_BORDER));
+            painter.rect_stroke(inset, CornerRadius::same(4), Stroke::new(1.0_f32, FILE_BORDER), StrokeKind::Inside);
         }
         if is_selected {
-            painter.rect_stroke(inset, CornerRadius::same(4), Stroke::new(2.0_f32, Color32::WHITE));
+            painter.rect_stroke(inset, CornerRadius::same(4), Stroke::new(2.0_f32, Color32::WHITE), StrokeKind::Inside);
         }
         draw_label(ui, &painter, inset, child);
 
@@ -227,7 +227,7 @@ fn show_tooltip(ui: &egui::Ui, id: egui::Id, node: &Node) {
 
     let tip_w = 240.0_f32;
     let tip_h = 52.0_f32;
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
 
     // 默认右上方
     let mut tip_x = mouse_pos.x + 16.0;
@@ -255,7 +255,7 @@ fn show_tooltip(ui: &egui::Ui, id: egui::Id, node: &Node) {
                 .fill(Color32::from_rgb(0x2A, 0x2C, 0x32))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x60)))
                 .corner_radius(CornerRadius::same(5))
-                .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                .inner_margin(egui::Margin::symmetric(8, 5))
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(format!("{} · {}", node.name, human_size(node.size)))
