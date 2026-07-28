@@ -218,6 +218,7 @@ impl eframe::App for DiskUiApp {
         style.visuals = visuals;
         style.spacing.item_spacing = Vec2::new(10.0, 8.0);
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
+        style.interaction.tooltip_delay = 0.05; // 即时显示气泡（默认 0.5s 太慢）
         ctx.set_style(style);
 
         egui::TopBottomPanel::top("top_bar")
@@ -375,10 +376,28 @@ impl eframe::App for DiskUiApp {
                         }
                     }
 
-                    // 无论块多小，鼠标悬浮时都用气泡显示完整名称和大小，信息不会因为截断而丢失
+                    // 手动气泡：不用 egui 内置 on_hover_text（按下鼠标键时会被抑制）
+                    // 直接检测鼠标位置，只要在块范围内就立刻显示，跟按没按键完全无关
                     let id = ui.id().with(("treemap_block", i));
                     let resp = ui.interact(inset, id, egui::Sense::click());
-                    resp.clone().on_hover_text(format!("{}\n{}", n.name, human_size(n.size)));
+                    if ui.rect_contains_pointer(inset) {
+                        egui::Area::new(id.with("tip"))
+                            .fixed_pos(ui.ctx().pointer_latest_pos().unwrap_or(inset.left_bottom()))
+                            .order(egui::Order::Tooltip)
+                            .show(ui.ctx(), |ui| {
+                                ui.add(
+                                    egui::Frame::default()
+                                        .fill(Color32::from_rgb(0x33, 0x33, 0x38))
+                                        .rounding(4.0)
+                                        .inner_margin(egui::Margin::same(6.0))
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new(
+                                                format!("{} · {}", n.name, human_size(n.size))
+                                            ).color(Color32::WHITE))
+                                        }).inner
+                                );
+                            });
+                    }
                     if resp.clicked() {
                         self.selected = Some(i);
                     }
