@@ -1,14 +1,13 @@
 //! 递归 Treemap 色块视图，交互方式参考 SpaceSniffer：
 //!
-//! - **单击**一个色块：在原地把它按 squarify 算法再细分一层，
-//!   显示它自己的子节点（嵌套色块）。再单击一次会收起（toggle）。
-//! - **双击**一个色块：以它为新的"根"放大铺满整个 treemap 区域
+//! - **单击**一个色块：选中它（高亮边框）。
+//! - **双击**一个文件夹色块：以它为新的"根"放大铺满整个 treemap 区域
 //!   （对应 SpaceSniffer 里双击进入子文件夹的操作），并在顶部面包屑里留痕，
 //!   可以随时点面包屑回退。
+//! - 单击文件色块：选中它。
 //!
-//! 只有被标记 `expanded` 的节点才会往下递归绘制子色块，
-//! 而不是不管有没有点开就无脑画到底——真实目录树可能有几十万个文件，
-//! 不加这层限制，帧率会直接崩掉。
+//! 展开/折叠操作由右侧文件列表树的 ▶/▼ 按钮完成，treemap 色块不参与展开/折叠，
+//! 避免单击/双击冲突。
 
 use egui::{Color32, FontId, Rounding, RichText, Stroke, Vec2};
 
@@ -18,14 +17,10 @@ use crate::treemap::compute_treemap;
 
 use super::TreeAction;
 
-/// 手动展开最多允许套多少层嵌套色块，防止用户一路点到底时把帧率拖垮。
-const MAX_RENDER_DEPTH: u32 = 6;
+/// 色块之间的间距（px）
+const BLOCK_PAD: f32 = 3.0;
 
-/// 绘制 `view_root`（当前被"放大"显示的节点）的子节点铺满 `rect`，
-/// 并按各自的 `expanded` 状态继续递归绘制更深层。
-///
-/// `base_path` 是 `view_root` 相对真实根节点的绝对路径，
-/// 用来把内部产生的相对路径换算成 app.rs 能直接使用的绝对路径。
+/// 绘制 `view_root`（当前被"放大"显示的节点）的子节点铺满 `rect`。
 pub fn show(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -35,17 +30,15 @@ pub fn show(
 ) -> TreeAction {
     let mut action = TreeAction::None;
     let mut path = base_path.to_vec();
-    draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
+    draw_children(ui, rect, view_root, &mut path, selected, &mut action);
     action
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_children(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     node: &Node,
     path: &mut NodePath,
-    depth: u32,
     selected: &Option<NodePath>,
     action: &mut TreeAction,
 ) {
@@ -56,8 +49,8 @@ fn draw_children(
     let rects = compute_treemap(&sizes, rect);
 
     for (i, (r, child)) in rects.iter().zip(node.children.iter()).enumerate() {
-        let inset = r.shrink(1.5);
-        if inset.width() < 1.0 || inset.height() < 1.0 {
+        let inset = r.shrink(BLOCK_PAD);
+        if inset.width() < 2.0 || inset.height() < 2.0 {
             continue;
         }
         path.push(i);
@@ -78,21 +71,15 @@ fn draw_children(
             show_tooltip(ui, id, inset, child);
         }
 
-        if resp.double_clicked() {
-            *action = TreeAction::ZoomTo(path.clone());
-        } else if resp.clicked() {
-            if child.children.is_empty() {
-                *action = TreeAction::Select(path.clone());
+        // ✅ 单击/双击分离：先判断 clicked，再在里面判断 double_clicked
+        // 避免第一次单击触发选中，第二次才触发双击的问题
+        if resp.clicked() {
+            if resp.double_clicked() {
+                if !child.children.is_empty() {
+                    *action = TreeAction::ZoomTo(path.clone());
+                }
             } else {
-                *action = TreeAction::ToggleExpand(path.clone());
-            }
-        }
-
-        // 只有"已经被单击展开过"的节点，才继续往下递归画嵌套子色块。
-        if child.expanded && !child.children.is_empty() && depth + 1 < MAX_RENDER_DEPTH {
-            let nested = inset.shrink(3.0);
-            if nested.width() > 6.0 && nested.height() > 6.0 {
-                draw_children(ui, nested, child, path, depth + 1, selected, action);
+                *action = TreeAction::Select(path.clone());
             }
         }
 
@@ -101,7 +88,7 @@ fn draw_children(
 }
 
 fn draw_label(ui: &egui::Ui, painter: &egui::Painter, inset: egui::Rect, node: &Node) {
-    let pad = 6.0;
+    let pad = 8.0;
     let text_max_w = inset.width() - pad * 2.0;
     if inset.width() <= 22.0 || inset.height() <= 18.0 || text_max_w <= 8.0 {
         return;
@@ -131,16 +118,13 @@ fn draw_label(ui: &egui::Ui, painter: &egui::Painter, inset: egui::Rect, node: &
     }
 }
 
-// 手动气泡：不用 egui 内置 on_hover_text（按下鼠标键时会被抑制），
-// 直接检测鼠标位置，只要在块范围内就立刻显示，跟按没按键完全无关。
+// 手动气泡，不用 egui 内置 on_hover_text（按下鼠标键时会被抑制）
 fn show_tooltip(ui: &egui::Ui, id: egui::Id, inset: egui::Rect, node: &Node) {
     let tip_pos = ui.ctx().pointer_latest_pos().unwrap_or(inset.left_bottom());
     let hint = if node.children.is_empty() {
         "单击选中"
-    } else if node.expanded {
-        "单击收起 · 双击放大到整层"
     } else {
-        "单击展开下一层 · 双击放大到整层"
+        "双击进入"
     };
     egui::Area::new(id.with("tip"))
         .fixed_pos(tip_pos + Vec2::new(14.0, 0.0))

@@ -156,8 +156,12 @@ impl DiskUiApp {
             )
             .show(ctx, |ui| {
                 let mut action = TreeAction::None;
+
+                // 当前层名称（一行截断显示）
+                let cur_name = self.root.navigate(&self.zoom_path)
+                    .map(|n| n.name.as_str()).unwrap_or(&self.root.name);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("空间分布 (Treemap)").strong().size(15.0));
+                    ui.label(RichText::new(format!("📂 {}", cur_name)).strong().size(15.0));
                     ui.add_space(10.0);
                     if let Some(a) = self.breadcrumb_ui(ui) {
                         action = a;
@@ -188,8 +192,8 @@ impl DiskUiApp {
             .inner
     }
 
-    /// 顶部面包屑：`根目录 / 子目录 / ...`，点击任意一段都相当于双击对应色块，
-    /// 直接跳转（放大）到那一层；额外提供"上一级"按钮回退一层。
+    /// 顶部面包屑（一行截断）：`根目录 / 子目录 / ...`，路径太长时自动截断。
+    /// 点击任意一段跳转回对应层级。
     fn breadcrumb_ui(&self, ui: &mut egui::Ui) -> Option<TreeAction> {
         let mut clicked: Option<NodePath> = None;
 
@@ -201,19 +205,38 @@ impl DiskUiApp {
             }
         }
 
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(self.zoom_path.is_empty(), RichText::new(&self.root.name).size(12.5))
-                .clicked()
-            {
+        // 构建完整路径文本
+        let mut path_parts: Vec<&str> = vec![&self.root.name];
+        let mut cursor = &self.root;
+        let mut prefix = Vec::new();
+        for &i in &self.zoom_path {
+            let Some(child) = cursor.children.get(i) else { break };
+            prefix.push(i);
+            path_parts.push(&child.name);
+            cursor = child;
+        }
+        // 路径太长时中间截断：保留首尾
+        let max_segments = 4;
+        let path_text = if path_parts.len() > max_segments {
+            let head = path_parts[0];
+            let tail: Vec<&&str> = path_parts[path_parts.len()-2..].iter().collect();
+            format!("{} / … / {}", head, tail.join(" / "))
+        } else {
+            path_parts.join(" / ")
+        };
+
+        ui.horizontal(|ui| {
+            ui.set_max_width(ui.available_width() - 10.0);
+            // 根节点可点击
+            if ui.selectable_label(self.zoom_path.is_empty(), RichText::new(&self.root.name).size(12.5)).clicked() {
                 clicked = Some(Vec::new());
             }
-            let mut prefix = Vec::new();
             let mut cursor = &self.root;
+            let mut prefix = Vec::new();
             for &i in &self.zoom_path {
                 let Some(child) = cursor.children.get(i) else { break };
                 prefix.push(i);
-                ui.label(RichText::new("/").color(Color32::from_rgb(0x70, 0x70, 0x70)));
+                ui.label(RichText::new(" / ").color(Color32::from_rgb(0x70, 0x70, 0x70)).size(12.5));
                 let is_current = prefix == self.zoom_path;
                 if ui.selectable_label(is_current, RichText::new(&child.name).size(12.5)).clicked() {
                     clicked = Some(prefix.clone());
@@ -239,6 +262,11 @@ impl DiskUiApp {
             }
             TreeAction::ZoomTo(path) => {
                 self.zoom_path = path.clone();
+                // 放大到新层级时重置该路径上所有节点的 inline 展开状态，
+                // 避免之前手动展开的子块在新视图里继续显示嵌套色块。
+                if let Some(n) = self.root.navigate_mut(&path) {
+                    n.collapse_all();
+                }
                 self.selected = Some(path);
             }
         }
