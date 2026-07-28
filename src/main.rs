@@ -479,21 +479,28 @@ impl eframe::App for DiskUiApp {
 
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "noto_sc".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/NotoSansSC-subset.ttf")),
-    );
-    // 插到 Proportional 字族最前面，中英文混排都优先用它
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "noto_sc".to_owned());
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .push("noto_sc".to_owned());
+
+    // 加载 Windows 系统字体（微软雅黑），中文 + ↑↓ 等符号都能正确渲染
+    // 相比内置字体子集，系统字体体积更大但兼容性更好
+    let sys_font_path = r"C:\Windows\Fonts\msyh.ttc";
+    if let Ok(data) = std::fs::read(sys_font_path) {
+        fonts.font_data.insert(
+            "msyh".to_owned(),
+            egui::FontData::from_owned(data),
+        );
+        // 插到 Proportional 字族最前面，优先渲染中文和特殊符号
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "msyh".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("msyh".to_owned());
+    }
+
     ctx.set_fonts(fonts);
 }
 
