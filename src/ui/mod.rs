@@ -21,8 +21,10 @@ pub enum TreeAction {
 }
 
 impl TreeAction {
+    /// 合并动作：保留第一个非 None 的动作（后面的不覆盖前面）。
+    /// 这样面包屑返回 ZoomTo 后，treemap 再返回 Select 不会把它冲掉。
     pub fn merge(&mut self, other: TreeAction) {
-        if !matches!(other, TreeAction::None) {
+        if matches!(*self, TreeAction::None) && !matches!(other, TreeAction::None) {
             *self = other;
         }
     }

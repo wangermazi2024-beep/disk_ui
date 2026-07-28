@@ -97,8 +97,8 @@ impl DiskUiApp {
         // 之前用 override_text_color 只对"没有显式设色"的文字生效，
         // .strong() 这类样式会绕过它，导致暗底配深色字看不清。
         ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals {
-            window_fill: Color32::from_rgb(0x1E, 0x1F, 0x22),
-            panel_fill: Color32::from_rgb(0x1E, 0x1F, 0x22),
+            window_fill: Color32::from_rgb(0x2D, 0x2D, 0x30),
+            panel_fill: Color32::from_rgb(0x25, 0x25, 0x28),
             ..Default::default()
         });
         ctx.style_mut_of(egui::Theme::Dark, |style| {
