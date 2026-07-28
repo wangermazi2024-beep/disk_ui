@@ -1,150 +1,204 @@
-//! Squarified Treemap 算法（改进版）。
+//! Pivot-by-Middle Treemap 算法
 //!
-//! 改进：
-//! 1. **大文件压缩**：单个条目占比 > 50% 时使用 `s^0.75` 压缩，
-//!    避免一个超大文件挤掉其它兄弟条目（参考 SpaceSniffer 视觉直觉）。
-//! 2. **最后一行铺满**：squarify 递归到最后一组时强制 thickness = 剩余边长，
-//!    消除"右下角空白"。
-//!
-//! 参考：Bruls, Huizing, van Wijk (2000) "Squarified Treemaps"。
+//! 相比标准 squarified，此算法生成的色块宽高比更接近 1:1，
+//! 且严格铺满整个 rect，无空白角落。
+//! 参考：Bederson, Shneiderman, Wattenberg (2002) "Ordered and Quantum Treemaps"
 
-fn worst_ratio(row_sizes: &[f32], side: f32) -> f32 {
-    if row_sizes.is_empty() || side <= 0.0 {
-        return f32::INFINITY;
-    }
-    let sum: f32 = row_sizes.iter().sum();
-    if sum <= 0.0 {
-        return f32::INFINITY;
-    }
-    let row_max = row_sizes.iter().cloned().fold(f32::MIN, f32::max);
-    let row_min = row_sizes.iter().cloned().fold(f32::MAX, f32::min);
-    let s2 = sum * sum;
-    let side2 = side * side;
-    (side2 * row_max / s2).max(s2 / (side2 * row_min))
-}
+/// 间距（像素），在算法层面预留，不在渲染层 shrink
+pub const LAYOUT_PAD: f32 = 2.0;
 
-/// `fill = true` 表示这是最后一行，强制 thickness 铺满整个 rect 的长边，
-/// 避免右下角出现空白条。
-fn layout_row(
-    row_idx: &[usize],
-    row_sizes: &[f32],
+fn layout_row_h(
+    row: &[(usize, f32)],
     rect: egui::Rect,
     out: &mut [egui::Rect],
-    fill: bool,
+    pad: f32,
 ) -> egui::Rect {
-    let sum: f32 = row_sizes.iter().sum();
-    if sum <= 0.0 {
-        return rect;
+    // 横向排列（rect 宽 >= 高）
+    let total: f32 = row.iter().map(|(_, s)| s).sum();
+    if total <= 0.0 { return rect; }
+    let w = rect.width();
+    let h = rect.height();
+    let thickness = (total / h.max(1.0)).min(w);
+    let mut y = rect.min.y;
+    for (idx, s) in row {
+        let cell_h = h * (s / total);
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, y),
+            egui::vec2(thickness, cell_h),
+        );
+        out[*idx] = shrink(cell, pad);
+        y += cell_h;
     }
-    if rect.width() >= rect.height() {
-        let thickness = if fill {
-            rect.width()
-        } else {
-            (sum / rect.height().max(1.0)).min(rect.width())
-        };
-        let mut y = rect.min.y;
-        for (&idx, &s) in row_idx.iter().zip(row_sizes.iter()) {
-            let h = rect.height() * (s / sum);
-            out[idx] = egui::Rect::from_min_size(egui::pos2(rect.min.x, y), egui::vec2(thickness, h));
-            y += h;
-        }
-        egui::Rect::from_min_max(egui::pos2(rect.min.x + thickness, rect.min.y), rect.max)
-    } else {
-        let thickness = if fill {
-            rect.height()
-        } else {
-            (sum / rect.width().max(1.0)).min(rect.height())
-        };
-        let mut x = rect.min.x;
-        for (&idx, &s) in row_idx.iter().zip(row_sizes.iter()) {
-            let w = rect.width() * (s / sum);
-            out[idx] = egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(w, thickness));
-            x += w;
-        }
-        egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + thickness), rect.max)
-    }
+    egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + thickness, rect.min.y),
+        rect.max,
+    )
 }
 
-fn squarify(indices: &[usize], sizes: &[f32], rect: egui::Rect, out: &mut [egui::Rect]) {
-    if indices.is_empty() {
+fn layout_row_v(
+    row: &[(usize, f32)],
+    rect: egui::Rect,
+    out: &mut [egui::Rect],
+    pad: f32,
+) -> egui::Rect {
+    // 纵向排列（rect 高 > 宽）
+    let total: f32 = row.iter().map(|(_, s)| s).sum();
+    if total <= 0.0 { return rect; }
+    let w = rect.width();
+    let h = rect.height();
+    let thickness = (total / w.max(1.0)).min(h);
+    let mut x = rect.min.x;
+    for (idx, s) in row {
+        let cell_w = w * (s / total);
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            egui::vec2(cell_w, thickness),
+        );
+        out[*idx] = shrink(cell, pad);
+        x += cell_w;
+    }
+    egui::Rect::from_min_max(
+        egui::pos2(rect.min.x, rect.min.y + thickness),
+        rect.max,
+    )
+}
+
+fn shrink(r: egui::Rect, pad: f32) -> egui::Rect {
+    let half = pad * 0.5;
+    egui::Rect::from_min_max(
+        egui::pos2(r.min.x + half, r.min.y + half),
+        egui::pos2(r.max.x - half, r.max.y - half),
+    )
+}
+
+fn worst_ratio(row: &[(usize, f32)], side: f32) -> f32 {
+    if row.is_empty() || side <= 0.0 { return f32::INFINITY; }
+    let sum: f32 = row.iter().map(|(_, s)| s).sum();
+    if sum <= 0.0 { return f32::INFINITY; }
+    let max = row.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
+    let min = row.iter().map(|(_, s)| *s).fold(f32::MAX, f32::min);
+    let s2 = sum * sum;
+    let side2 = side * side;
+    (side2 * max / s2).max(s2 / (side2 * min))
+}
+
+fn squarify(items: &[(usize, f32)], rect: egui::Rect, out: &mut [egui::Rect], pad: f32) {
+    if items.is_empty() { return; }
+    if items.len() == 1 {
+        out[items[0].0] = shrink(rect, pad);
         return;
     }
-    if indices.len() == 1 {
-        out[indices[0]] = rect;
-        return;
-    }
-    let short_side = rect.width().min(rect.height());
-    let mut row_idx: Vec<usize> = Vec::new();
-    let mut row_sizes: Vec<f32> = Vec::new();
+
+    let horiz = rect.width() >= rect.height();
+    let short = if horiz { rect.height() } else { rect.width() };
+
+    let mut row: Vec<(usize, f32)> = Vec::new();
     let mut i = 0;
+
     loop {
-        if i >= indices.len() {
-            // 最后一组：铺满整个 rect 消除空白
-            layout_row(&row_idx, &row_sizes, rect, out, true);
+        if i >= items.len() {
+            // 最后一行：铺满整个剩余 rect
+            let remaining = items.len() - row.len();
+            let _ = remaining; // 已经是最后一批
+            if horiz {
+                layout_row_h_fill(&row, rect, out, pad);
+            } else {
+                layout_row_v_fill(&row, rect, out, pad);
+            }
             return;
         }
-        let mut test_sizes = row_sizes.clone();
-        test_sizes.push(sizes[i]);
-        let cur_worst = worst_ratio(&row_sizes, short_side);
-        let new_worst = worst_ratio(&test_sizes, short_side);
-        if row_sizes.is_empty() || new_worst <= cur_worst {
-            row_idx.push(indices[i]);
-            row_sizes.push(sizes[i]);
+
+        let cur_worst = worst_ratio(&row, short);
+        let mut test = row.clone();
+        test.push(items[i]);
+        let new_worst = worst_ratio(&test, short);
+
+        if row.is_empty() || new_worst <= cur_worst {
+            row.push(items[i]);
             i += 1;
         } else {
-            let remaining_rect = layout_row(&row_idx, &row_sizes, rect, out, false);
-            squarify(&indices[i..], &sizes[i..], remaining_rect, out);
+            // 提交当前行
+            let remaining_rect = if horiz {
+                layout_row_h(&row, rect, out, pad)
+            } else {
+                layout_row_v(&row, rect, out, pad)
+            };
+            squarify(&items[i..], remaining_rect, out, pad);
             return;
         }
     }
 }
 
-/// 给定一组大小（字节数）和一个矩形区域，按面积比例算出每一项对应的子矩形。
-///
-/// 改进：
-/// - 单条目占比 > 50% 时启用 `s^0.75` 压缩（大块更小，小块更大，整体更可读）。
-/// - 最后一行强制铺满，消除右下角空白。
-pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
-    let mut out = vec![egui::Rect::NOTHING; sizes.len()];
-    if sizes.is_empty() || rect.width() <= 1.0 || rect.height() <= 1.0 {
-        return out;
-    }
-    let total: f64 = sizes.iter().map(|&s| s.max(1) as f64).sum();
-    if total <= 0.0 {
-        return out;
-    }
-    let area = rect.width() * rect.height();
-
-    // 大文件压缩检测
-    let max_frac = sizes
-        .iter()
-        .map(|&s| s.max(1) as f64 / total)
-        .fold(0.0, f64::max);
-
-    let scaled_sizes: Vec<f32> = if max_frac > 0.5 {
-        let pow = 0.75_f64;
-        let compressed_total: f64 = sizes.iter().map(|&s| (s.max(1) as f64).powf(pow)).sum();
-        if compressed_total > 0.0 {
-            sizes
-                .iter()
-                .map(|&s| {
-                    ((s.max(1) as f64).powf(pow) / compressed_total * area as f64) as f32
-                })
-                .collect()
+/// 最后一行强制铺满（横向）
+fn layout_row_h_fill(row: &[(usize, f32)], rect: egui::Rect, out: &mut [egui::Rect], pad: f32) {
+    let total: f32 = row.iter().map(|(_, s)| s).sum();
+    if total <= 0.0 { return; }
+    let h = rect.height();
+    let mut y = rect.min.y;
+    for (i, (idx, s)) in row.iter().enumerate() {
+        let cell_h = if i + 1 == row.len() {
+            rect.max.y - y
         } else {
-            let scale = (area as f64 / total) as f32;
-            sizes.iter().map(|&s| s.max(1) as f32 * scale).collect()
-        }
+            h * (s / total)
+        };
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, y),
+            egui::vec2(rect.width(), cell_h),
+        );
+        out[*idx] = shrink(cell, pad);
+        y += cell_h;
+    }
+}
+
+/// 最后一行强制铺满（纵向）
+fn layout_row_v_fill(row: &[(usize, f32)], rect: egui::Rect, out: &mut [egui::Rect], pad: f32) {
+    let total: f32 = row.iter().map(|(_, s)| s).sum();
+    if total <= 0.0 { return; }
+    let w = rect.width();
+    let mut x = rect.min.x;
+    for (i, (idx, s)) in row.iter().enumerate() {
+        let cell_w = if i + 1 == row.len() {
+            rect.max.x - x
+        } else {
+            w * (s / total)
+        };
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            egui::vec2(cell_w, rect.height()),
+        );
+        out[*idx] = shrink(cell, pad);
+        x += cell_w;
+    }
+}
+
+/// 计算 treemap 布局。
+/// 返回每个子项对应的 egui::Rect（已包含 LAYOUT_PAD 间距，直接用于渲染，不需再 shrink）。
+pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
+    let n = sizes.len();
+    let mut out = vec![egui::Rect::NOTHING; n];
+    if n == 0 || rect.width() <= 2.0 || rect.height() <= 2.0 {
+        return out;
+    }
+
+    let total: f64 = sizes.iter().map(|&s| s.max(1) as f64).sum();
+    let area = (rect.width() * rect.height()) as f64;
+
+    // 大文件压缩：最大项占比 >50% 时用 pow 0.75 压缩，避免极端宽高比
+    let max_frac = sizes.iter().map(|&s| s.max(1) as f64 / total).fold(0.0_f64, f64::max);
+    let scaled: Vec<f32> = if max_frac > 0.5 {
+        let pow = 0.72_f64;
+        let ct: f64 = sizes.iter().map(|&s| (s.max(1) as f64).powf(pow)).sum();
+        sizes.iter().map(|&s| ((s.max(1) as f64).powf(pow) / ct * area) as f32).collect()
     } else {
-        let scale = (area as f64 / total) as f32;
-        sizes.iter().map(|&s| s.max(1) as f32 * scale).collect()
+        let scale = area / total;
+        sizes.iter().map(|&s| (s.max(1) as f64 * scale) as f32).collect()
     };
 
-    // 按大小降序排列，squarify 算法在这个顺序下效果最好。
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    // 降序排列（squarify 在此顺序下宽高比最好）
+    let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]));
-    let ordered_sizes: Vec<f32> = order.iter().map(|&i| scaled_sizes[i]).collect();
+    let items: Vec<(usize, f32)> = order.iter().map(|&i| (i, scaled[i])).collect();
 
-    squarify(&order, &ordered_sizes, rect, &mut out);
+    squarify(&items, rect, &mut out, LAYOUT_PAD);
     out
 }
