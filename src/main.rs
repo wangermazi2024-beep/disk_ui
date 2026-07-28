@@ -431,7 +431,7 @@ impl eframe::App for DiskUiApp {
                     .striped(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .auto_shrink([false, false])
-                    .column(egui_extras::Column::initial(280.0).at_least(150.0).resizable(true))
+                    .column(egui_extras::Column::remainder().at_least(150.0).resizable(true))
                     .column(egui_extras::Column::initial(90.0).at_least(50.0).resizable(true))
                     .column(egui_extras::Column::initial(110.0).at_least(60.0).resizable(true))
                     .header(22.0, |mut header| {
