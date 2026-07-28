@@ -181,7 +181,7 @@ impl DiskUiApp {
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
-                    action = action.or(list_action);
+                    action = action.clone().or(list_action);
                 });
                 action
             })
