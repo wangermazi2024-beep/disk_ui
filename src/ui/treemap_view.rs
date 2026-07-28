@@ -16,15 +16,16 @@ use crate::treemap::compute_treemap;
 
 use super::TreeAction;
 
-/// 色块间距
 const BLOCK_PAD: f32 = 2.0;
-/// 嵌套内缩（px）— 调大一些让嵌套层次明显可见
-const NEST_PAD: f32 = 5.0;
-/// 最大嵌套层数
+const NEST_PAD: f32 = 10.0;     // 嵌套间距（大一些让层级明显）
 const MAX_DEPTH: u32 = 6;
-/// 文件色块固定灰色
 const FILE_COLOR: Color32 = Color32::from_rgb(0x5A, 0x6B, 0x7C);
 const FILE_BORDER: Color32 = Color32::from_rgb(0x6A, 0x7B, 0x8C);
+
+/// 返回上层的色块颜色
+const UP_COLOR: Color32 = Color32::from_rgb(0x40, 0x42, 0x46);
+/// 返回上层按钮的高度比例（占 treemap 高度的比例）
+const UP_BAR_HEIGHT: f32 = 0.06;
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -32,10 +33,52 @@ pub fn show(
     view_root: &Node,
     base_path: &[usize],
     selected: &Option<NodePath>,
+    parent_node: Option<&Node>,       // zoom_path 的父节点（用于渲染"返回上层"块）
+    parent_base_path: Option<&[usize]>, // parent 的路径
 ) -> TreeAction {
     let mut action = TreeAction::None;
-    let mut path = base_path.to_vec();
-    draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
+
+    // ── 如果已放大到子层，在顶部画一个"⬆ 返回上层"条 ──
+    if let (Some(parent), Some(parent_base)) = (parent_node, parent_base_path) {
+        let up_h = (rect.height() * UP_BAR_HEIGHT).max(20.0);
+        let up_rect = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), up_h));
+        let painter = ui.painter_at(up_rect);
+        painter.rect_filled(up_rect, CornerRadius::same(4), UP_COLOR);
+        painter.text(
+            up_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("⬆ 返回上级：{}", parent.name),
+            FontId::proportional(12.0),
+            Color32::from_rgb(0xBB, 0xBB, 0xCC),
+        );
+        let up_id = ui.id().with("go_up");
+        let up_resp = ui.interact(up_rect, up_id, egui::Sense::click());
+        if ui.rect_contains_pointer(up_rect) {
+            egui::Area::new(up_id.with("tip"))
+                .fixed_pos(ui.ctx().pointer_latest_pos().unwrap_or_default() + Vec2::new(14.0, -18.0))
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new("单击返回上一级").color(Color32::WHITE));
+                });
+        }
+        if up_resp.clicked() && !up_resp.double_clicked() {
+            // 返回上层：ZoomTo 到 parent 的路径
+            action = TreeAction::ZoomTo(parent_base.to_vec());
+        }
+
+        // 剩下的空间给子色块
+        let remaining = egui::Rect::from_min_size(
+            Pos2::new(rect.min.x, up_rect.max.y + 4.0),
+            Vec2::new(rect.width(), rect.height() - up_h - 4.0),
+        );
+        let mut path = base_path.to_vec();
+        draw_children(ui, remaining, view_root, &mut path, 0, selected, &mut action);
+    } else {
+        let mut path = base_path.to_vec();
+        draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
+    }
+
     action
 }
 
@@ -91,7 +134,7 @@ fn draw_children(
         // ── 关键：先递归子块（嵌套色块），再处理本级点击 ──
         if child.expanded && !child.children.is_empty() && depth + 1 < MAX_DEPTH {
             let nested = inset.shrink(NEST_PAD);
-            if nested.width() > 8.0 && nested.height() > 8.0 {
+            if nested.width() > 10.0 && nested.height() > 10.0 {
                 draw_children(ui, nested, child, path, depth + 1, selected, action);
             }
         }
@@ -114,31 +157,32 @@ fn draw_children(
 }
 
 fn draw_label(ui: &egui::Ui, painter: &egui::Painter, inset: egui::Rect, node: &Node) {
-    let pad = 5.0;
+    let pad = 4.0;
     let text_max_w = inset.width() - pad * 2.0;
-    if inset.width() <= 22.0 || inset.height() <= 18.0 || text_max_w <= 8.0 {
+    if inset.width() <= 20.0 || inset.height() <= 16.0 || text_max_w <= 6.0 {
         return;
     }
-    let name_font = FontId::proportional(11.5);
+    // 文件名用更小的字体，以适应色块尺寸
+    let name_font = FontId::proportional(9.5);
     let shown_name = truncate_text(ui.ctx(), &node.name, name_font.clone(), text_max_w);
     if !shown_name.is_empty() {
         painter.text(
-            inset.left_top() + Vec2::new(pad, 3.0),
+            inset.left_top() + Vec2::new(pad, 2.0),
             egui::Align2::LEFT_TOP,
             &shown_name,
             name_font,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 235),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 230),
         );
     }
-    if inset.height() > 34.0 {
-        let size_font = FontId::proportional(10.0);
+    if inset.height() > 28.0 {
+        let size_font = FontId::proportional(8.5);
         let sz = truncate_text(ui.ctx(), &human_size(node.size), size_font.clone(), text_max_w);
         painter.text(
-            inset.left_bottom() + Vec2::new(pad, -3.0),
+            inset.left_bottom() + Vec2::new(pad, -2.0),
             egui::Align2::LEFT_BOTTOM,
             &sz,
             size_font,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 190),
         );
     }
 }
