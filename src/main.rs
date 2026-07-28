@@ -321,8 +321,14 @@ impl eframe::App for DiskUiApp {
                 ui.label(RichText::new("空间分布 (Treemap)").strong().size(15.0));
                 ui.add_space(8.0);
 
-                let avail = ui.available_size() - Vec2::new(0.0, 220.0);
-                let (rect, _resp) = ui.allocate_exact_size(avail.max(Vec2::new(100.0, 100.0)), egui::Sense::click());
+                // treemap 给一个相对固定的高度比例，剩下的空间交给下面
+                // 独立的 ScrollArea（文件明细）自己管理，不再用脆弱的"瞎减常数"写法。
+                let total_h = ui.available_height();
+                let treemap_h = (total_h * 0.5).clamp(220.0, 420.0);
+                let (rect, _resp) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), treemap_h),
+                    egui::Sense::click(),
+                );
                 let rects = compute_treemap(&self.nodes, rect);
 
                 for (i, (r, n)) in rects.iter().zip(self.nodes.iter()).enumerate() {
@@ -383,27 +389,38 @@ impl eframe::App for DiskUiApp {
                 ui.add_space(8.0);
 
                 ui.label(RichText::new("文件明细").strong().size(14.0));
-                egui_extras::TableBuilder::new(ui)
-                    .striped(true)
-                    .column(egui_extras::Column::remainder().at_least(200.0))
-                    .column(egui_extras::Column::exact(90.0))
-                    .column(egui_extras::Column::exact(110.0))
-                    .header(22.0, |mut header| {
-                        header.col(|ui| { ui.label(RichText::new("名称").strong()); });
-                        header.col(|ui| { ui.label(RichText::new("类型").strong()); });
-                        header.col(|ui| { ui.label(RichText::new("大小").strong()); });
-                    })
-                    .body(|mut body| {
-                        for n in &self.nodes {
-                            body.row(20.0, |mut row| {
-                                row.col(|ui| {
-                                    let icon = if n.kind == "folder" { "📁" } else { "📄" };
-                                    ui.label(format!("{icon} {}", n.name));
-                                });
-                                row.col(|ui| { ui.label(n.kind); });
-                                row.col(|ui| { ui.label(human_size(n.size)); });
+                ui.add_space(4.0);
+
+                // 关键修复：表格必须包在独立的 ScrollArea 里，并且明确用
+                // auto_shrink([false, false]) 让它撑满剩余空间自己管理滚动，
+                // 否则内容超出面板高度时会被直接截断，且外层没有真正可用的滚动条。
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui_extras::TableBuilder::new(ui)
+                            .striped(true)
+                            .column(egui_extras::Column::remainder().at_least(200.0))
+                            .column(egui_extras::Column::exact(90.0))
+                            .column(egui_extras::Column::exact(110.0))
+                            .header(22.0, |mut header| {
+                                header.col(|ui| { ui.label(RichText::new("名称").strong()); });
+                                header.col(|ui| { ui.label(RichText::new("类型").strong()); });
+                                header.col(|ui| { ui.label(RichText::new("大小").strong()); });
+                            })
+                            .body(|mut body| {
+                                for n in &self.nodes {
+                                    body.row(20.0, |mut row| {
+                                        row.col(|ui| {
+                                            let icon = if n.kind == "folder" { "📁" } else { "📄" };
+                                            ui.label(format!("{icon} {}", n.name));
+                                        });
+                                        row.col(|ui| { ui.label(n.kind); });
+                                        row.col(|ui| { ui.label(human_size(n.size)); });
+                                    });
+                                }
                             });
-                        }
+                        // 底部留白，确保滚到最下面时最后一行完整可见、不贴边
+                        ui.add_space(16.0);
                     });
             });
 
