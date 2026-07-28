@@ -20,7 +20,8 @@ const BLOCK_PAD: f32 = 0.5;
 const NEST_TOP: f32 = 14.0;
 const MAX_DEPTH: u32 = 6;
 /// 子块小于此尺寸时不展开嵌套（提示双击进入）
-const MIN_INLINE_SIZE: f32 = 30.0;
+const MIN_INLINE_SIZE: f32 = 80.0;
+const MIN_RENDER_SIZE: f32 = 12.0;
 const FILE_COLOR: Color32 = Color32::from_rgb(0x5A, 0x6B, 0x7C);
 const FILE_BORDER: Color32 = Color32::from_rgb(0x6A, 0x7B, 0x8C);
 const UP_COLOR: Color32 = Color32::from_rgb(0x40, 0x42, 0x46);
@@ -32,38 +33,27 @@ pub fn show(
     base_path: &[usize],
     selected: &Option<NodePath>,
     parent_node: Option<&Node>,
-    parent_base_path: Option<&[usize]>,
+    _parent_base_path: Option<&[usize]>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
 
-    if let (Some(parent), Some(parent_base)) = (parent_node, parent_base_path) {
-        let up_h = 22.0_f32;
-        let up_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), up_h));
-        let painter = ui.painter_at(up_rect);
-        painter.rect_filled(up_rect, CornerRadius::same(3), UP_COLOR);
+    // SpaceSniffer 风格：放大后保留上一层色块作为容器，不显示返回按钮。
+    let mut draw_rect = rect;
+    if let Some(parent) = parent_node {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::same(4), parent.color);
         painter.text(
-            up_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("⬆ 返回  {}", parent.name),
+            rect.left_top() + Vec2::new(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            &parent.name,
             FontId::proportional(11.0),
-            Color32::from_rgb(0xBB, 0xBB, 0xCC),
+            Color32::WHITE,
         );
-        let up_id = ui.id().with("go_up");
-        let up_resp = ui.interact(up_rect, up_id, egui::Sense::click());
-        if up_resp.clicked() && !up_resp.double_clicked() {
-            action = TreeAction::ZoomTo(parent_base.to_vec());
-        }
-        // 剩余空间给子色块
-        let remain = Rect::from_min_max(
-            Pos2::new(rect.min.x, up_rect.max.y + 3.0),
-            rect.max,
-        );
-        let mut path = base_path.to_vec();
-        draw_children(ui, remain, view_root, &mut path, 0, selected, &mut action);
-    } else {
-        let mut path = base_path.to_vec();
-        draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
+        draw_rect = rect.shrink2(Vec2::new(8.0, 20.0));
     }
+
+    let mut path = base_path.to_vec();
+    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action);
     action
 }
 
@@ -85,7 +75,7 @@ fn draw_children(
 
     for (i, (r, child)) in rects.iter().zip(node.children.iter()).enumerate() {
         let inset = r.shrink(BLOCK_PAD);
-        if inset.width() < 2.0 || inset.height() < 2.0 {
+        if inset.width() < MIN_RENDER_SIZE || inset.height() < MIN_RENDER_SIZE {
             continue;
         }
         path.push(i);
@@ -168,7 +158,7 @@ fn draw_label(ui: &egui::Ui, painter: &egui::Painter, inset: egui::Rect, node: &
     let name_font = FontId::proportional(9.0);
     let shown = truncate_text(ui.ctx(), &node.name, name_font.clone(), text_max_w);
     if !shown.is_empty() && inset.height() > 12.0 {
-        let y_top = if expanded { NEST_TOP - 2.0 } else { 2.0 };
+        let y_top = 2.0;
         painter.text(
             inset.left_top() + Vec2::new(pad, y_top),
             egui::Align2::LEFT_TOP,
