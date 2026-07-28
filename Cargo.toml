@@ -9,4 +9,3 @@ edition = "2021"
 eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.28"
 egui_extras = "0.28"
-
