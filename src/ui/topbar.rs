@@ -29,7 +29,7 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
         .exact_size(56.0)
         .frame(
             egui::Frame::default()
-                .fill(Color32::from_rgb(0x2D, 0x2D, 0x30))
+                .fill(Color32::from_rgb(0x38, 0x38, 0x3C))
                 .inner_margin(egui::Margin::symmetric(16, 8)),
         )
         .show(ui, |ui| {
