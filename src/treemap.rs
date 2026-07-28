@@ -45,8 +45,8 @@ fn binary_split(
     }
 
     let target = total * 0.5;
-    let mid = match prefix.binary_search_by(|&p| {
-        if p > target {
+    let mid = match prefix.binary_search_by(|p| {
+        if *p > target {
             std::cmp::Ordering::Greater
         } else {
             std::cmp::Ordering::Less
@@ -155,7 +155,7 @@ pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
         };
 
         // ── 布局：降序排列后二分分割 ──
-        let mut order: Vec<usize> = (0..n).filter(|&i| active[i]).collect();
+        let mut order: Vec<usize> = (0..n).filter(|i| active[*i]).collect();
         order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]));
         let mut tmp = vec![egui::Rect::NOTHING; n];
         binary_split(rect, &mut order, &scaled, &mut tmp, LAYOUT_PAD);
