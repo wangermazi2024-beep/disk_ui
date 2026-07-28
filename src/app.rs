@@ -193,8 +193,12 @@ impl DiskUiApp {
     }
 
     /// 顶部面包屑（可点击路径）：`C: / Windows / System32 / drivers`。
-    /// 如果用宽度不够显示完整路径，用算法截断中间层级：`C: / … / drivers / … / target`。
-    /// 点击任意一段跳转回对应层级（截断的「…」本身不可点击）。
+    ///
+    /// 截断算法（Middle Ellipsis）：
+    /// - 始终保留最左一段（根）和最右一段（当前层）。
+    /// - 从左往右贪心地加入中间段，直到剩余宽度不足以再加下一段 + " / … / " + 当前层。
+    /// - 被省略的中间段统一用不可点击的 "…" 替代。
+    /// - 这样用户随时能看到"我在哪"和"从哪来"，也能点击根或当前层的父级回溯。
     fn breadcrumb_ui(&self, ui: &mut egui::Ui) -> Option<TreeAction> {
         let mut clicked: Option<NodePath> = None;
 
@@ -206,53 +210,84 @@ impl DiskUiApp {
             }
         }
 
-        // 收集所有路径段的名称和路径
+        // 收集所有路径段
         struct Seg {
             name: String,
             path: Vec<usize>,
         }
-        let mut segs = vec![Seg {
-            name: self.root.name.clone(),
-            path: Vec::new(),
-        }];
+        let mut segs = vec![Seg { name: self.root.name.clone(), path: Vec::new() }];
         let mut cursor = &self.root;
         let mut prefix = Vec::new();
         for &i in &self.zoom_path {
             let Some(child) = cursor.children.get(i) else { break };
             prefix.push(i);
-            segs.push(Seg {
-                name: child.name.clone(),
-                path: prefix.clone(),
-            });
+            segs.push(Seg { name: child.name.clone(), path: prefix.clone() });
             cursor = child;
         }
 
-        let avail_w = ui.available_width() - 50.0; // 给按钮预留
-        ui.horizontal(|ui| {
-            ui.set_max_width(avail_w.max(80.0));
+        // 用 egui 测量字符串像素宽度
+        let measure_str = |s: &str| -> f32 {
+            let font = egui::FontId::proportional(12.5);
+            ui.ctx().fonts(|f| f.layout_no_wrap(s.to_owned(), font, Color32::WHITE).size().x)
+        };
+        let sep_w = measure_str(" / ");
+        let ellipsis_w = measure_str("…");
 
-            // 路径太长 → 截断：保留首尾，中间用"…"代替
-            let max_visible = 3; // 最多显示 N 段（根 + 1~2 个子段）
-            let show_segs: Vec<&Seg> = if segs.len() > max_visible + 1 {
-                let head = &segs[0..2]; // 根 + 第一级
-                let tail = &segs[segs.len() - 2..]; // 最后两级
-                head.iter().chain(
-                    std::iter::once(&Seg { name: "…".into(), path: vec![] }),
-                ).chain(tail.iter()).collect()
-            } else {
-                segs.iter().collect()
-            };
+        // 可用宽度（留 8px 安全边距）
+        let avail_w = (ui.available_width() - 8.0).max(60.0);
 
-            for (idx, seg) in show_segs.iter().enumerate() {
-                if idx > 0 {
-                    ui.label(RichText::new(" / ").color(Color32::from_rgb(0x70, 0x70, 0x70)).size(12.5));
-                }
-                if seg.name == "…" {
-                    ui.label(RichText::new("…").color(Color32::from_rgb(0x70, 0x70, 0x70)).size(12.5));
+        // Middle-Ellipsis 算法（用下标避免 lifetime 问题）：
+        // - 始终显示首段（index 0）和尾段（index n-1）
+        // - 中间段从左向右贪心填入，装不下就用 None 表示省略
+        // slot = Some(seg_index) 表示显示该段，None 表示"…"
+        let slots: Vec<Option<usize>> = if segs.len() <= 2 {
+            (0..segs.len()).map(Some).collect()
+        } else {
+            let first_w = measure_str(&segs[0].name);
+            let last_w  = measure_str(&segs[segs.len() - 1].name);
+            // 最少空间：first + sep + … + sep + last
+            let min_w = first_w + sep_w + ellipsis_w + sep_w + last_w;
+            let mut remaining = avail_w - min_w;
+
+            let mut middle: Vec<Option<usize>> = Vec::new();
+            let mut need_ellipsis = false;
+            for idx in 1..segs.len() - 1 {
+                let cost = sep_w + measure_str(&segs[idx].name);
+                if remaining >= cost {
+                    middle.push(Some(idx));
+                    remaining -= cost;
                 } else {
-                    let is_last = idx == show_segs.len() - 1;
-                    if ui.selectable_label(is_last, RichText::new(&seg.name).size(12.5)).clicked() {
-                        clicked = Some(seg.path.clone());
+                    need_ellipsis = true;
+                    break;
+                }
+            }
+
+            let mut result = vec![Some(0_usize)];
+            result.extend(middle);
+            if need_ellipsis {
+                result.push(None); // "…"
+            }
+            result.push(Some(segs.len() - 1));
+            result
+        };
+
+        ui.horizontal(|ui| {
+            let total = slots.len();
+            for (slot_idx, slot) in slots.iter().enumerate() {
+                if slot_idx > 0 {
+                    ui.label(RichText::new(" / ").color(Color32::from_rgb(0x65, 0x65, 0x70)).size(12.5));
+                }
+                match slot {
+                    None => {
+                        ui.label(RichText::new("…").color(Color32::from_rgb(0x65, 0x65, 0x70)).size(12.5));
+                    }
+                    Some(seg_idx) => {
+                        let seg = &segs[*seg_idx];
+                        let is_last = slot_idx == total - 1;
+                        let label = RichText::new(&seg.name).size(12.5);
+                        if ui.selectable_label(is_last, label).clicked() && !is_last {
+                            clicked = Some(seg.path.clone());
+                        }
                     }
                 }
             }
