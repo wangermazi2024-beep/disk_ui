@@ -4,7 +4,7 @@
 //! 真正发起后台扫描线程的逻辑留在 `app.rs`，模块本身不持有 channel/线程状态，
 //! 保持职责单一。
 
-use egui::{Color32, RichText};
+use egui::{Color32, CornerRadius, RichText};
 
 use crate::format::human_size;
 
@@ -42,7 +42,7 @@ pub fn show(ctx: &egui::Context, state: TopbarState) -> TopbarAction {
                     .add(
                         egui::Button::new(RichText::new("  扫描  ").color(Color32::WHITE))
                             .fill(Color32::from_rgb(0x4C, 0x8B, 0xF5))
-                            .rounding(6.0),
+                            .corner_radius(CornerRadius::same(6)),
                     )
                     .clicked()
                 {

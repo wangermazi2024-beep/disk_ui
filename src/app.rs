@@ -63,7 +63,8 @@ fn estimate_total(used: u64) -> u64 {
 }
 
 impl eframe::App for DiskUiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx();
         self.apply_dark_theme(ctx);
         self.poll_scan();
 
@@ -96,15 +97,16 @@ impl DiskUiApp {
         // 从 egui 内置的暗色主题起步，而不是零散地强制文字颜色。
         // 之前用 override_text_color 只对"没有显式设色"的文字生效，
         // .strong() 这类样式会绕过它，导致暗底配深色字看不清。
-        let mut visuals = egui::Visuals::dark();
-        visuals.window_fill = Color32::from_rgb(0x1E, 0x1F, 0x22);
-        visuals.panel_fill = Color32::from_rgb(0x1E, 0x1F, 0x22);
-        let mut style = (*ctx.style()).clone();
-        style.visuals = visuals;
-        style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-        style.spacing.button_padding = Vec2::new(12.0, 6.0);
-        style.interaction.tooltip_delay = 0.05; // 即时显示气泡（默认 0.5s 太慢）
-        ctx.set_style(style);
+        ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals {
+            window_fill: Color32::from_rgb(0x1E, 0x1F, 0x22),
+            panel_fill: Color32::from_rgb(0x1E, 0x1F, 0x22),
+            ..Default::default()
+        });
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+            style.spacing.button_padding = Vec2::new(12.0, 6.0);
+            style.interaction.tooltip_delay = 0.05; // 即时显示气泡（默认 0.5s 太慢）
+        });
     }
 
     fn start_scan(&mut self) {
