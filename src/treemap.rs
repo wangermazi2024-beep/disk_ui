@@ -99,7 +99,7 @@ pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
         let total: f64 = active
             .iter()
             .enumerate()
-            .filter(|(_, a)| *a)
+            .filter(|(_, a)| **a)
             .map(|(i, _)| sizes[i].max(1) as f64)
             .sum();
         if total <= 0.0 {
@@ -111,7 +111,7 @@ pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
         let max_frac = active
             .iter()
             .enumerate()
-            .filter(|(_, a)| *a)
+            .filter(|(_, a)| **a)
             .map(|(i, _)| sizes[i].max(1) as f64 / total)
             .fold(0.0_f64, f64::max);
         let scaled: Vec<f32> = if max_frac > 0.5 {
@@ -119,7 +119,6 @@ pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
             let ct: f64 = sizes
                 .iter()
                 .enumerate()
-                .filter(|(_, _)| true)
                 .map(|(i, _)| {
                     if active[i] {
                         (sizes[i].max(1) as f64).powf(pow)
