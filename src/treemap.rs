@@ -1,135 +1,104 @@
-//! Simple recursive proportional-split treemap algorithm.
+//! Binary Treemap 算法
 //!
-//! Preserves original item order (no sorting), alternating split direction
-//! at each recursion level. Produces naturally staggered, irregular blocks
-//! reminiscent of SpaceSniffer — no aspect-ratio optimization.
+//! 递归二分分割：找到累计面积的中点，垂直或水平分割，再递归处理两侧。
+//! 相比 squarified 产生更错落有致的矩形分布，接近 SpaceSniffer 效果。
+//! 参考：Speedy37/streemap-rs (MIT)
 
-/// 间距（像素），在算法层面预留，不在渲染层 shrink
+/// 间距（像素），算法层统一处理
 pub const LAYOUT_PAD: f32 = 2.0;
 
 fn shrink(r: egui::Rect, pad: f32) -> egui::Rect {
-    let half = pad * 0.5;
+    let h = pad * 0.5;
     egui::Rect::from_min_max(
-        egui::pos2(r.min.x + half, r.min.y + half),
-        egui::pos2(r.max.x - half, r.max.y - half),
+        egui::pos2(r.min.x + h, r.min.y + h),
+        egui::pos2(r.max.x - h, r.max.y - h),
     )
 }
 
-/// Recursive split: divide items into two groups at the point where cumulative
-/// size is closest to half of total, split the rect proportionally, then recurse
-/// with the opposite orientation (vertical ↔ horizontal).
-fn split_treemap(
-    items: &[(usize, f32)],
+/// 递归二分分割
+fn binary_split(
     rect: egui::Rect,
+    indices: &mut [usize],
+    scaled: &[f32],
     out: &mut [egui::Rect],
     pad: f32,
-    vertical: bool,
 ) {
-    if items.is_empty() {
+    let n = indices.len();
+    if n == 0 {
         return;
     }
-    if items.len() == 1 {
-        out[items[0].0] = shrink(rect, pad);
-        return;
-    }
-
-    let total: f32 = items.iter().map(|(_, s)| s).sum();
-
-    // When all sizes are zero (edge case), split evenly by count
-    if total <= 0.0 {
-        let mid = items.len() / 2;
-        let frac = mid as f32 / items.len() as f32;
-        let (r1, r2) = split_rect(rect, frac, vertical);
-        split_treemap(&items[..mid], r1, out, pad, !vertical);
-        split_treemap(&items[mid..], r2, out, pad, !vertical);
+    if n == 1 {
+        out[indices[0]] = shrink(rect, pad);
         return;
     }
 
-    let half = total * 0.5;
-
-    // Find split index where cumulative size is closest to half.
-    // At least one item must go into each group.
-    let mut split_idx = 1;
-    let mut best_diff = f32::MAX;
-    let mut cumul = 0.0_f32;
-
-    for i in 0..items.len().saturating_sub(1) {
-        cumul += items[i].1;
-        let diff = (cumul - half).abs();
-        if diff < best_diff {
-            best_diff = diff;
-            split_idx = i + 1;
-        }
+    // 计算前缀和
+    let mut prefix = Vec::with_capacity(n);
+    let mut total = 0.0_f32;
+    for &idx in indices.iter() {
+        total += scaled[idx];
+        prefix.push(total);
     }
 
-    let group1_sum: f32 = items[..split_idx].iter().map(|(_, s)| s).sum();
-    let frac = (group1_sum / total).clamp(0.01, 0.99);
+    // 找中点：累计面积达到 total/2 的位置
+    let target = total * 0.5;
+    let mid = match prefix.binary_search_by(|&p| p.partial_cmp(&target).unwrap_or(std::cmp::Ordering::Less)) {
+        Ok(i) => i + 1,
+        Err(i) => i.max(1),
+    };
+    let mid = mid.min(n - 1); // 保证两侧都至少有 1 个
 
-    let (r1, r2) = split_rect(rect, frac, vertical);
-    split_treemap(&items[..split_idx], r1, out, pad, !vertical);
-    split_treemap(&items[split_idx..], r2, out, pad, !vertical);
-}
-
-/// Split `rect` into two sub-rectangles at a fractional position along the
-/// given axis (`vertical = true` → left/right split).
-fn split_rect(rect: egui::Rect, frac: f32, vertical: bool) -> (egui::Rect, egui::Rect) {
-    if vertical {
-        let split_x = rect.min.x + rect.width() * frac;
-        let r1 = egui::Rect::from_min_max(rect.min, egui::pos2(split_x, rect.max.y));
-        let r2 = egui::Rect::from_min_max(egui::pos2(split_x, rect.min.y), rect.max);
-        (r1, r2)
+    // 根据宽高比决定分割方向
+    if rect.width() >= rect.height() {
+        // 垂直分割（左右）
+        let left_frac = prefix[mid - 1] / total;
+        let xm = rect.min.x + rect.width() * left_frac;
+        let left = egui::Rect::from_min_max(rect.min, egui::pos2(xm, rect.max.y));
+        let right = egui::Rect::from_min_max(egui::pos2(xm, rect.min.y), rect.max);
+        binary_split(left, &mut indices[..mid], scaled, out, pad);
+        binary_split(right, &mut indices[mid..], scaled, out, pad);
     } else {
-        let split_y = rect.min.y + rect.height() * frac;
-        let r1 = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, split_y));
-        let r2 = egui::Rect::from_min_max(egui::pos2(rect.min.x, split_y), rect.max);
-        (r1, r2)
+        // 水平分割（上下）
+        let top_frac = prefix[mid - 1] / total;
+        let ym = rect.min.y + rect.height() * top_frac;
+        let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, ym));
+        let bottom = egui::Rect::from_min_max(egui::pos2(rect.min.x, ym), rect.max);
+        binary_split(top, &mut indices[..mid], scaled, out, pad);
+        binary_split(bottom, &mut indices[mid..], scaled, out, pad);
     }
 }
 
 /// 计算 treemap 布局。
+/// 返回每个子项对应的 egui::Rect（已包含 LAYOUT_PAD 间距，直接用于渲染）。
 ///
-/// 返回每个子项对应的 `egui::Rect`（已包含 `LAYOUT_PAD` 间距，直接用于渲染，不需再 shrink）。
-///
-/// 使用递归比例分割：保持原始文件顺序不变，每层按累计大小比例分割矩形，
-/// 方向在垂直/水平之间交替。不优化宽高比，产生自然错落的"SpaceSniffer 风格"色块。
+/// 算法：将 items 按面积比例缩放到 rect 内，
+/// 然后递归二分分割，每次在累计中点处垂直或水平切开。
+/// 不去优化宽高比，而是让块按面积自然错落分布。
 pub fn compute_treemap(sizes: &[u64], rect: egui::Rect) -> Vec<egui::Rect> {
     let n = sizes.len();
     let mut out = vec![egui::Rect::NOTHING; n];
-    if n == 0 || rect.width() <= 2.0 || rect.height() <= 2.0 {
+    if n == 0 || rect.width() <= LAYOUT_PAD || rect.height() <= LAYOUT_PAD {
         return out;
     }
 
-    let total: f64 = sizes.iter().map(|s| (*s).max(1) as f64).sum();
-    let area = (rect.width() * rect.height()) as f64;
+    let total: f64 = sizes.iter().map(|&s| s.max(1) as f64).sum();
+    let area = rect.width() as f64 * rect.height() as f64;
 
-    // Size compression: when a single file dominates (>50%), apply pow scaling
-    // to avoid extreme aspect ratios while preserving ordering.
-    let max_frac = sizes
-        .iter()
-        .map(|s| (*s).max(1) as f64 / total)
-        .fold(0.0_f64, f64::max);
-
+    // 大文件压缩：最大项占比 >50% 时用 pow 压缩，避免极端宽高比
+    let max_frac = sizes.iter().map(|&s| s.max(1) as f64 / total).fold(0.0_f64, f64::max);
     let scaled: Vec<f32> = if max_frac > 0.5 {
         let pow = 0.72_f64;
-        let ct: f64 = sizes
-            .iter()
-            .map(|s| ((*s).max(1) as f64).powf(pow))
-            .sum();
-        sizes
-            .iter()
-            .map(|s| (((*s).max(1) as f64).powf(pow) / ct * area) as f32)
-            .collect()
+        let ct: f64 = sizes.iter().map(|&s| (s.max(1) as f64).powf(pow)).sum();
+        sizes.iter().map(|&s| ((s.max(1) as f64).powf(pow) / ct * area) as f32).collect()
     } else {
         let scale = area / total;
-        sizes
-            .iter()
-            .map(|s| ((*s).max(1) as f64 * scale) as f32)
-            .collect()
+        sizes.iter().map(|&s| (s.max(1) as f64 * scale) as f32).collect()
     };
 
-    // Preserve original order — no sorting
-    let items: Vec<(usize, f32)> = (0..n).map(|i| (i, scaled[i])).collect();
+    // 降序排列（Binary 在此顺序下效果最好）
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]));
 
-    split_treemap(&items, rect, &mut out, LAYOUT_PAD, true);
+    binary_split(rect, &mut order, &scaled, &mut out, LAYOUT_PAD);
     out
 }
