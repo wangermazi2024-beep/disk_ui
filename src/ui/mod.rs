@@ -21,10 +21,9 @@ pub enum TreeAction {
 }
 
 impl TreeAction {
-    pub fn or(self, other: TreeAction) -> TreeAction {
-        match self {
-            TreeAction::None => other,
-            _ => self,
+    pub fn merge(&mut self, other: TreeAction) {
+        if !matches!(other, TreeAction::None) {
+            *self = other;
         }
     }
 }

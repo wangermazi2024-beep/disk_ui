@@ -171,7 +171,7 @@ impl DiskUiApp {
 
                 let view_root = self.root.navigate(&self.zoom_path).unwrap_or(&self.root);
                 let tm_action = treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected);
-                action = action.or(tm_action);
+                action.merge(tm_action);
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -181,7 +181,7 @@ impl DiskUiApp {
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
-                    action = action.clone().or(list_action);
+                    action.merge(list_action);
                 });
                 action
             })
