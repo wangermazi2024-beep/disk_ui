@@ -100,9 +100,9 @@ fn draw_children(
 
         let painter = ui.painter_at(*r);
         painter.rect_filled(*r, CornerRadius::same(2), block_color);
-        if is_file {
-            painter.rect_stroke(*r, CornerRadius::same(2), Stroke::new(1.0, FILE_BORDER), StrokeKind::Inside);
-        }
+        // 每个色块都画边框线，无间隙时靠边框区分相邻块
+        let border_color = if is_file { FILE_BORDER } else { Color32::from_rgba_unmultiplied(0, 0, 0, 40) };
+        painter.rect_stroke(*r, CornerRadius::same(2), Stroke::new(1.0, border_color), StrokeKind::Inside);
         if is_selected {
             painter.rect_stroke(*r, CornerRadius::same(2), Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
         }
