@@ -192,8 +192,9 @@ impl DiskUiApp {
             .inner
     }
 
-    /// 顶部面包屑（一行截断）：`根目录 / 子目录 / ...`，路径太长时自动截断。
-    /// 点击任意一段跳转回对应层级。
+    /// 顶部面包屑（可点击路径）：`C: / Windows / System32 / drivers`。
+    /// 如果用宽度不够显示完整路径，用算法截断中间层级：`C: / … / drivers / … / target`。
+    /// 点击任意一段跳转回对应层级（截断的「…」本身不可点击）。
     fn breadcrumb_ui(&self, ui: &mut egui::Ui) -> Option<TreeAction> {
         let mut clicked: Option<NodePath> = None;
 
@@ -205,23 +206,55 @@ impl DiskUiApp {
             }
         }
 
+        // 收集所有路径段的名称和路径
+        struct Seg {
+            name: String,
+            path: Vec<usize>,
+        }
+        let mut segs = vec![Seg {
+            name: self.root.name.clone(),
+            path: Vec::new(),
+        }];
+        let mut cursor = &self.root;
+        let mut prefix = Vec::new();
+        for &i in &self.zoom_path {
+            let Some(child) = cursor.children.get(i) else { break };
+            prefix.push(i);
+            segs.push(Seg {
+                name: child.name.clone(),
+                path: prefix.clone(),
+            });
+            cursor = child;
+        }
+
+        let avail_w = ui.available_width() - 50.0; // 给按钮预留
         ui.horizontal(|ui| {
-            ui.set_max_width(ui.available_width() - 10.0);
-            // 根节点可点击
-            if ui.selectable_label(self.zoom_path.is_empty(), RichText::new(&self.root.name).size(12.5)).clicked() {
-                clicked = Some(Vec::new());
-            }
-            let mut cursor = &self.root;
-            let mut prefix = Vec::new();
-            for &i in &self.zoom_path {
-                let Some(child) = cursor.children.get(i) else { break };
-                prefix.push(i);
-                ui.label(RichText::new(" / ").color(Color32::from_rgb(0x70, 0x70, 0x70)).size(12.5));
-                let is_current = prefix == self.zoom_path;
-                if ui.selectable_label(is_current, RichText::new(&child.name).size(12.5)).clicked() {
-                    clicked = Some(prefix.clone());
+            ui.set_max_width(avail_w.max(80.0));
+
+            // 路径太长 → 截断：保留首尾，中间用"…"代替
+            let max_visible = 3; // 最多显示 N 段（根 + 1~2 个子段）
+            let show_segs: Vec<&Seg> = if segs.len() > max_visible + 1 {
+                let head = &segs[0..2]; // 根 + 第一级
+                let tail = &segs[segs.len() - 2..]; // 最后两级
+                head.iter().chain(
+                    std::iter::once(&Seg { name: "…".into(), path: vec![] }),
+                ).chain(tail.iter()).collect()
+            } else {
+                segs.iter().collect()
+            };
+
+            for (idx, seg) in show_segs.iter().enumerate() {
+                if idx > 0 {
+                    ui.label(RichText::new(" / ").color(Color32::from_rgb(0x70, 0x70, 0x70)).size(12.5));
                 }
-                cursor = child;
+                if seg.name == "…" {
+                    ui.label(RichText::new("…").color(Color32::from_rgb(0x70, 0x70, 0x70)).size(12.5));
+                } else {
+                    let is_last = idx == show_segs.len() - 1;
+                    if ui.selectable_label(is_last, RichText::new(&seg.name).size(12.5)).clicked() {
+                        clicked = Some(seg.path.clone());
+                    }
+                }
             }
         });
 
