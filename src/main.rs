@@ -10,7 +10,7 @@ struct FileNode {
     color: Color32,
 }
 
-// 文件类型分类（对应 WizTree/TreeSize 的“按类型统计”视图）
+// 文件类型分类（对应 WizTree/TreeSize 的"按类型统计"视图）
 #[derive(Clone)]
 struct CategoryStat {
     label: &'static str,
@@ -407,12 +407,46 @@ impl eframe::App for DiskUiApp {
                 ui.separator();
                 ui.add_space(8.0);
 
+                // ---------- 固定表头（不随表格滚动） ----------
                 ui.label(RichText::new("文件明细").strong().size(14.0));
                 ui.add_space(4.0);
 
-                // 关键修复：表格必须包在独立的 ScrollArea 里，并且明确用
-                // auto_shrink([false, false]) 让它撑满剩余空间自己管理滚动，
-                // 否则内容超出面板高度时会被直接截断，且外层没有真正可用的滚动条。
+                let header_bg = Color32::from_rgb(0x2A, 0x2C, 0x30);
+                let header_h = 22.0;
+                egui::Frame::default()
+                    .fill(header_bg)
+                    .inner_margin(egui::Margin::symmetric(6.0, 0.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // 名称列（剩余宽度）
+                            let name_w = ui.available_width() - 90.0 - 110.0;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(name_w.max(50.0), header_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new("名称").strong().size(12.5).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
+                                },
+                            );
+                            // 类型列
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(90.0, header_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new("类型").strong().size(12.5).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
+                                },
+                            );
+                            // 大小列
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(110.0, header_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new("大小").strong().size(12.5).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
+                                },
+                            );
+                        });
+                    });
+
+                // ---------- 表格体（可滚动） ----------
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -421,11 +455,6 @@ impl eframe::App for DiskUiApp {
                             .column(egui_extras::Column::remainder().at_least(200.0))
                             .column(egui_extras::Column::exact(90.0))
                             .column(egui_extras::Column::exact(110.0))
-                            .header(22.0, |mut header| {
-                                header.col(|ui| { ui.label(RichText::new("名称").strong()); });
-                                header.col(|ui| { ui.label(RichText::new("类型").strong()); });
-                                header.col(|ui| { ui.label(RichText::new("大小").strong()); });
-                            })
                             .body(|mut body| {
                                 for n in &self.nodes {
                                     body.row(20.0, |mut row| {
