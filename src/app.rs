@@ -205,26 +205,6 @@ impl DiskUiApp {
             }
         }
 
-        // 构建完整路径文本
-        let mut path_parts: Vec<&str> = vec![&self.root.name];
-        let mut cursor = &self.root;
-        let mut prefix = Vec::new();
-        for &i in &self.zoom_path {
-            let Some(child) = cursor.children.get(i) else { break };
-            prefix.push(i);
-            path_parts.push(&child.name);
-            cursor = child;
-        }
-        // 路径太长时中间截断：保留首尾
-        let max_segments = 4;
-        let path_text = if path_parts.len() > max_segments {
-            let head = path_parts[0];
-            let tail: Vec<&&str> = path_parts[path_parts.len()-2..].iter().collect();
-            format!("{} / … / {}", head, tail.join(" / "))
-        } else {
-            path_parts.join(" / ")
-        };
-
         ui.horizontal(|ui| {
             ui.set_max_width(ui.available_width() - 10.0);
             // 根节点可点击
