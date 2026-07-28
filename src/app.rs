@@ -17,6 +17,9 @@ use crate::ui::{sidebar, tree_list, treemap_view, TreeAction};
 
 pub struct DiskUiApp {
     root_path: String,
+    /// 模拟的磁盘总容量。真实的"剩余空间"需要平台相关的 API（statvfs / GetDiskFreeSpaceEx），
+    /// 为了不引入额外的平台依赖，这里按已用空间估算一个总容量用于展示比例条，
+    /// 并在界面上如实叫它"演示值"，不假装是真实磁盘剩余空间。
     total_size: u64,
 
     root: Node,
@@ -24,6 +27,7 @@ pub struct DiskUiApp {
     zoom_path: NodePath,
     /// 当前选中节点，treemap 色块和文件列表树共用同一个选中状态实现联动高亮。
     selected: Option<NodePath>,
+
 
     categories: Vec<crate::model::CategoryStat>,
 
