@@ -144,7 +144,8 @@ fn draw_children(
             } else if r.width() < MIN_EXPAND_W || r.height() < MIN_EXPAND_H {
                 *action = TreeAction::Select(path.clone());
             } else {
-                *action = TreeAction::ToggleExpand(path.clone());
+                // 文件夹单击：先选中，下一帧再展开（避免双击第一帧触发展开）
+                *action = TreeAction::PrepareToggle(path.clone());
             }
         }
 

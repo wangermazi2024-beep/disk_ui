@@ -16,6 +16,8 @@ use crate::model::NodePath;
 pub enum TreeAction {
     None,
     Select(NodePath),
+    /// 单击文件夹：先选中，下一帧才执行 ToggleExpand（避免与双击冲突）
+    PrepareToggle(NodePath),
     ToggleExpand(NodePath),
     ZoomTo(NodePath),
 }
