@@ -148,8 +148,6 @@ impl DiskUiApp {
     /// 所有交互统一收敛成一个 `TreeAction`，画完之后再统一应用到状态上，
     /// 避免在 egui 的画图闭包内部同时持有 `self` 的多处可变借用。
     fn show_central_panel(&self, ctx: &egui::Context) -> TreeAction {
-        let mut action = TreeAction::None;
-
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -157,6 +155,7 @@ impl DiskUiApp {
                     .inner_margin(egui::Margin::same(16.0)),
             )
             .show(ctx, |ui| {
+                let mut action = TreeAction::None;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("空间分布 (Treemap)").strong().size(15.0));
                     ui.add_space(10.0);
@@ -184,9 +183,9 @@ impl DiskUiApp {
                     let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
                     action = action.or(list_action);
                 });
-            });
-
-        action
+                action
+            })
+            .inner
     }
 
     /// 顶部面包屑：`根目录 / 子目录 / ...`，点击任意一段都相当于双击对应色块，

@@ -136,13 +136,12 @@ fn draw_label(ui: &egui::Ui, painter: &egui::Painter, inset: egui::Rect, node: &
 fn show_tooltip(ui: &egui::Ui, id: egui::Id, inset: egui::Rect, node: &Node) {
     let tip_pos = ui.ctx().pointer_latest_pos().unwrap_or(inset.left_bottom());
     let hint = if node.children.is_empty() {
-        "单击选中".to_owned()
+        "单击选中"
     } else if node.expanded {
         "单击收起 · 双击放大到整层"
     } else {
         "单击展开下一层 · 双击放大到整层"
-    }
-    .to_string();
+    };
     egui::Area::new(id.with("tip"))
         .fixed_pos(tip_pos + Vec2::new(14.0, 0.0))
         .order(egui::Order::Tooltip)
