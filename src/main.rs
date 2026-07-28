@@ -435,7 +435,7 @@ impl eframe::App for DiskUiApp {
                     .column(egui_extras::Column::exact(110.0).resizable(true))
                     .header(22.0, |mut header| {
                         header.col(|ui| {
-                            let sort_ind = if self.sort_col == 0 { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                            let sort_ind = if self.sort_col == 0 { if self.sort_asc { " ↑" } else { " ↓" } } else { "" };
                             let resp = ui.label(RichText::new(format!("名称{sort_ind}")).strong().size(12.5));
                             if resp.clicked() {
                                 if self.sort_col == 0 { self.sort_asc = !self.sort_asc; }
@@ -443,7 +443,7 @@ impl eframe::App for DiskUiApp {
                             }
                         });
                         header.col(|ui| {
-                            let sort_ind = if self.sort_col == 1 { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                            let sort_ind = if self.sort_col == 1 { if self.sort_asc { " ↑" } else { " ↓" } } else { "" };
                             let resp = ui.label(RichText::new(format!("类型{sort_ind}")).strong().size(12.5));
                             if resp.clicked() {
                                 if self.sort_col == 1 { self.sort_asc = !self.sort_asc; }
@@ -451,7 +451,7 @@ impl eframe::App for DiskUiApp {
                             }
                         });
                         header.col(|ui| {
-                            let sort_ind = if self.sort_col == 2 { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                            let sort_ind = if self.sort_col == 2 { if self.sort_asc { " ↑" } else { " ↓" } } else { "" };
                             let resp = ui.label(RichText::new(format!("大小{sort_ind}")).strong().size(12.5));
                             if resp.clicked() {
                                 if self.sort_col == 2 { self.sort_asc = !self.sort_asc; }
