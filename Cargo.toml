@@ -9,4 +9,4 @@ edition = "2024"
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.35"
 egui_extras = "0.35"
-mft = "0.7"
+jwalk = "0.8"
