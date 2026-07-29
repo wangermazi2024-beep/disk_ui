@@ -114,6 +114,33 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                 root_node.size as f64 / 1e9,
                                 mft_elapsed.as_secs_f64()
                             );
+                            // 一致性检查：扫描汇总 vs 系统已用空间
+                            if let Some(info) = &disk_info {
+                                let scanned_gb = root_node.size as f64 / 1e9;
+                                let used_gb = info.used_bytes as f64 / 1e9;
+                                let ratio = if info.used_bytes > 0 {
+                                    root_node.size as f64 / info.used_bytes as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                eprintln!(
+                                    "[scan] 一致性检查: 扫描汇总={:.2}GB, 系统已用={:.2}GB, 比例={:.1}%",
+                                    scanned_gb, used_gb, ratio
+                                );
+                                if ratio < 60.0 {
+                                    eprintln!(
+                                        "[scan] ⚠ 扫描汇总不到系统已用的 60%，可能有丢数据（正常 70%~95%，差值含 $MFT/簇碎片/VSS/USN日志）"
+                                    );
+                                } else if ratio > 105.0 {
+                                    eprintln!(
+                                        "[scan] ⚠ 扫描汇总超过系统已用 105%，可能含 ADS/硬链接重复计算"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[scan] ✓ 扫描汇总在合理范围内（差值 = $MFT + 簇碎片 + VSS + NTFS元数据）"
+                                    );
+                                }
+                            }
                             let _ = tx.send(ScanMessage::Done(Box::new(root_node), disk_info));
                             let total = scan_start.elapsed().unwrap_or_default();
                             eprintln!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());

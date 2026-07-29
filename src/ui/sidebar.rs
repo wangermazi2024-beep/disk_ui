@@ -15,6 +15,9 @@ pub fn show(
     free_size: u64,
     categories: &[CategoryStat],
     file_system: &str,
+    scanned_size: u64,
+    scanned_files: u64,
+    scanned_folders: u64,
 ) {
     egui::Panel::left("stats_panel")
         .resizable(false)
@@ -76,5 +79,23 @@ pub fn show(
             ui.separator();
             ui.add_space(8.0);
             ui.label(RichText::new(format!("剩余空间: {}", human_size(free_size))).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+
+            // 扫描汇总 vs 系统已用，方便用户判断有没有丢数据
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new("扫描结果").strong().size(12.0).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
+            ui.label(RichText::new(format!("扫描汇总: {}", human_size(scanned_size))).size(11.5).color(Color32::from_rgb(0x4C, 0x8B, 0xF5)));
+            ui.label(RichText::new(format!("系统已用: {}", human_size(used_size))).size(11.5).color(Color32::from_rgb(0xF5, 0xA6, 0x23)));
+            let ratio = if used_size > 0 { scanned_size as f64 / used_size as f64 * 100.0 } else { 0.0 };
+            let ratio_color = if ratio < 60.0 {
+                Color32::from_rgb(0xE0, 0x55, 0x5B)
+            } else if ratio > 105.0 {
+                Color32::from_rgb(0xF5, 0xA6, 0x23)
+            } else {
+                Color32::from_rgb(0x34, 0xC7, 0x59)
+            };
+            ui.label(RichText::new(format!("一致性: {:.0}%", ratio)).size(11.5).color(ratio_color));
+            ui.label(RichText::new(format!("文件: {}  文件夹: {}", scanned_files, scanned_folders)).size(11.0).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
         });
 }

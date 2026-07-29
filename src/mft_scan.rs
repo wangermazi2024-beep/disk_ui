@@ -433,6 +433,12 @@ pub fn scan_drive_via_mft(
     let mut dir_count = 0usize;
     let mut file_count = 0usize;
     let mut records_read: u64 = 0;
+    // 诊断计数器：统计被过滤掉的记录分别是因为什么原因
+    let mut fixup_failed = 0u64;      // USA fixup 失败（记录损坏）
+    let mut bad_magic = 0u64;         // 不是 "FILE" magic（可能是 HOLE 或零填充）
+    let mut not_in_use = 0u64;        // in_use=0（已删除但 MFT 槽位未重用）
+    let mut not_base = 0u64;          // 非 base record（大文件的扩展记录，正确跳过）
+    let mut no_file_name = 0u64;      // 有 in_use+base 但没解析出 $FILE_NAME（异常）
 
     // 一次读 128 条记录（约 128KB），按 sector 对齐
     const RECORDS_PER_CHUNK: usize = 128;
@@ -511,22 +517,53 @@ pub fn scan_drive_via_mft(
                 let start = i * record_size;
                 let end = start + record_size;
                 let rec = &mut chunk_buf[start..end];
-                // apply_fixup 会修改 rec，但 chunk_buf 下一轮会被覆盖，所以直接改没问题
-                if !apply_fixup(rec, sector_size as u32) {
+                // 先检查 magic，区分"零填充/空洞"和"真实损坏记录"
+                if rec.len() < 4 || &rec[0..4] != b"FILE" {
+                    bad_magic += 1;
                     entries.push(None);
                     records_read += 1;
                     continue;
                 }
-                let parsed = parse_record(rec).filter(|e| e.in_use && e.is_base_record);
-                if let Some(p) = &parsed {
-                    valid_count += 1;
-                    if p.is_dir {
-                        dir_count += 1;
-                    } else {
-                        file_count += 1;
-                    }
+                // apply_fixup 会修改 rec，但 chunk_buf 下一轮会被覆盖，所以直接改没问题
+                if !apply_fixup(rec, sector_size as u32) {
+                    fixup_failed += 1;
+                    entries.push(None);
+                    records_read += 1;
+                    continue;
                 }
-                entries.push(parsed);
+                // parse_record 返回 Some 但可能 in_use=0 或 not base，
+                // 我们要分别统计这些情况，方便诊断有没有丢数据。
+                let parsed_opt = parse_record(rec);
+                let parsed = match parsed_opt {
+                    None => {
+                        no_file_name += 1;
+                        entries.push(None);
+                        records_read += 1;
+                        continue;
+                    }
+                    Some(e) => {
+                        if !e.in_use {
+                            not_in_use += 1;
+                            entries.push(None);
+                            records_read += 1;
+                            continue;
+                        }
+                        if !e.is_base_record {
+                            not_base += 1;
+                            entries.push(None);
+                            records_read += 1;
+                            continue;
+                        }
+                        e
+                    }
+                };
+                valid_count += 1;
+                if parsed.is_dir {
+                    dir_count += 1;
+                } else {
+                    file_count += 1;
+                }
+                entries.push(Some(parsed));
                 records_read += 1;
             }
             records_in_run_left -= actual_recs;
@@ -546,6 +583,18 @@ pub fn scan_drive_via_mft(
         dir_count,
         file_count
     );
+    eprintln!(
+        "[mft_scan] 过滤统计: bad_magic={} (零填充/空洞), fixup_failed={} (USA损坏), not_in_use={} (已删除), not_base={} (扩展记录), no_file_name={} (无$FILE_NAME)",
+        bad_magic, fixup_failed, not_in_use, not_base, no_file_name
+    );
+    // 关键诊断：no_file_name 应该接近 0。如果 >0 说明有 in_use+base 的记录
+    // 但我们没解析出 $FILE_NAME，可能是 parse_record 有 bug，导致丢文件。
+    if no_file_name > 0 {
+        eprintln!(
+            "[mft_scan] ⚠ 有 {} 条 in_use+base 记录没解析出 $FILE_NAME！这可能表示丢数据，请检查 parse_record",
+            no_file_name
+        );
+    }
 
     // 第二遍：按 parent_record 建邻接表。
     let mut children_of: HashMap<u64, Vec<u64>> = HashMap::new();

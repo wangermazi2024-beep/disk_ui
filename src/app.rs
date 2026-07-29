@@ -169,6 +169,9 @@ impl eframe::App for DiskUiApp {
                 .and_then(|i| i.as_ref())
                 .map(|i| i.file_system.as_str())
                 .unwrap_or(""),
+            self.partitions.first().map(|p| p.size).unwrap_or(0),
+            self.partitions.first().map(|p| p.file_count).unwrap_or(0),
+            self.partitions.first().map(|p| p.folder_count).unwrap_or(0),
         );
 
         let action = self.show_central_panel(ui);

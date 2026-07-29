@@ -22,8 +22,8 @@ use crate::model::{Node, NodePath};
 use super::TreeAction;
 
 const ROW_H: f32 = 22.0;
-/// 磁盘根行更高，留出多行展示 总/已分配/未分配/占用 四个值。
-const DISK_ROW_H: f32 = 56.0;
+/// 磁盘根行更高，留出多行展示 总/已分配/未分配/扫描汇总/一致性 五个值。
+const DISK_ROW_H: f32 = 68.0;
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -101,38 +101,59 @@ pub fn show(
                                 if resp.clicked() { part_clicked.set(true); }
                             });
 
-                            // ── 大小列：磁盘行多行展示 总/已分配/未分配/占用 ─
+                            // ── 大小列：磁盘行多行展示 总/已分配/未分配/扫描汇总/一致性 ─
                             row.col(|ui| {
                                 let rect = ui.available_rect_before_wrap();
                                 let resp = ui.allocate_rect(rect, Sense::click());
                                 let p = ui.painter();
-                                let line_h = 13.0;
-                                let start_y = rect.min.y + 4.0;
+                                let line_h = 12.0;
+                                let start_y = rect.min.y + 3.0;
                                 let x_label = rect.min.x + 2.0;
                                 let x_value = rect.max.x - 4.0;
 
-                                let lines: [(Color32, &str, String); 4] = if let Some(i) = info {
-                                    [
+                                // 计算一致性比例 = 扫描汇总 / 系统已用
+                                let (ratio_str, ratio_color) = if let Some(i) = info {
+                                    if i.used_bytes > 0 {
+                                        let r = partition.size as f64 / i.used_bytes as f64 * 100.0;
+                                        let color = if r < 60.0 {
+                                            Color32::from_rgb(0xE0, 0x55, 0x5B) // 红：可能丢数据
+                                        } else if r > 105.0 {
+                                            Color32::from_rgb(0xF5, 0xA6, 0x23) // 橙：可能重复计算
+                                        } else {
+                                            Color32::from_rgb(0x34, 0xC7, 0x59) // 绿：正常
+                                        };
+                                        (format!("{:.0}%", r), color)
+                                    } else {
+                                        ("—".into(), Color32::from_rgb(0xA0, 0xA0, 0xA0))
+                                    }
+                                } else {
+                                    ("—".into(), Color32::from_rgb(0xA0, 0xA0, 0xA0))
+                                };
+
+                                let lines: Vec<(Color32, &str, String)> = if let Some(i) = info {
+                                    vec![
                                         (Color32::from_rgb(0xE0, 0xE0, 0xE0), "总大小", human_size_compact(i.total_bytes)),
                                         (Color32::from_rgb(0xF5, 0xA6, 0x23), "已分配", human_size_compact(i.used_bytes)),
                                         (Color32::from_rgb(0x34, 0xC7, 0x59), "未分配", human_size_compact(i.free_bytes)),
-                                        (Color32::from_rgb(0x4C, 0x8B, 0xF5), "占用",   human_size_compact(partition.size)),
+                                        (Color32::from_rgb(0x4C, 0x8B, 0xF5), "扫描",   human_size_compact(partition.size)),
+                                        (ratio_color,                      "一致性", ratio_str),
                                     ]
                                 } else {
-                                    [
+                                    vec![
                                         (Color32::from_rgb(0xE0, 0xE0, 0xE0), "总大小", human_size_compact(partition.size)),
                                         (Color32::from_rgb(0xA0, 0xA0, 0xA0), "已分配", "—".into()),
                                         (Color32::from_rgb(0xA0, 0xA0, 0xA0), "未分配", "—".into()),
-                                        (Color32::from_rgb(0x4C, 0x8B, 0xF5), "占用",   human_size_compact(partition.size)),
+                                        (Color32::from_rgb(0x4C, 0x8B, 0xF5), "扫描",   human_size_compact(partition.size)),
+                                        (Color32::from_rgb(0xA0, 0xA0, 0xA0), "一致性", "—".into()),
                                     ]
                                 };
                                 for (i, (color, label, value)) in lines.iter().enumerate() {
                                     let y = start_y + (i as f32) * line_h;
                                     p.text(Pos2::new(x_label, y), egui::Align2::LEFT_TOP,
-                                        label, egui::FontId::proportional(10.0),
+                                        label, egui::FontId::proportional(9.5),
                                         Color32::from_rgb(0xA0, 0xA0, 0xA0));
                                     p.text(Pos2::new(x_value, y), egui::Align2::RIGHT_TOP,
-                                        value, egui::FontId::proportional(10.0), *color);
+                                        value, egui::FontId::proportional(9.5), *color);
                                 }
                                 if resp.clicked() { part_clicked.set(true); }
                             });
