@@ -33,7 +33,8 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+    CreateFileW, GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives,
+    GetVolumeInformationW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -523,7 +524,59 @@ fn build_subtree(
     Node::new_folder(display_name, folder_color(depth), children_nodes)
 }
 
-/// 用 `GetDiskFreeSpaceExW` 拿该盘符官方报告的总容量/可用空间，
+/// 枚举所有固定磁盘（如 C、D、E...），返回盘符列表。
+pub fn enum_fixed_drives() -> Vec<char> {
+    unsafe {
+        let mask = GetLogicalDrives();
+        let mut drives = Vec::new();
+        for i in 0..26 {
+            if mask & (1 << i) != 0 {
+                let d = (b'A' + i) as char;
+                let root = wide(&format!("{d}:\\"));
+                let dt = GetDriveTypeW(root.as_ptr());
+                // DRIVE_FIXED = 3
+                if dt == 3 {
+                    drives.push(d);
+                }
+            }
+        }
+        drives
+    }
+}
+
+/// 获取卷标（如果存在）和 Explorer 友好显示名。
+/// 返回 (卷标, 友好名)。
+pub fn get_volume_label(drive_letter: char) -> (String, String) {
+    use std::ptr;
+    unsafe {
+        let path = wide(&format!(r"{drive_letter}:\"));
+        let mut vol_buf = [0u16; 256];
+        let mut fs_buf = [0u16; 256];
+        let mut sn = 0u32;
+        let mut max_comp = 0u32;
+        let mut flags = 0u32;
+
+        let ok = GetVolumeInformationW(
+            path.as_ptr(),
+            vol_buf.as_mut_ptr(),
+            vol_buf.len() as u32,
+            &mut sn,
+            &mut max_comp,
+            &mut flags,
+            fs_buf.as_mut_ptr(),
+            fs_buf.len() as u32,
+        );
+
+        let vol_label = if ok != 0 {
+            let len = vol_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            String::from_utf16_lossy(&vol_buf[..len])
+        } else {
+            String::new()
+        };
+
+        (vol_label, String::new()) // 友好名后续扩展
+    }
+}
 /// 用来和扫描结果的汇总大小做一个"量级是否合理"的旁证
 /// （注意：文件逻辑大小之和天然会小于"已用空间"，因为它不包含簇内部碎片、
 /// NTFS 元数据本身、卷影副本等——这是预期内的差异，不是 bug）。
