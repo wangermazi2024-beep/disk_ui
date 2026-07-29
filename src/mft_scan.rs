@@ -93,7 +93,7 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
         eprintln!("[mft] is_elevated=false, 无法扫描");
         return false;
     }
-    let path = wide(&format!(r"\\\.\{}:", drive_letter));
+    let path = wide(&format!(r"\\\\.\{}:", drive_letter));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -131,7 +131,7 @@ struct VolumeInfo {
 }
 
 fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
-    let path = wide(&format!(r"\\.\{}:", drive_letter));
+    let path = wide(&format!(r"\\\.\{}:", drive_letter));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
