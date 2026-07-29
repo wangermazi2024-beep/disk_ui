@@ -30,7 +30,11 @@ pub struct DiskUiApp {
     view_path: NodePath,
     /// 当前选中节点，treemap 色块和文件列表树共用同一个选中状态实现联动高亮。
     selected: Option<NodePath>,
-
+    /// 只在"刚展开某层/刚跳转到新视图根"的那一帧有值：告诉 treemap_view，
+    /// 这一层的子色块是新出现的，需要自动选中其中第一个真正被渲染出来的色块，
+    /// 而不是让旧的白色选中框停留在一个现在已经不相关的位置上。
+    /// 用一次就清空（在 apply_action 开头清掉），不会一直生效。
+    pending_auto_select: Option<NodePath>,
 
     categories: Vec<crate::model::CategoryStat>,
 
@@ -51,6 +55,7 @@ impl Default for DiskUiApp {
             root,
             view_path: Vec::new(),
             selected: None,
+            pending_auto_select: None,
             categories,
             scanning: false,
             scanned_count: 0,
@@ -181,7 +186,14 @@ impl DiskUiApp {
                 let treemap_h = (total_h * 0.5).clamp(220.0, 420.0);
                 let (rect, _resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), treemap_h), egui::Sense::hover());
 
-                let tm_action = treemap_view::show(ui, rect, &self.root, &self.view_path, &self.selected);
+                let tm_action = treemap_view::show(
+                    ui,
+                    rect,
+                    &self.root,
+                    &self.view_path,
+                    &self.selected,
+                    self.pending_auto_select.as_ref(),
+                );
                 action.merge(tm_action);
 
                 ui.add_space(12.0);
@@ -309,6 +321,11 @@ impl DiskUiApp {
     }
 
     fn apply_action(&mut self, action: TreeAction) {
+        // pending_auto_select 只对"刚刚渲染的那一帧"有效，这一帧渲染时已经被
+        // treemap_view 读取/使用过了（如果适用的话会转化成下面的 Select 分支），
+        // 所以这里统一先清空，避免它一直生效、每帧都强制改选中项。
+        self.pending_auto_select = None;
+
         match action {
             TreeAction::None => {}
             TreeAction::Select(path) => {
@@ -316,25 +333,43 @@ impl DiskUiApp {
             }
             TreeAction::ToggleExpand(path) => {
                 // path 已经是"从真正根节点出发"的绝对路径，直接在真实数据上操作即可：
-                // exclusive_toggle 会自己递归到目标节点所在层，折叠兄弟、展开目标。
-                self.root.exclusive_toggle(&path);
-                self.selected = Some(path);
+                // exclusive_toggle 会自己递归到目标节点所在层，折叠兄弟、展开目标；
+                // 返回 true 表示这次操作的结果是"展开"，false 表示"收起"。
+                let expanded_now = self.root.exclusive_toggle(&path);
+                self.selected = Some(path.clone());
+                if expanded_now {
+                    // 新展开出来的子色块里还没有天然合理的选中项，标记这一层，
+                    // 下一帧交给 treemap_view 自动选中第一个真正渲染出来的色块。
+                    self.pending_auto_select = Some(path);
+                }
             }
             TreeAction::EnterNode(path) => {
-                // 双击某个节点：把它的父节点设为新的"当前视图根"。
+                // 双击某个色块（普通子色块，或者顶部"⬆ 上级目录"标题条代表的
+                // "当前视图根自己"）：把它的父节点设为新的"当前视图根"。
                 // view_path 只是一个只读的导航索引（下次渲染时用它去 navigate），
-                // 不修改、不复制、也不丢弃 root 里的任何数据——
-                // 文件列表树用的还是同一份完整的真实数据。
+                // 不修改、不复制、也不丢弃 root 里的任何数据——文件列表树用的
+                // 还是同一份完整的真实数据。
+                //
+                // 双击标题条时，这里的 path 就是当前视图根自己的绝对路径，取其
+                // 父路径正好就是"再上一级目录"，于是新画面里，刚才那个视图根会
+                // 作为普通子色块出现在它自己的兄弟中间——用户可以一路双击最外层
+                // 的标题条，逐层返回，直到 view_path 为空、回到真正的根目录。
+                //
+                // 这里不需要 pending_auto_select 兜底：不管是双击进入了哪个子
+                // 目录，还是双击标题条退回上一级，`path` 本身必定会作为新画面里
+                // 的一个可见色块存在，直接高亮它就是明确、有意义的选中状态。
                 if let Some((_, parent_path)) = path.split_last() {
                     self.view_path = parent_path.to_vec();
                 }
                 self.selected = Some(path);
             }
             TreeAction::NavigateTo(path) => {
-                // 面包屑 / "⬆ 上级目录"：直接把视图根跳到给定的绝对路径，
-                // 一路点击可以逐层返回，直到 path 为空即回到真正的根目录。
+                // 面包屑 / "⬆ 上级目录"按钮：直接把视图根跳到给定的绝对路径，
+                // 可能一次跳好几层，旧的选中项大概率已经不在新画面里了，
+                // 交给下一帧自动选中新视图根下第一个真正渲染出来的色块。
                 self.view_path = path.clone();
-                self.selected = Some(path);
+                self.selected = None;
+                self.pending_auto_select = Some(path);
             }
         }
     }
