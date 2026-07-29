@@ -20,6 +20,8 @@ pub fn show(
     ui: &mut egui::Ui,
     partitions: &[Node],
     selected: &Option<NodePath>,
+    disk_total: u64,
+    disk_free: u64,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
 
@@ -44,6 +46,31 @@ pub fn show(
                         .at_least(50.0)
                         .resizable(true),
                 )
+                .column(                         // 项目数列
+                    egui_extras::Column::initial(60.0)
+                        .at_least(40.0)
+                        .resizable(true),
+                )
+                .column(                         // 文件数列
+                    egui_extras::Column::initial(60.0)
+                        .at_least(40.0)
+                        .resizable(true),
+                )
+                .column(                         // 文件夹数列
+                    egui_extras::Column::initial(60.0)
+                        .at_least(40.0)
+                        .resizable(true),
+                )
+                .column(                         // 修改时间列
+                    egui_extras::Column::initial(140.0)
+                        .at_least(80.0)
+                        .resizable(true),
+                )
+                .column(                         // 属性列
+                    egui_extras::Column::initial(80.0)
+                        .at_least(50.0)
+                        .resizable(true),
+                )
                 .column(                         // 占比列
                     egui_extras::Column::initial(130.0)
                         .at_least(80.0)
@@ -55,6 +82,21 @@ pub fn show(
                     });
                     header.col(|ui| {
                         ui.label(egui::RichText::new("大小").strong().size(12.0).color(Color32::WHITE));
+                    });
+                    header.col(|ui| {
+                        ui.label(egui::RichText::new("项目数").strong().size(12.0).color(Color32::WHITE));
+                    });
+                    header.col(|ui| {
+                        ui.label(egui::RichText::new("文件数").strong().size(12.0).color(Color32::WHITE));
+                    });
+                    header.col(|ui| {
+                        ui.label(egui::RichText::new("文件夹数").strong().size(12.0).color(Color32::WHITE));
+                    });
+                    header.col(|ui| {
+                        ui.label(egui::RichText::new("修改时间").strong().size(12.0).color(Color32::WHITE));
+                    });
+                    header.col(|ui| {
+                        ui.label(egui::RichText::new("属性").strong().size(12.0).color(Color32::WHITE));
                     });
                     header.col(|ui| {
                         ui.label(egui::RichText::new("占比").strong().size(12.0).color(Color32::WHITE));
@@ -113,6 +155,63 @@ pub fn show(
                                     Color32::from_rgb(0xC0, 0xC0, 0xC0),
                                 );
                                 if resp.clicked() { part_clicked.set(true); }
+                            });
+                            // 项目数（分区行：用 disk_total 信息）
+                            row.col(|ui| {
+                                let rect = ui.available_rect_before_wrap();
+                                let _ = ui.allocate_rect(rect, Sense::click());
+                                let total_items = partition.file_count + partition.folder_count;
+                                ui.painter().text(
+                                    egui::pos2(rect.center().x, rect.center().y),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", total_items),
+                                    egui::FontId::proportional(11.0),
+                                    Color32::from_rgb(0xCC, 0xCC, 0xCC),
+                                );
+                            });
+                            // 文件数
+                            row.col(|ui| {
+                                let rect = ui.available_rect_before_wrap();
+                                let _ = ui.allocate_rect(rect, Sense::click());
+                                ui.painter().text(
+                                    egui::pos2(rect.center().x, rect.center().y),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", partition.file_count),
+                                    egui::FontId::proportional(11.0),
+                                    Color32::from_rgb(0xCC, 0xCC, 0xCC),
+                                );
+                            });
+                            // 文件夹数
+                            row.col(|ui| {
+                                let rect = ui.available_rect_before_wrap();
+                                let _ = ui.allocate_rect(rect, Sense::click());
+                                ui.painter().text(
+                                    egui::pos2(rect.center().x, rect.center().y),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", partition.folder_count),
+                                    egui::FontId::proportional(11.0),
+                                    Color32::from_rgb(0xCC, 0xCC, 0xCC),
+                                );
+                            });
+                            // 修改时间（分区行不显示）
+                            row.col(|ui| {
+                                let rect = ui.available_rect_before_wrap();
+                                let _ = ui.allocate_rect(rect, Sense::click());
+                            });
+                            // 属性（分区行：显示磁盘容量信息）
+                            row.col(|ui| {
+                                let rect = ui.available_rect_before_wrap();
+                                let _ = ui.allocate_rect(rect, Sense::click());
+                                if disk_total > 0 {
+                                    let used = disk_total - disk_free;
+                                    ui.painter().text(
+                                        egui::pos2(rect.max.x - 4.0, rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        format!("{:.0}%", (used as f64 / disk_total as f64) * 100.0),
+                                        egui::FontId::proportional(11.0),
+                                        Color32::from_rgb(0xAA, 0xCC, 0xFF),
+                                    );
+                                }
                             });
                             row.col(|ui| {
                                 let rect = ui.available_rect_before_wrap();
@@ -263,7 +362,7 @@ fn draw_rows(
                 else if resp.clicked()   { clicked.set(true); }
             });
 
-            // ── 大小列 ───────────────────────────────────────────
+            // ── 大小列 ──
             row.col(|ui| {
                 let rect = ui.available_rect_before_wrap();
                 let resp = ui.allocate_rect(rect, Sense::click());
@@ -278,7 +377,84 @@ fn draw_rows(
                 else if resp.clicked()   { clicked.set(true); }
             });
 
-            // ── 占比列 ───────────────────────────────────────────
+            // ── 项目数列 ──
+            row.col(|ui| {
+                let rect = ui.available_rect_before_wrap();
+                let _ = ui.allocate_rect(rect, Sense::click());
+                let total_items = child.folder_count + child.file_count;
+                if is_folder && total_items > 0 {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", total_items),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(0xCC, 0xCC, 0xCC),
+                    );
+                }
+            });
+
+            // ── 文件数列 ──
+            row.col(|ui| {
+                let rect = ui.available_rect_before_wrap();
+                let _ = ui.allocate_rect(rect, Sense::click());
+                if is_folder && child.file_count > 0 {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", child.file_count),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(0xCC, 0xCC, 0xCC),
+                    );
+                }
+            });
+
+            // ── 文件夹数列 ──
+            row.col(|ui| {
+                let rect = ui.available_rect_before_wrap();
+                let _ = ui.allocate_rect(rect, Sense::click());
+                if is_folder && child.folder_count > 0 {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", child.folder_count),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(0xCC, 0xCC, 0xCC),
+                    );
+                }
+            });
+
+            // ── 修改时间列 ──
+            row.col(|ui| {
+                let rect = ui.available_rect_before_wrap();
+                let _ = ui.allocate_rect(rect, Sense::click());
+                if child.modified > 0 {
+                    ui.painter().text(
+                        egui::pos2(rect.max.x - 4.0, rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        fmt_time(child.modified),
+                        egui::FontId::proportional(10.5),
+                        Color32::from_rgb(0xA0, 0xA0, 0xA0),
+                    );
+                }
+            });
+
+            // ── 属性列 ──
+            row.col(|ui| {
+                let rect = ui.available_rect_before_wrap();
+                let _ = ui.allocate_rect(rect, Sense::click());
+                let attr_str = fmt_attr(child.attributes);
+                if !attr_str.is_empty() {
+                    ui.painter().text(
+                        egui::pos2(rect.max.x - 4.0, rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        attr_str,
+                        egui::FontId::proportional(10.5),
+                        Color32::from_rgb(0xA0, 0xA0, 0xA0),
+                    );
+                }
+            });
+
+            // ── 占比列 ──
             row.col(|ui| {
                 let rect = ui.available_rect_before_wrap();
                 let resp = ui.allocate_rect(rect, Sense::click());
@@ -307,4 +483,58 @@ fn draw_rows(
 
         rel_path.pop();
     }
+}
+
+/// 将 unix nanos 格式化为可读的日期时间字符串。
+fn fmt_time(nanos: u64) -> String {
+    let secs = (nanos / 1_000_000_000) as i64;
+    // 使用 chrono 或手动计算；这里用简单方式：取年月日
+    // 因为不能引入 chrono 依赖，手动计算 Unix 时间 → 日期
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let h = time_secs / 3600;
+    let m = (time_secs % 3600) / 60;
+    let s = time_secs % 60;
+    // 粗略年/月（从 1970 开始）
+    let mut y = 1970i64;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if is_leap(y) { 366 } else { 365 };
+        if remaining < days_in_year { break; }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let mo_days = [31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 1usize;
+    for &d in &mo_days {
+        if remaining < d { break; }
+        remaining -= d;
+        mo += 1;
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, remaining + 1, h, m, s)
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// 格式化 Windows 文件属性为简短字符串。
+fn fmt_attr(attr: u32) -> String {
+    let mut s = String::new();
+    if attr & 0x0001 != 0 { s.push_str("RO "); }       // READONLY
+    if attr & 0x0002 != 0 { s.push_str("H "); }         // HIDDEN
+    if attr & 0x0004 != 0 { s.push_str("S "); }         // SYSTEM
+    if attr & 0x0010 != 0 { s.push_str("D "); }         // DIRECTORY (usually not needed as we track is_dir separately)
+    if attr & 0x0020 != 0 { s.push_str("A "); }         // ARCHIVE
+    if attr & 0x0040 != 0 { s.push_str("DE "); }        // DEVICE
+    if attr & 0x0080 != 0 { s.push_str("N "); }         // NORMAL
+    if attr & 0x0100 != 0 { s.push_str("T "); }         // TEMPORARY
+    if attr & 0x0200 != 0 { s.push_str("SF "); }        // SPARSE_FILE
+    if attr & 0x0400 != 0 { s.push_str("RP "); }        // REPARSE_POINT
+    if attr & 0x0800 != 0 { s.push_str("C "); }         // COMPRESSED
+    if attr & 0x1000 != 0 { s.push_str("OFF "); }       // OFFLINE
+    if attr & 0x2000 != 0 { s.push_str("NC "); }        // NOT_CONTENT_INDEXED
+    if attr & 0x4000 != 0 { s.push_str("E "); }         // ENCRYPTED
+    if s.is_empty() { s.push_str("-"); }
+    s
 }

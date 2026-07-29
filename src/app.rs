@@ -166,7 +166,7 @@ impl DiskUiApp {
             )
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                tree_list::show(ui, &self.partitions, &self.selected)
+                tree_list::show(ui, &self.partitions, &self.selected, self.disk_total, self.disk_free)
             })
             .inner
     }
