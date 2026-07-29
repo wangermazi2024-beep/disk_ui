@@ -55,22 +55,22 @@ fn draw_rows(
 
     for i in order {
         let child = &node.children[i];
+        let is_folder = !child.children.is_empty();
         path.push(i);
 
         body.row(ROW_H, |mut row| {
             row.col(|ui| {
-                let is_folder = child.is_folder() && !child.children.is_empty();
                 let indent = depth as f32 * 16.0;
 
                 // 展开/收起小图标
                 if is_folder {
                     let arrow = if child.expanded { "▼ " } else { "▶ " };
-                    ui.label(RichText::new(arrow).size(10.0).color(Color32::WHITE));
+                    ui.colored_label(Color32::WHITE, RichText::new(arrow).size(10.0));
                 } else {
                     ui.add_space(14.0); // 对齐文件夹的箭头宽度
                 }
 
-                // 缩进（覆盖已占空间后再加缩进）
+                // 缩进
                 ui.add_space(indent);
 
                 let is_selected = selected.as_deref() == Some(path.as_slice());
@@ -81,7 +81,6 @@ fn draw_rows(
                     *action = TreeAction::EnterNode(path.clone());
                 } else if resp.clicked() {
                     if is_folder {
-                        // 文件夹单击：展开/收起
                         *action = TreeAction::ToggleExpand(path.clone());
                     } else {
                         *action = TreeAction::Select(path.clone());
@@ -97,14 +96,10 @@ fn draw_rows(
         });
 
         // 如果是展开的文件夹，递归渲染其子节点
-        if child.expanded && is_folder(child) {
+        if child.expanded && is_folder {
             draw_rows(body, child, path, depth + 1, selected, action);
         }
 
         path.pop();
     }
-}
-
-fn is_folder(node: &Node) -> bool {
-    !node.children.is_empty()
 }
