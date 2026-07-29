@@ -29,60 +29,11 @@ pub fn show(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     view_root: &Node,
-    base_path: &[usize],
     selected: &Option<NodePath>,
-    parent_node: Option<&Node>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
-
-    // 双击放大后，上层作为整个 treemap 的背景填充，当前层子色块绘制在内部。
-    let mut parent_path: NodePath = Vec::new();
-    let mut parent_clicked = false;
-    let mut parent_dbl = false;
-
-    let draw_rect = if let Some(parent) = parent_node {
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(2), parent.color);
-        let shown = truncate_text(ui.ctx(), &parent.name, FontId::proportional(10.0), (rect.width() - 12.0).max(20.0));
-        painter.text(
-            rect.left_top() + Vec2::new(4.0, 2.0),
-            egui::Align2::LEFT_TOP,
-            &shown,
-            FontId::proportional(10.0),
-            Color32::from_rgba_unmultiplied(255, 255, 255, 200),
-        );
-
-        // 父节点色块本身也有交互（和普通色块一样：单击展开，双击放大）
-        parent_path = base_path[..base_path.len().saturating_sub(1)].to_vec();
-        let parent_id = ui.id().with(("parent", &parent_path));
-        let resp = ui.interact(rect, parent_id, egui::Sense::click());
-        parent_clicked = resp.clicked();
-        parent_dbl = resp.double_clicked();
-
-        Rect::from_min_max(
-            Pos2::new(rect.min.x, rect.min.y + NEST_TOP + 2.0),
-            rect.max,
-        )
-    } else {
-        rect
-    };
-
-    let mut path = base_path.to_vec();
-    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action);
-
-    // 处理父节点色块的单击/双击（子节点已优先消费事件则跳过）
-    if parent_clicked && matches!(action, TreeAction::None) {
-        if let Some(parent) = parent_node {
-            if parent_dbl && !parent.children.is_empty() {
-                // 双击父节点：放大到父节点（逐级回到根）
-                action = TreeAction::ZoomTo(parent_path);
-            } else if !parent_path.is_empty() {
-                // 单击父节点：展开/收起
-                action = TreeAction::ToggleExpand(parent_path);
-            }
-            // parent_path 为空（根节点做父层时）单击不做操作
-        }
-    }
+    let mut path = Vec::new();
+    draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
     action
 }
 
