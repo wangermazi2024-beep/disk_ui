@@ -170,7 +170,10 @@ impl DiskUiApp {
                 ui.add_space(4.0);
                 ui.label(RichText::new("文件列表").strong().size(14.0).color(Color32::from_rgb(0xF0, 0xF0, 0xF0)));
                 ui.add_space(4.0);
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
                     let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
                     action.merge(list_action);
                 });

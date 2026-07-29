@@ -34,6 +34,7 @@ fn draw_children(ui: &mut egui::Ui, node: &Node, path: &mut NodePath, selected: 
             let id = ui.make_persistent_id(("tree_row", path.clone()));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
                 .show_header(ui, |ui| {
+                    ui.style_mut().visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(0xF0, 0xF0, 0xF0);
                     row_contents(ui, child, path, selected, action);
                 })
                 .body(|ui| {
