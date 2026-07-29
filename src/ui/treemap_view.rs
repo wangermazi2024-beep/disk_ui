@@ -3,12 +3,9 @@
 //! - **单击文件夹**：在当前块内展开子色块（inline 嵌套）。
 //! - **单击已展开的文件夹**：收起。
 //! - **单击文件**：选中。
-//! - **双击文件夹**：ZoomTo，把 `zoom_path` 设到该文件夹。
-//!   下一帧渲染时，该文件夹的父节点作为唯一色块占满画面并强制展开，
-//!   于是自然长出"上一层 → 当前层 → 子层"三层，且上层色块本身可交互。
+//! - **双击文件夹**：ZoomTo，画面保留父层背景，当前层作为父层内展开的一个大子块。
 //!
-//! 没有为"上一层"单独写背景绘制——它走 `draw_block`，和普通色块同一份代码。
-//! 双击"上一层"色块 = 双击普通文件夹，ZoomTo 到它自己的路径，一路返回根。
+//! 布局间距由 treemap 算法层统一处理，渲染时不再二次 shrink。
 
 use egui::{Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2};
 
@@ -31,40 +28,17 @@ const FILE_BORDER: Color32 = Color32::from_rgb(0x6A, 0x7B, 0x8C);
 pub fn show(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    root: &Node,
-    zoom_path: &[usize],
+    view_root: &Node,
+    base_path: &[usize],
     selected: &Option<NodePath>,
+    parent_node: Option<&Node>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
 
-    if zoom_path.is_empty() {
-        // 顶层视图：直接画 root 的孩子
-        let mut path = Vec::new();
-        draw_children(ui, rect, root, &mut path, 0, selected, &mut action, None);
-        return action;
-    }
-
-    // 有 zoom_path：把 zoom_path 的父节点画成一个占满全区的色块（强制展开），
-    // 该色块内部显示它的所有孩子（含目标节点及其兄弟）。
-    // 目标节点同样被强制展开——这样"上一层→当前层→子层"就都可见了。
-    let Some((&target_idx, parent_path)) = zoom_path.split_last() else {
-        let mut path = Vec::new();
-        draw_children(ui, rect, root, &mut path, 0, selected, &mut action, None);
-        return action;
-    };
-    let Some(parent) = root.navigate(parent_path) else {
-        let mut path = Vec::new();
-        draw_children(ui, rect, root, &mut path, 0, selected, &mut action, None);
-        return action;
-    };
-
-    // 父节点占满全区
-    let mut path = parent_path.to_vec();
-    // 父节点背景 + 标签
-    {
+    // 双击放大后，上层作为整个 treemap 的背景填充，当前层子色块绘制在内部。
+    let draw_rect = if let Some(parent) = parent_node {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::same(2), parent.color);
-        painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)), StrokeKind::Inside);
         let shown = truncate_text(ui.ctx(), &parent.name, FontId::proportional(10.0), (rect.width() - 12.0).max(20.0));
         painter.text(
             rect.left_top() + Vec2::new(4.0, 2.0),
@@ -73,31 +47,16 @@ pub fn show(
             FontId::proportional(10.0),
             Color32::from_rgba_unmultiplied(255, 255, 255, 200),
         );
-    }
+        Rect::from_min_max(
+            Pos2::new(rect.min.x, rect.min.y + NEST_TOP + 2.0),
+            rect.max,
+        )
+    } else {
+        rect
+    };
 
-    // 子层区域（强制展开目标子项，以露出"当前层→子层"）
-    let nested = Rect::from_min_max(
-        Pos2::new(rect.min.x, rect.min.y + NEST_TOP + 2.0),
-        rect.max,
-    );
-    if nested.width() > 4.0 && nested.height() > 4.0 {
-        draw_children(ui, nested, parent, &mut path, 0, selected, &mut action, Some(target_idx));
-    }
-
-    // 父节点本身的交互（单击/双击），在子节点处理完之后再检查，
-    // 如果子节点已消费事件则跳过。
-    if matches!(action, TreeAction::None) {
-        let id = ui.id().with(("block", path.clone()));
-        let resp = ui.interact(rect, id, egui::Sense::click());
-        if resp.clicked() {
-            if resp.double_clicked() && !parent.children.is_empty() {
-                action = TreeAction::ZoomTo(path);
-            } else {
-                action = TreeAction::ToggleExpand(path);
-            }
-        }
-    }
-
+    let mut path = base_path.to_vec();
+    draw_children(ui, draw_rect, view_root, &mut path, 0, selected, &mut action);
     action
 }
 
@@ -110,7 +69,6 @@ fn draw_children(
     depth: u32,
     selected: &Option<NodePath>,
     action: &mut TreeAction,
-    force_index: Option<usize>,
 ) {
     if node.children.is_empty() { return; }
     if rect.width() < 2.0 || rect.height() < 2.0 { return; }
@@ -137,11 +95,8 @@ fn draw_children(
             painter.rect_stroke(*r, CornerRadius::same(2), Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
         }
 
-        // 如果是被强制展开的子项（当前层），假装 expanded=true
-        let is_forced = force_index == Some(i);
-        let expanded = child.expanded || is_forced;
         let can_inline_expand = !is_file
-            && expanded
+            && child.expanded
             && depth + 1 < MAX_DEPTH
             && r.width() > MIN_EXPAND_W
             && r.height() > MIN_EXPAND_H;
@@ -150,9 +105,11 @@ fn draw_children(
 
         let id = ui.id().with(("block", path.clone()));
         let resp = ui.interact(*r, id, egui::Sense::click());
+        let was_clicked = resp.clicked();
+        let was_dbl = resp.double_clicked();
 
         if ui.rect_contains_pointer(*r) {
-            show_tooltip(ui, id, child, !can_inline_expand && expanded && !is_file);
+            show_tooltip(ui, id, child, !can_inline_expand && child.expanded && !is_file);
         }
 
         if can_inline_expand {
@@ -161,14 +118,12 @@ fn draw_children(
                 r.max,
             );
             if nested.width() > 4.0 && nested.height() > 4.0 {
-                // 强制展开只沿 zoom_path 走一层：递归下去不再传递 force_index
-                draw_children(ui, nested, child, path, depth + 1, selected, action, None);
+                draw_children(ui, nested, child, path, depth + 1, selected, action);
             }
         }
 
-        // 单击/双击处理（double_clicked 优先）
-        if resp.clicked() && matches!(*action, TreeAction::None) {
-            if resp.double_clicked() {
+        if was_clicked && matches!(*action, TreeAction::None) {
+            if was_dbl {
                 if !child.children.is_empty() {
                     *action = TreeAction::ZoomTo(path.clone());
                 }
