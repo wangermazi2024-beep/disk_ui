@@ -12,6 +12,7 @@
 
 mod app;
 mod categorize;
+mod disk_info;
 mod format;
 mod model;
 #[cfg(windows)]

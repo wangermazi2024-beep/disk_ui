@@ -5,14 +5,15 @@
 //!   2. 直接打开 `\\.\X:\$MFT` 这个特殊路径，把整张表顺序读入内存；
 //!   3. 逐条解析 FILE 记录：先做 Fixup（每扇区末 2 字节的 USA 修正），
 //!      再遍历属性链，取出 `$FILE_NAME`(0x30) 里的父目录引用号和名字、
-//!      以及 `$DATA`(0x80) 的真实大小；
+//!      `$DATA`(0x80) 的真实大小，以及 `$STANDARD_INFORMATION`(0x10) 里
+//!      的修改时间和文件属性位；
 //!   4. 用"父记录号 -> 子记录号列表"的邻接表在内存里重建目录树（O(n)，
 //!      不发起任何一次逐目录的系统调用）。
 //!
 //! ## 重要限制（已通过检索官方资料确认，不是这份实现自己猜的）
 //! - 打开卷设备 / `$MFT` 需要管理员权限（`SeBackupPrivilege`），
 //!   这是 NTFS 原始卷访问的强制要求，不是可选项：普通用户权限下
-//!   `CreateFileW("\\\\.\\C:\\$MFT", ...)` 会直接返回 ACCESS_DENIED。
+//!   `CreateFileW(r"\\.\C:\$MFT", ...)` 会直接返回 ACCESS_DENIED。
 //! - 只对 NTFS 卷有效；FAT/exFAT/ReFS/网络盘会在探测阶段直接失败，
 //!   调用方应退回标准目录遍历（见 `scan.rs::scan_dir`）。
 //! - 只在 Windows 上编译（`cfg(windows)`），非 Windows 平台这个模块整体不参与构建。
@@ -33,8 +34,7 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives,
-    GetVolumeInformationW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+    CreateFileW, GetDiskFreeSpaceExW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
@@ -57,7 +57,7 @@ impl std::fmt::Display for MftError {
     }
 }
 fn last_err(ctx: &str) -> MftError {
-    MftError(format!("{ctx} (GetLastError={})", unsafe { GetLastError() }))
+    MftError(format!("{} (GetLastError={})", ctx, unsafe { GetLastError() }))
 }
 
 /// 当前进程是否以管理员身份提升运行。读 `$MFT` 强制要求这个，
@@ -90,10 +90,13 @@ fn wide(s: &str) -> Vec<u16> {
 /// 用于扫描前的"能不能走快速路径"探测，不满足条件就应该 fallback。
 pub fn mft_scan_available(drive_letter: char) -> bool {
     if !is_elevated() {
-        eprintln!("[mft] is_elevated=false, 无法扫描");
+        eprintln!(
+            "[mft_scan] 不可用：当前进程非管理员，无法读 $MFT (drive={})",
+            drive_letter
+        );
         return false;
     }
-    let path = wide(&format!(r"\\\\.\{}:", drive_letter));
+    let path = wide(&format!(r"\\.\{drive_letter}:"));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -105,7 +108,11 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            eprintln!("[mft] CreateFileW 卷设备失败: win32={}", unsafe { GetLastError() });
+            eprintln!(
+                "[mft_scan] 不可用：无法打开卷设备 (drive={}, GetLastError={})",
+                drive_letter,
+                GetLastError()
+            );
             return false;
         }
         let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
@@ -121,7 +128,19 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
             null_mut(),
         );
         CloseHandle(h);
-        ok != 0
+        if ok == 0 {
+            eprintln!(
+                "[mft_scan] 不可用：FSCTL_GET_NTFS_VOLUME_DATA 失败 (drive={}, GetLastError={})，可能不是 NTFS",
+                drive_letter,
+                GetLastError()
+            );
+            return false;
+        }
+        eprintln!(
+            "[mft_scan] 可用：drive={} 是 NTFS，BytesPerFileRecordSegment={}, BytesPerSector={}",
+            drive_letter, buf.BytesPerFileRecordSegment, buf.BytesPerSector
+        );
+        true
     }
 }
 
@@ -131,7 +150,7 @@ struct VolumeInfo {
 }
 
 fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
-    let path = wide(&format!(r"\\\\\.\{}:", drive_letter));
+    let path = wide(&format!(r"\\.\{drive_letter}:"));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -171,8 +190,7 @@ fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
 /// 把整张 `$MFT` 顺序读入内存。这是一次大块顺序 I/O，而不是逐文件调用系统 API，
 /// 这也是这条路径比标准目录遍历快一个数量级的根本原因。
 fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
-    // 方案：打开卷设备 \\.\C:，用 FSCTL 获取 MFT 位置后直接读取（$MFT 文件路径不可靠）
-    let path = wide(&format!(r"\\\\\.\{}:", drive_letter));
+    let path = wide(&format!(r"\\.\{drive_letter}:\$MFT"));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -180,70 +198,28 @@ fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             null_mut(),
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL,
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            return Err(last_err("无法打开卷设备（需要管理员权限）"));
+            return Err(last_err("无法打开 \\\\.\\X:\\$MFT（需要管理员权限）"));
         }
-
-        // 获取 MFT 位置
-        let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
-        let mut ret = 0u32;
-        let ok = DeviceIoControl(
-            h,
-            FSCTL_GET_NTFS_VOLUME_DATA,
-            null_mut(),
-            0,
-            &mut buf as *mut _ as *mut _,
-            std::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
-            &mut ret,
-            null_mut(),
+        let mut file = std::fs::File::from_raw_handle(h as *mut _);
+        use std::io::Read;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .map_err(|e| MftError(format!("读取 $MFT 失败: {e}")))?;
+        eprintln!(
+            "[mft_scan] $MFT 已读入内存: drive={}, {} 字节",
+            drive_letter,
+            buf.len()
         );
-        if ok == 0 {
-            CloseHandle(h);
-            return Err(last_err("FSCTL_GET_NTFS_VOLUME_DATA 失败"));
-        }
-
-        let bps = buf.BytesPerSector as u64;
-        let bpc = buf.BytesPerCluster as u64;
-        let mft_lcn = buf.MftStartLcn as u64;
-        let mft_len = buf.MftValidDataLength as u64;
-        let rec_size = buf.BytesPerFileRecordSegment;
-
-        // 扇区对齐读取 MFT
-        let mft_byte_off = mft_lcn * bpc;
-        let sector_mask = bps - 1;
-        let aligned_off = mft_byte_off & !sector_mask;
-        let read_start = (mft_byte_off - aligned_off) as usize;
-        let aligned_sz = ((mft_len as usize + read_start + bps as usize - 1) / bps as usize) * bps as usize;
-
-        // 定位
-        let mut raw_buf = vec![0u8; aligned_sz];
-        let mut read_bytes = 0u32;
-
-        // SetFilePointerEx
-        use windows_sys::Win32::Storage::FileSystem::{SetFilePointerEx, ReadFile, FILE_BEGIN};
-
-        SetFilePointerEx(h, aligned_off as i64, null_mut(), FILE_BEGIN);
-        let ok = ReadFile(
-            h,
-            raw_buf.as_mut_ptr() as *mut _,
-            aligned_sz as u32,
-            &mut read_bytes,
-            null_mut(),
-        );
-        CloseHandle(h);
-
-        if ok == 0 {
-            return Err(last_err("ReadFile MFT 失败"));
-        }
-
-        raw_buf.truncate(read_bytes as usize);
-        Ok(raw_buf[read_start..read_start + mft_len as usize].to_vec())
+        // `file` 在这里 drop 会自动 CloseHandle。
+        Ok(buf)
     }
 }
 
+/// 单条 MFT 记录里我们关心的字段。
 struct RawEntry {
     parent_record: u64,
     name: String,
@@ -251,7 +227,9 @@ struct RawEntry {
     in_use: bool,
     is_base_record: bool,
     real_size: u64,
-    modified: u64,
+    /// 来自 $STANDARD_INFORMATION 的 LastModificationTime（FILETIME）。
+    modified_ft: u64,
+    /// 来自 $STANDARD_INFORMATION 的 Flags（FILE_ATTRIBUTE_*）。
     attributes: u32,
 }
 
@@ -283,6 +261,21 @@ fn apply_fixup(record: &mut [u8], bytes_per_sector: u32) -> bool {
     true
 }
 
+/// $STANDARD_INFORMATION 内容布局（resident）：
+///   +0x00 CreationTime      (FILETIME 8B)
+///   +0x08 LastModificationTime (FILETIME 8B)
+///   +0x10 LastMftChangeTime (FILETIME 8B)
+///   +0x18 LastAccessTime    (FILETIME 8B)
+///   +0x20 AllocatedSize     (8B)
+///   +0x28 RealSize          (8B)
+///   +0x30 Flags             (4B, FILE_ATTRIBUTE_*)
+///   +0x34 UsedSize          (4B)
+///   ...
+/// 我们只要 LastModificationTime 和 Flags。
+const STD_INFO_OFFSET_MODIFIED: usize = 0x08;
+const STD_INFO_OFFSET_FLAGS: usize = 0x30;
+const STD_INFO_MIN_LEN: usize = 0x38; // 至少要读到 0x34 + 4
+
 fn parse_record(record: &[u8]) -> Option<RawEntry> {
     if record.len() < 48 || &record[0..4] != b"FILE" {
         return None;
@@ -296,41 +289,44 @@ fn parse_record(record: &[u8]) -> Option<RawEntry> {
 
     let mut parent_record: u64 = 0;
     let mut name: Option<String> = None;
-    let mut best_ns = 255u8;
+    let mut best_ns = 255u8; // 越小优先级越高，见下方选择逻辑
     let mut real_size: u64 = 0;
-    let mut modified_time: u64 = 0;
-    let mut file_attributes: u32 = 0;
+    let mut modified_ft: u64 = 0;
+    let mut attributes: u32 = 0;
 
     let mut off = first_attr_offset;
     while off + 16 <= record.len() {
         let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
-        if attr_type == ATTR_END { break; }
+        if attr_type == ATTR_END {
+            break;
+        }
         let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
-        if attr_len == 0 || off + attr_len > record.len() { break; }
+        if attr_len == 0 || off + attr_len > record.len() {
+            break;
+        }
         let non_resident = record[off + 8] != 0;
+        // resident 属性的 value_off / value_len 在固定偏移上；non-resident 不一样。
+        let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
+        let value_len =
+            u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
+        let content_start = off + value_off;
 
         if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
-            // $STANDARD_INFORMATION: 常驻属性, 包含时间戳和文件属性
-            let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
-            let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
-            let v_start = off + value_off;
-            if v_start + 36 <= record.len() && value_len >= 36 {
-                let c = &record[v_start..v_start + value_len];
-                // 偏移 0-7: 创建时间
-                // 偏移 8-15: 修改时间
-                let modified_ft = u64::from_le_bytes(c[8..16].try_into().unwrap());
-                // Windows FILETIME (1601-01-01 epoch, 100ns units) -> unix nanos
-                if modified_ft != 0 {
-                    // FILETIME → Unix epoch: subtract 11644473600 seconds, multiply by 100
-                    modified_time = (modified_ft / 10).saturating_sub(11644473600_0000000);
-                }
-                // 偏移 32-35: file attributes (DWORD)
-                file_attributes = u32::from_le_bytes(c[32..36].try_into().unwrap());
+            if content_start + STD_INFO_MIN_LEN <= record.len() && value_len >= STD_INFO_MIN_LEN {
+                modified_ft = u64::from_le_bytes(
+                    record[content_start + STD_INFO_OFFSET_MODIFIED
+                        ..content_start + STD_INFO_OFFSET_MODIFIED + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                attributes = u32::from_le_bytes(
+                    record[content_start + STD_INFO_OFFSET_FLAGS
+                        ..content_start + STD_INFO_OFFSET_FLAGS + 4]
+                        .try_into()
+                        .unwrap(),
+                );
             }
         } else if attr_type == ATTR_FILE_NAME && !non_resident {
-            let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
-            let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
-            let content_start = off + value_off;
             if content_start + value_len <= record.len() && value_len >= 66 {
                 let c = &record[content_start..content_start + value_len];
                 let parent_ref = u64::from_le_bytes(c[0..8].try_into().unwrap());
@@ -351,7 +347,8 @@ fn parse_record(record: &[u8]) -> Option<RawEntry> {
                             .collect();
                         name = Some(OsString::from_wide(&u16s).to_string_lossy().into_owned());
                         parent_record = parent_ref & 0x0000_FFFF_FFFF_FFFF; // 低 48 位是记录号
-                        real_size = u64::from_le_bytes(c[48..56].try_into().unwrap());
+                        // $FILE_NAME 属性里也有一个 real_size（allocation size + real size），
+                        // 但 $DATA(0x80) 里的更准确，这里不覆盖。
                     }
                 }
             }
@@ -365,8 +362,6 @@ fn parse_record(record: &[u8]) -> Option<RawEntry> {
                     u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
                 };
             }
-        } else if attr_type == ATTR_STANDARD_INFORMATION {
-            // 目前不需要这里的字段（时间戳/常规属性），跳过。
         }
 
         off += attr_len;
@@ -380,8 +375,8 @@ fn parse_record(record: &[u8]) -> Option<RawEntry> {
         in_use,
         is_base_record,
         real_size,
-        modified: modified_time,
-        attributes: file_attributes,
+        modified_ft,
+        attributes,
     })
 }
 
@@ -417,7 +412,6 @@ pub fn scan_drive_via_mft(
     tx: &Sender<crate::scan::ScanMessage>,
 ) -> Result<MftScanResult, MftError> {
     if !is_elevated() {
-        eprintln!("[mft] 未提升权限, 无法读 MFT");
         return Err(MftError(
             "直读 $MFT 需要管理员权限运行本程序（右键“以管理员身份运行”）".into(),
         ));
@@ -426,14 +420,19 @@ pub fn scan_drive_via_mft(
     let vol = get_volume_info(drive_letter)?;
     let record_size = vol.bytes_per_file_record_segment.max(1024) as usize;
     let sector_size = vol.bytes_per_sector.max(512);
-    eprintln!("[mft] 卷信息: bytes_per_sector={}, record_size={}", sector_size, record_size);
 
     let mft_bytes = read_whole_mft(drive_letter)?;
     let total_records = mft_bytes.len() / record_size;
-    eprintln!("[mft] MFT 读取完成: {} 字节, {} 条记录", mft_bytes.len(), total_records);
+    eprintln!(
+        "[mft_scan] 开始解析 MFT 记录: total_records={}, record_size={}B",
+        total_records, record_size
+    );
 
     // 第一遍：解析所有记录。索引 == MFT 记录号。
     let mut entries: Vec<Option<RawEntry>> = Vec::with_capacity(total_records);
+    let mut valid_count = 0usize;
+    let mut dir_count = 0usize;
+    let mut file_count = 0usize;
     for i in 0..total_records {
         let start = i * record_size;
         let end = start + record_size;
@@ -446,12 +445,24 @@ pub fn scan_drive_via_mft(
             continue;
         }
         let parsed = parse_record(&rec).filter(|e| e.in_use && e.is_base_record);
+        if let Some(p) = &parsed {
+            valid_count += 1;
+            if p.is_dir {
+                dir_count += 1;
+            } else {
+                file_count += 1;
+            }
+        }
         entries.push(parsed);
 
         if i % 20_000 == 0 {
             let _ = tx.send(crate::scan::ScanMessage::Progress(i as u64));
         }
     }
+    eprintln!(
+        "[mft_scan] 解析完成: 总记录={}, 有效={}, 目录={}, 文件={}",
+        total_records, valid_count, dir_count, file_count
+    );
 
     // 第二遍：按 parent_record 建邻接表。
     let mut children_of: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -462,6 +473,10 @@ pub fn scan_drive_via_mft(
             }
         }
     }
+    eprintln!(
+        "[mft_scan] 邻接表构建完成: {} 个父节点",
+        children_of.len()
+    );
 
     let mut file_paths = Vec::new();
     let mut file_sizes = Vec::new();
@@ -475,6 +490,13 @@ pub fn scan_drive_via_mft(
         &PathBuf::from(format!("{drive_letter}:\\")),
         &mut file_paths,
         &mut file_sizes,
+    );
+
+    eprintln!(
+        "[mft_scan] 树构建完成: root.size={:.2}GB, files={}, folders={}",
+        root_node.size as f64 / 1e9,
+        root_node.file_count,
+        root_node.folder_count
     );
 
     Ok(MftScanResult {
@@ -495,6 +517,18 @@ fn build_subtree(
     file_sizes: &mut Vec<u64>,
 ) -> Node {
     let mut children_nodes = Vec::new();
+    // 本目录自身的元信息：默认 0，如果 MFT 记录里有就从记录里取。
+    let mut self_modified: u64 = 0;
+    let mut self_attrs: u32 = 0x10; // DIRECTORY
+    if let Some(Some(entry)) = entries.get(record_idx as usize) {
+        self_modified = entry.modified_ft;
+        self_attrs = if entry.attributes == 0 {
+            0x10
+        } else {
+            entry.attributes
+        };
+    }
+
     if let Some(kids) = children_of.get(&record_idx) {
         for &child_idx in kids {
             let Some(entry) = entries.get(child_idx as usize).and_then(|e| e.as_ref()) else {
@@ -516,72 +550,26 @@ fn build_subtree(
             } else {
                 file_paths.push(child_path);
                 file_sizes.push(entry.real_size);
-                children_nodes.push(Node::new_file_full(
+                children_nodes.push(Node::new_file_with_meta(
                     entry.name.clone(),
                     entry.real_size,
-                    entry.modified,
-                    entry.attributes,
                     file_color(),
+                    entry.modified_ft,
+                    entry.attributes,
                 ));
             }
         }
     }
-    Node::new_folder(display_name, folder_color(depth), children_nodes)
+    Node::new_folder_with_meta(
+        display_name,
+        folder_color(depth),
+        children_nodes,
+        self_modified,
+        self_attrs,
+    )
 }
 
-/// 枚举所有固定磁盘（如 C、D、E...），返回盘符列表。
-pub fn enum_fixed_drives() -> Vec<char> {
-    unsafe {
-        let mask = GetLogicalDrives();
-        let mut drives = Vec::new();
-        for i in 0..26 {
-            if mask & (1 << i) != 0 {
-                let d = (b'A' + i) as char;
-                let root = wide(&format!("{d}:\\"));
-                let dt = GetDriveTypeW(root.as_ptr());
-                // DRIVE_FIXED = 3
-                if dt == 3 {
-                    drives.push(d);
-                }
-            }
-        }
-        drives
-    }
-}
-
-/// 获取卷标（如果存在）和 Explorer 友好显示名。
-/// 返回 (卷标, 友好名)。
-pub fn get_volume_label(drive_letter: char) -> (String, String) {
-    use std::ptr;
-    unsafe {
-        let path = wide(&format!(r"{drive_letter}:\"));
-        let mut vol_buf = [0u16; 256];
-        let mut fs_buf = [0u16; 256];
-        let mut sn = 0u32;
-        let mut max_comp = 0u32;
-        let mut flags = 0u32;
-
-        let ok = GetVolumeInformationW(
-            path.as_ptr(),
-            vol_buf.as_mut_ptr(),
-            vol_buf.len() as u32,
-            &mut sn,
-            &mut max_comp,
-            &mut flags,
-            fs_buf.as_mut_ptr(),
-            fs_buf.len() as u32,
-        );
-
-        let vol_label = if ok != 0 {
-            let len = vol_buf.iter().position(|&c| c == 0).unwrap_or(0);
-            String::from_utf16_lossy(&vol_buf[..len])
-        } else {
-            String::new()
-        };
-
-        (vol_label, String::new()) // 友好名后续扩展
-    }
-}
+/// 用 `GetDiskFreeSpaceExW` 拿该盘符官方报告的总容量/可用空间，
 /// 用来和扫描结果的汇总大小做一个"量级是否合理"的旁证
 /// （注意：文件逻辑大小之和天然会小于"已用空间"，因为它不包含簇内部碎片、
 /// NTFS 元数据本身、卷影副本等——这是预期内的差异，不是 bug）。
