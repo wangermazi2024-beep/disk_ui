@@ -35,14 +35,6 @@ pub struct DiskUiApp {
     scanned_count: u64,
     scan_error: Option<String>,
     scan_rx: Option<Receiver<ScanMessage>>,
-
-    /// 单击/双击去抖：egui 的 clicked() 在双击的第一下就会先触发一次
-    /// （见 response.rs 里 clicked_by/double_clicked_by 共用同一个 CLICKED 标志位，
-    /// 只是 double_clicked 额外多判断了一次点击计数），这时候还不知道
-    /// 紧接着会不会来第二下。所以单击对应的 Select/ToggleExpand 不立即生效，
-    /// 先记下来，等一小段时间没等到双击（ZoomTo）再真正应用；
-    /// 双击如期而至的话，这里记的单击直接作废。
-    pending_click: Option<(TreeAction, f64)>,
 }
 
 impl Default for DiskUiApp {
@@ -61,7 +53,6 @@ impl Default for DiskUiApp {
             scanned_count: 0,
             scan_error: None,
             scan_rx: None,
-            pending_click: None,
         }
     }
 }
@@ -95,9 +86,7 @@ impl eframe::App for DiskUiApp {
         sidebar::show(ui, self.root.size, self.total_size, self.total_size.saturating_sub(self.root.size), &self.categories);
 
         let action = self.show_central_panel(ui);
-        let now = ui.ctx().input(|i| i.time);
-        self.apply_action(action, now);
-        self.flush_pending_click(now);
+        self.apply_action(action);
 
         ui.ctx().request_repaint();
     }
@@ -308,37 +297,9 @@ impl DiskUiApp {
         clicked.map(TreeAction::ZoomTo)
     }
 
-    fn apply_action(&mut self, action: TreeAction, now: f64) {
+    fn apply_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::None => {}
-            TreeAction::Select(_) | TreeAction::ToggleExpand(_) => {
-                // 不立即生效，先登记，等 flush_pending_click 确认没有双击跟上再应用。
-                self.pending_click = Some((action, now));
-            }
-            TreeAction::ZoomTo(path) => {
-                // 双击没有歧义，直接生效，并作废掉刚才还在等待的单击。
-                self.pending_click = None;
-                self.zoom_path = path.clone();
-                // 清理整棵树所有节点的 inline 展开状态：
-                // 用户导航到新层级（无论是双击 ZoomTo 还是面包屑跳转），
-                // 希望看到干净视图，不保留之前在其他层展开的残留子块。
-                self.root.collapse_all();
-                self.selected = Some(path);
-            }
-        }
-    }
-
-    /// 单击去抖的另一半：等待窗口（0.3 秒，跟系统双击判定间隔量级一致）过去了
-    /// 还没等到第二次点击（也就没有 ZoomTo 把 pending_click 作废），
-    /// 才说明这确实是一次单纯的单击，这时候才真正应用 Select/ToggleExpand。
-    fn flush_pending_click(&mut self, now: f64) {
-        const DOUBLE_CLICK_WINDOW: f64 = 0.3;
-        let Some((action, t)) = self.pending_click.clone() else { return };
-        if now - t < DOUBLE_CLICK_WINDOW {
-            return;
-        }
-        self.pending_click = None;
-        match action {
             TreeAction::Select(path) => {
                 self.selected = Some(path);
             }
@@ -360,7 +321,14 @@ impl DiskUiApp {
                 }
                 self.selected = Some(path);
             }
-            _ => {}
+            TreeAction::ZoomTo(path) => {
+                self.zoom_path = path.clone();
+                // 清理整棵树所有节点的 inline 展开状态：
+                // 用户导航到新层级（无论是双击 ZoomTo 还是面包屑跳转），
+                // 希望看到干净视图，不保留之前在其他层展开的残留子块。
+                self.root.collapse_all();
+                self.selected = Some(path);
+            }
         }
     }
 }
