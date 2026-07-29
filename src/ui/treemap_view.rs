@@ -248,7 +248,9 @@ fn show_tooltip(ui: &egui::Ui, info: HoverInfo) {
 /// 气泡矩形的 x 范围永远不包含鼠标 x 坐标本身，所以不管垂直方向怎么选，
 /// 气泡都不可能盖住鼠标指针所在的那个点。
 fn tooltip_pos(ui: &egui::Ui, mouse: Pos2, line1: &str, line2: &str) -> Pos2 {
-    let screen = ui.ctx().input(|i| i.raw.screen_rect);
+    let screen = ui.ctx().input(|i| i.raw.screen_rect.unwrap_or(
+        egui::Rect::from_min_max(egui::pos2(-1e5, -1e5), egui::pos2(1e5, 1e5)),
+    ));
 
     let measure = |s: &str, size: f32| -> f32 {
         let font = FontId::proportional(size);
