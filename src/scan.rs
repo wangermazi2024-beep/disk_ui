@@ -50,33 +50,50 @@ fn as_drive_root(path: &Path) -> Option<char> {
 
 pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
     std::thread::spawn(move || {
-        // Windows 下，如果目标是一个整盘根目录（如 C:\），且当前有管理员权限、
+        eprintln!("[scan] spawn_scan: root={:?}", root);
+        // Windows 下，如果目标是一个整盘根目录（如 C:\\），且当前有管理员权限、
         // 目标卷是 NTFS，就优先走 $MFT 直读快速路径（WizTree/Everything 同款原理）。
         // 任何一步失败（没权限/非NTFS/记录损坏等）都直接 fallback 回标准目录遍历，
         // 保证功能上始终可用，只是速度上有快慢之分。
         #[cfg(windows)]
         {
             if let Some(drive) = as_drive_root(&root) {
+                eprintln!("[scan] 路径是盘符根目录: {}:", drive);
                 if crate::mft_scan::mft_scan_available(drive) {
+                    eprintln!("[scan] mft_scan_available=true, 尝试 MFT 直读...");
                     match crate::mft_scan::scan_drive_via_mft(drive, &tx) {
                         Ok(result) => {
+                            eprintln!("[scan] MFT 直读成功: 文件={}, 文件夹={}, 总大小={}",
+                                result.root.file_count, result.root.folder_count, result.root.size);
                             let _ = tx.send(ScanMessage::Done(Box::new(result.root)));
                             return;
                         }
                         Err(e) => {
-                            // 不中断，退回传统遍历；把原因打到 stderr 方便排查，
-                            // 不打断 UI（UI 只关心最终能不能拿到数据）。
-                            eprintln!("MFT 直读失败，回退到标准目录遍历: {e}");
+                            eprintln!("[scan] MFT 直读失败: {e}");
                         }
                     }
+                } else {
+                    eprintln!("[scan] mft_scan_available=false (无管理员权限/非NTFS)");
                 }
+            } else {
+                eprintln!("[scan] 路径不是盘符根目录, 跳过 MFT 直读");
             }
         }
+        #[cfg(not(windows))]
+        eprintln!("[scan] 非 Windows 系统, 使用 jwalk 遍历");
 
+        eprintln!("[scan] 降级到传统目录遍历");
         let counter = Arc::new(AtomicU64::new(0));
         match scan_dir(&root, 0, &counter, &tx) {
-            Ok(node) => { let _ = tx.send(ScanMessage::Done(Box::new(node))); }
-            Err(e)   => { let _ = tx.send(ScanMessage::Error(format!("扫描失败: {e}"))); }
+            Ok(node) => {
+                eprintln!("[scan] 传统遍历完成: 文件={}, 文件夹={}, 总大小={}",
+                    node.file_count, node.folder_count, node.size);
+                let _ = tx.send(ScanMessage::Done(Box::new(node)));
+            }
+            Err(e) => {
+                eprintln!("[scan] 传统遍历失败: {e}");
+                let _ = tx.send(ScanMessage::Error(format!("扫描失败: {e}")));
+            }
         }
     });
 }

@@ -90,9 +90,10 @@ fn wide(s: &str) -> Vec<u16> {
 /// 用于扫描前的"能不能走快速路径"探测，不满足条件就应该 fallback。
 pub fn mft_scan_available(drive_letter: char) -> bool {
     if !is_elevated() {
+        eprintln!("[mft] is_elevated=false, 无法扫描");
         return false;
     }
-    let path = wide(&format!(r"\.\{}:", drive_letter));
+    let path = wide(&format!(r"\\.\{}:", drive_letter));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -104,6 +105,7 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
+            eprintln!("[mft] CreateFileW 卷设备失败: win32={}", unsafe { GetLastError() });
             return false;
         }
         let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
@@ -415,6 +417,7 @@ pub fn scan_drive_via_mft(
     tx: &Sender<crate::scan::ScanMessage>,
 ) -> Result<MftScanResult, MftError> {
     if !is_elevated() {
+        eprintln!("[mft] 未提升权限, 无法读 MFT");
         return Err(MftError(
             "直读 $MFT 需要管理员权限运行本程序（右键“以管理员身份运行”）".into(),
         ));
@@ -423,9 +426,11 @@ pub fn scan_drive_via_mft(
     let vol = get_volume_info(drive_letter)?;
     let record_size = vol.bytes_per_file_record_segment.max(1024) as usize;
     let sector_size = vol.bytes_per_sector.max(512);
+    eprintln!("[mft] 卷信息: bytes_per_sector={}, record_size={}", sector_size, record_size);
 
     let mft_bytes = read_whole_mft(drive_letter)?;
     let total_records = mft_bytes.len() / record_size;
+    eprintln!("[mft] MFT 读取完成: {} 字节, {} 条记录", mft_bytes.len(), total_records);
 
     // 第一遍：解析所有记录。索引 == MFT 记录号。
     let mut entries: Vec<Option<RawEntry>> = Vec::with_capacity(total_records);
