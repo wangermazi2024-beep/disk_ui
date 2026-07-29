@@ -104,7 +104,10 @@ fn draw_children(
             let coll_id = ui.make_persistent_id(("tree_row", path.clone()));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), coll_id, false)
                 .show_header(ui, |ui| {
-                    ui.style_mut().visuals.widgets.inactive.fg_stroke.color = Color32::WHITE;
+                    let s = &mut ui.style_mut().visuals.widgets;
+                    s.inactive.fg_stroke.color = Color32::WHITE;
+                    s.active.fg_stroke.color = Color32::WHITE;
+                    s.hovered.fg_stroke.color = Color32::WHITE;
                     row_contents(ui, child, path, selected, action, name_w);
                 })
                 .body(|ui| {
