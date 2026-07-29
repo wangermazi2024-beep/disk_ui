@@ -81,8 +81,8 @@ fn scan_via_mft(drive_letter: char, tx: &Sender<ScanMessage>) -> Result<Node, Bo
             file.read_to_end(&mut buf)?;
             buf
         }
-        Err(e) => {
-            // $MFT 直接打开失败, 尝试从卷设备读取
+        // $MFT 直接打开失败, 尝试从卷设备读取
+        Err(_e) => {
             read_mft_from_volume(drive_letter)?
         }
     };
@@ -94,7 +94,6 @@ fn scan_via_mft(drive_letter: char, tx: &Sender<ScanMessage>) -> Result<Node, Bo
 /// 启用 SeBackupPrivilege，使管理员能打开受保护的系统文件。
 #[cfg(windows)]
 fn enable_backup_privilege() {
-    use std::mem;
     use std::ptr;
 
     type HANDLE = isize;
@@ -154,7 +153,7 @@ fn enable_backup_privilege() {
             return;
         }
 
-        let mut tp = TOKEN_PRIVILEGES {
+        let tp = TOKEN_PRIVILEGES {
             privilege_count: 1,
             privileges: [LUID_AND_ATTRIBUTES {
                 luid,
@@ -202,7 +201,6 @@ fn read_mft_from_volume(drive_letter: char) -> Result<Vec<u8>, Box<dyn std::erro
             lpNumberOfBytesRead: *mut DWORD,
             lpOverlapped: *mut std::ffi::c_void,
         ) -> BOOL;
-        fn CloseHandle(hObject: HANDLE) -> BOOL;
         fn GetLastError() -> DWORD;
     }
 
@@ -264,7 +262,7 @@ fn read_mft_from_volume(drive_letter: char) -> Result<Vec<u8>, Box<dyn std::erro
 
     let bytes_per_cluster = nvdb.BytesPerCluster as u64;
     let bytes_per_sector = nvdb.BytesPerSector as u64;
-    let bytes_per_record = nvdb.BytesPerFileRecordSegment as usize;
+    let _bytes_per_record = nvdb.BytesPerFileRecordSegment as usize;
     let mft_start_lcn = nvdb.MftStartLcn as u64;
     let mft_valid_len = nvdb.MftValidDataLength as u64;
 
