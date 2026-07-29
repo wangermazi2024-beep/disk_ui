@@ -130,9 +130,11 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
     let is_base_record = (base_record_ref & 0x0000_FFFF_FFFF_FFFF) == 0;
 
     let mut parent_record: u64 = 0;
-    let mut name: Option<String> = None;
-    let mut best_ns = 255u8; // 越小优先级越高，见下方选择逻辑
-    let mut real_size: u64 = 0;
+    // 收集所有 $FILE_NAME 属性，最后按优先级选最好的一个。
+    // 这样能处理"先遇到 DOS 名、后遇到 WIN32 名"的情况，避免 PROGRA~1 覆盖 Program Files。
+    // 每个元素: (namespace, name, parent_ref, real_size_from_filename)
+    let mut file_names: Vec<(u8, String, u64, u64)> = Vec::new();
+    let mut real_size: u64 = 0; // 来自 $DATA 属性（最准确，但可能在大文件的扩展记录里）
     let mut modified_ft: u64 = 0;
     let mut attributes: u32 = 0;
 
@@ -169,8 +171,19 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
                 );
             }
         } else if attr_type == ATTR_FILE_NAME && !non_resident {
-            // $FILE_NAME 属性内容最小 66 字节（前 64 字节头 + 至少 1 字节 name_len + 1 字节 ns）
-            // 但有些记录可能 value_len < 66（损坏或异常），要容错。
+            // $FILE_NAME 内容布局：
+            //   +0  ParentReference (8B)
+            //   +8  CreationTime (8B)
+            //   +16 ModificationTime (8B)
+            //   +24 MftChangeTime (8B)
+            //   +32 AccessTime (8B)
+            //   +40 AllocatedSize (8B)
+            //   +48 RealSize (8B)  ← 文件真实大小，作为 $DATA 在扩展记录时的 fallback
+            //   +56 Flags (4B)
+            //   +60 ReparseValue (4B)
+            //   +64 NameLength (1B, 字符数)
+            //   +65 Namespace (1B)
+            //   +66 Name (UTF-16LE)
             if content_start + value_len <= record.len() && value_len >= 66 {
                 let c = &record[content_start..content_start + value_len];
                 let parent_ref = u64::from_le_bytes(c[0..8].try_into().unwrap());
@@ -178,24 +191,19 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
                 let ns = c[65]; // 0=POSIX 1=WIN32 2=DOS(8.3短名) 3=WIN32&DOS
                 let name_bytes_len = name_len_chars * 2;
                 if 66 + name_bytes_len <= c.len() && name_len_chars > 0 {
-                    // 优先取 WIN32(1) 或 POSIX(0) 名字；纯 DOS 短名(2) 只在没有更好选择时用。
-                    let priority = match ns {
-                        1 | 0 | 3 => 0,
-                        _ => 1,
+                    let u16s: Vec<u16> = c[66..66 + name_bytes_len]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    let name_str = os_string_from_wide(&u16s).to_string_lossy().into_owned();
+                    // 从 $FILE_NAME 拿 real_size 作为 fallback
+                    //（当 $DATA 在扩展记录里时，$FILE_NAME 的大小是唯一的来源）
+                    let fname_real_size = if c.len() >= 56 {
+                        u64::from_le_bytes(c[48..56].try_into().unwrap())
+                    } else {
+                        0
                     };
-                    if priority < best_ns {
-                        best_ns = priority;
-                        let u16s: Vec<u16> = c[66..66 + name_bytes_len]
-                            .chunks_exact(2)
-                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                            .collect();
-                        name = Some(
-                            os_string_from_wide(&u16s)
-                                .to_string_lossy()
-                                .into_owned(),
-                        );
-                        parent_record = parent_ref & 0x0000_FFFF_FFFF_FFFF; // 低 48 位是记录号
-                    }
+                    file_names.push((ns, name_str, parent_ref & 0x0000_FFFF_FFFF_FFFF, fname_real_size));
                 }
             }
         } else if attr_type == ATTR_DATA {
@@ -203,7 +211,12 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
             let name_len = record[off + 9];
             if name_len == 0 {
                 real_size = if non_resident {
-                    u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
+                    // non-resident $DATA: real_size 在 off+48
+                    if off + 56 <= record.len() {
+                        u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
+                    } else {
+                        0
+                    }
                 } else {
                     u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
                 };
@@ -213,10 +226,39 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
         off += attr_len;
     }
 
-    // 如果没解析出 $FILE_NAME，不要丢这条记录——用 FRN 占位名。
-    // 这通常发生在系统元数据文件（$MFT/$LogFile/$Bitmap 等）或极少数异常记录上。
-    // 它们会挂到根目录下，用户能看到，不会丢数据。
-    let name = name.unwrap_or_else(|| format!("<FRN_{}>", 0u64));
+    // 从收集到的 $FILE_NAME 列表里选最好的一个。
+    // 优先级：WIN32(1) > WIN32&DOS(3) > POSIX(0) > DOS(2) > 其他
+    // 这样 "Program Files" (ns=1 或 3) 胜过 "PROGRA~1" (ns=2)。
+    let (name, fname_parent, fname_real_size) = if file_names.is_empty() {
+        (format!("<FRN_{}>", 0u64), 0u64, 0u64)
+    } else {
+        let ns_priority = |ns: u8| -> u32 {
+            match ns {
+                1 => 0, // WIN32 - 最高优先级（长文件名）
+                3 => 1, // WIN32&DOS - 第二（既是长名又是短名）
+                0 => 2, // POSIX - 第三（通常也是长名）
+                2 => 3, // DOS - 最低（8.3 短名，如 PROGRA~1）
+                _ => 4,
+            }
+        };
+        let best = file_names
+            .iter()
+            .min_by_key(|(ns, _, _, _)| ns_priority(*ns))
+            .unwrap();
+        (best.1.clone(), best.2, best.3)
+    };
+
+    // 如果 parent_record 还没设置，用 $FILE_NAME 的 parent
+    if parent_record == 0 && fname_parent != 0 {
+        parent_record = fname_parent;
+    }
+    // FIX: 如果 $DATA 的 real_size 是 0（大文件的 $DATA 在扩展记录里），
+    // 用 $FILE_NAME 的 real_size 作为 fallback。
+    // 这样 Hermes.exe (204MB) 即使 $DATA 在扩展记录，也能从 $FILE_NAME 拿到大小。
+    if real_size == 0 && fname_real_size > 0 {
+        real_size = fname_real_size;
+    }
+
     Some(RawEntry {
         parent_record,
         name,
@@ -236,21 +278,13 @@ pub fn parse_record_with_diag(record: &[u8]) -> Option<(RawEntry, Vec<u32>, bool
     if record.len() < 48 || &record[0..4] != b"FILE" {
         return None;
     }
-    let flags = u16::from_le_bytes([record[22], record[23]]);
-    let in_use = flags & 0x0001 != 0;
-    let is_dir = flags & 0x0002 != 0;
-    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
-    let base_record_ref = u64::from_le_bytes(record[32..40].try_into().unwrap());
-    let is_base_record = (base_record_ref & 0x0000_FFFF_FFFF_FFFF) == 0;
+    // 先用标准 parse_record 拿到 entry
+    let entry = parse_record(record)?;
 
-    let mut parent_record: u64 = 0;
-    let mut name: Option<String> = None;
-    let mut real_size: u64 = 0;
-    let mut modified_ft: u64 = 0;
-    let mut attributes: u32 = 0;
+    // 再单独扫一遍收集属性类型列表和 has_file_name
+    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
     let mut attr_types: Vec<u32> = Vec::new();
     let mut has_file_name = false;
-
     let mut off = first_attr_offset;
     while off + 16 <= record.len() {
         let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
@@ -258,75 +292,16 @@ pub fn parse_record_with_diag(record: &[u8]) -> Option<(RawEntry, Vec<u32>, bool
             break;
         }
         attr_types.push(attr_type);
+        if attr_type == ATTR_FILE_NAME {
+            has_file_name = true;
+        }
         let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
         if attr_len == 0 || off + attr_len > record.len() {
             break;
         }
-        let non_resident = record[off + 8] != 0;
-        let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
-        let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
-        let content_start = off + value_off;
-
-        if attr_type == ATTR_FILE_NAME && !non_resident {
-            has_file_name = true;
-            if content_start + value_len <= record.len() && value_len >= 66 {
-                let c = &record[content_start..content_start + value_len];
-                let name_len_chars = c[64] as usize;
-                let name_bytes_len = name_len_chars * 2;
-                if 66 + name_bytes_len <= c.len() && name_len_chars > 0 {
-                    let parent_ref = u64::from_le_bytes(c[0..8].try_into().unwrap());
-                    let u16s: Vec<u16> = c[66..66 + name_bytes_len]
-                        .chunks_exact(2)
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                        .collect();
-                    name = Some(os_string_from_wide(&u16s).to_string_lossy().into_owned());
-                    parent_record = parent_ref & 0x0000_FFFF_FFFF_FFFF;
-                }
-            }
-        } else if attr_type == ATTR_DATA {
-            let name_len = record[off + 9];
-            if name_len == 0 {
-                real_size = if non_resident {
-                    u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
-                } else {
-                    u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
-                };
-            }
-        } else if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
-            if content_start + STD_INFO_MIN_LEN <= record.len() && value_len >= STD_INFO_MIN_LEN {
-                modified_ft = u64::from_le_bytes(
-                    record[content_start + STD_INFO_OFFSET_MODIFIED
-                        ..content_start + STD_INFO_OFFSET_MODIFIED + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-                attributes = u32::from_le_bytes(
-                    record[content_start + STD_INFO_OFFSET_FLAGS
-                        ..content_start + STD_INFO_OFFSET_FLAGS + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-            }
-        }
-
         off += attr_len;
     }
-
-    let name = name.unwrap_or_else(|| format!("<FRN_{}>", 0u64));
-    Some((
-        RawEntry {
-            parent_record,
-            name,
-            is_dir,
-            in_use,
-            is_base_record,
-            real_size,
-            modified_ft,
-            attributes,
-        },
-        attr_types,
-        has_file_name,
-    ))
+    Some((entry, attr_types, has_file_name))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -536,5 +511,145 @@ mod tests {
             parsed_count += 1;
         }
         assert_eq!(parsed_count, records_data.len(), "应该解析出全部记录");
+    }
+
+    /// 测试文件大小 fallback：当 $DATA 属性不在 base record 里（大文件用扩展记录），
+    /// 应该从 $FILE_NAME 的 RealSize 字段拿大小，而不是返回 0。
+    #[test]
+    fn test_real_size_fallback_from_file_name() {
+        // 构造一个只有 $STANDARD_INFORMATION + $FILE_NAME（带 RealSize）但没有 $DATA 的记录
+        // 模拟大文件的 base record（$DATA 在扩展记录里）
+        let mut buf = vec![0u8; 1024];
+        buf[0..4].copy_from_slice(b"FILE");
+        put_u16(&mut buf, 4, 0x30); // usa_offset
+        put_u16(&mut buf, 6, 1); // usa_count = 1
+        put_u16(&mut buf, 0x30, 0x0001); // USN
+        put_u16(&mut buf, 22, 0x01); // flags: in_use, not dir
+        put_u16(&mut buf, 20, 0x38); // first_attr_offset
+        put_u64(&mut buf, 32, 0); // base_record_ref = 0
+
+        let mut off = 0x38usize;
+
+        // $STANDARD_INFORMATION（简短）
+        let std_len: usize = 0x48;
+        let std_total: usize = 24 + std_len;
+        put_u32(&mut buf, off, ATTR_STANDARD_INFORMATION);
+        put_u32(&mut buf, off + 4, std_total as u32);
+        buf[off + 8] = 0;
+        put_u32(&mut buf, off + 16, std_len as u32);
+        put_u16(&mut buf, off + 20, 24);
+        off += std_total;
+
+        // $FILE_NAME（带 RealSize = 214281216，模拟 Hermes.exe 204MB）
+        let expected_size: u64 = 214_281_216;
+        let name = "Hermes.exe";
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        let name_bytes_len = name_u16.len() * 2;
+        let fn_content_len: usize = 66 + name_bytes_len;
+        let fn_total: usize = (24 + fn_content_len + 7) & !7;
+        put_u32(&mut buf, off, ATTR_FILE_NAME);
+        put_u32(&mut buf, off + 4, fn_total as u32);
+        buf[off + 8] = 0;
+        put_u32(&mut buf, off + 16, fn_content_len as u32);
+        put_u16(&mut buf, off + 20, 24);
+        let fn_off = off + 24;
+        put_u64(&mut buf, fn_off + 0, 5); // parent = root (5)
+        // 时间字段全 0
+        // AllocatedSize at +40
+        put_u64(&mut buf, fn_off + 40, expected_size);
+        // RealSize at +48  ← 这是关键
+        put_u64(&mut buf, fn_off + 48, expected_size);
+        // Flags at +56
+        put_u32(&mut buf, fn_off + 56, 0x20); // ARCHIVE
+        put_u32(&mut buf, fn_off + 60, 0);
+        buf[fn_off + 64] = name_u16.len() as u8;
+        buf[fn_off + 65] = 1; // ns = WIN32
+        for (i, &c) in name_u16.iter().enumerate() {
+            put_u16(&mut buf, fn_off + 66 + i * 2, c);
+        }
+        off += fn_total;
+
+        // 没有 $DATA 属性！直接放 ATTR_END
+        put_u32(&mut buf, off, ATTR_END);
+        put_u32(&mut buf, off + 4, 0);
+
+        // apply_fixup + parse
+        assert!(apply_fixup(&mut buf, 512));
+        let entry = parse_record(&buf).expect("parse should succeed");
+        assert_eq!(entry.name, "Hermes.exe");
+        // 关键断言：real_size 应该从 $FILE_NAME 拿到，不是 0
+        assert_eq!(
+            entry.real_size, expected_size,
+            "real_size 应该从 $FILE_NAME 的 RealSize fallback 拿到，而不是 0"
+        );
+    }
+
+    /// 测试文件名优先级：WIN32 名应该胜过 DOS 8.3 短名。
+    /// 模拟 "Program Files" 目录，同时有 ns=1 (WIN32) 和 ns=2 (DOS "PROGRA~1")。
+    #[test]
+    fn test_filename_prefers_win32_over_dos() {
+        let mut buf = vec![0u8; 1024];
+        buf[0..4].copy_from_slice(b"FILE");
+        put_u16(&mut buf, 4, 0x30);
+        put_u16(&mut buf, 6, 1);
+        put_u16(&mut buf, 0x30, 0x0001);
+        put_u16(&mut buf, 22, 0x03); // flags: in_use + directory
+        put_u16(&mut buf, 20, 0x38);
+        put_u64(&mut buf, 32, 0);
+
+        let mut off = 0x38usize;
+
+        // 先放 DOS 名 (ns=2, "PROGRA~1") — 故意放前面，测试优先级
+        let dos_name = "PROGRA~1";
+        let dos_u16: Vec<u16> = dos_name.encode_utf16().collect();
+        let dos_bytes = dos_u16.len() * 2;
+        let dos_content = 66 + dos_bytes;
+        let dos_total = (24 + dos_content + 7) & !7;
+        put_u32(&mut buf, off, ATTR_FILE_NAME);
+        put_u32(&mut buf, off + 4, dos_total as u32);
+        buf[off + 8] = 0;
+        put_u32(&mut buf, off + 16, dos_content as u32);
+        put_u16(&mut buf, off + 20, 24);
+        let dos_off = off + 24;
+        put_u64(&mut buf, dos_off + 0, 5);
+        put_u64(&mut buf, dos_off + 48, 0);
+        buf[dos_off + 64] = dos_u16.len() as u8;
+        buf[dos_off + 65] = 2; // ns = DOS
+        for (i, &c) in dos_u16.iter().enumerate() {
+            put_u16(&mut buf, dos_off + 66 + i * 2, c);
+        }
+        off += dos_total;
+
+        // 再放 WIN32 名 (ns=1, "Program Files")
+        let win_name = "Program Files";
+        let win_u16: Vec<u16> = win_name.encode_utf16().collect();
+        let win_bytes = win_u16.len() * 2;
+        let win_content = 66 + win_bytes;
+        let win_total = (24 + win_content + 7) & !7;
+        put_u32(&mut buf, off, ATTR_FILE_NAME);
+        put_u32(&mut buf, off + 4, win_total as u32);
+        buf[off + 8] = 0;
+        put_u32(&mut buf, off + 16, win_content as u32);
+        put_u16(&mut buf, off + 20, 24);
+        let win_off = off + 24;
+        put_u64(&mut buf, win_off + 0, 5);
+        put_u64(&mut buf, win_off + 48, 0);
+        buf[win_off + 64] = win_u16.len() as u8;
+        buf[win_off + 65] = 1; // ns = WIN32
+        for (i, &c) in win_u16.iter().enumerate() {
+            put_u16(&mut buf, win_off + 66 + i * 2, c);
+        }
+        off += win_total;
+
+        put_u32(&mut buf, off, ATTR_END);
+        put_u32(&mut buf, off + 4, 0);
+
+        assert!(apply_fixup(&mut buf, 512));
+        let entry = parse_record(&buf).expect("parse should succeed");
+        // 关键断言：应该选 WIN32 名 "Program Files"，不是 DOS 名 "PROGRA~1"
+        assert_eq!(
+            entry.name, "Program Files",
+            "应该选 WIN32 长名，不是 DOS 8.3 短名 PROGRA~1"
+        );
     }
 }
