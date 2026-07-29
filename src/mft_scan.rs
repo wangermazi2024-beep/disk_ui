@@ -192,7 +192,6 @@ fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
     }
 }
 
-/// 单条 MFT 记录里我们关心的字段。
 struct RawEntry {
     parent_record: u64,
     name: String,
@@ -200,6 +199,8 @@ struct RawEntry {
     in_use: bool,
     is_base_record: bool,
     real_size: u64,
+    modified: u64,
+    attributes: u32,
 }
 
 fn apply_fixup(record: &mut [u8], bytes_per_sector: u32) -> bool {
@@ -243,22 +244,38 @@ fn parse_record(record: &[u8]) -> Option<RawEntry> {
 
     let mut parent_record: u64 = 0;
     let mut name: Option<String> = None;
-    let mut best_ns = 255u8; // 越小优先级越高，见下方选择逻辑
+    let mut best_ns = 255u8;
     let mut real_size: u64 = 0;
+    let mut modified_time: u64 = 0;
+    let mut file_attributes: u32 = 0;
 
     let mut off = first_attr_offset;
     while off + 16 <= record.len() {
         let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
-        if attr_type == ATTR_END {
-            break;
-        }
+        if attr_type == ATTR_END { break; }
         let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
-        if attr_len == 0 || off + attr_len > record.len() {
-            break;
-        }
+        if attr_len == 0 || off + attr_len > record.len() { break; }
         let non_resident = record[off + 8] != 0;
 
-        if attr_type == ATTR_FILE_NAME && !non_resident {
+        if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
+            // $STANDARD_INFORMATION: 常驻属性, 包含时间戳和文件属性
+            let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
+            let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
+            let v_start = off + value_off;
+            if v_start + 36 <= record.len() && value_len >= 36 {
+                let c = &record[v_start..v_start + value_len];
+                // 偏移 0-7: 创建时间
+                // 偏移 8-15: 修改时间
+                let modified_ft = u64::from_le_bytes(c[8..16].try_into().unwrap());
+                // Windows FILETIME (1601-01-01 epoch, 100ns units) -> unix nanos
+                if modified_ft != 0 {
+                    // FILETIME → Unix epoch: subtract 11644473600 seconds, multiply by 100
+                    modified_time = (modified_ft / 10).saturating_sub(11644473600_0000000);
+                }
+                // 偏移 32-35: file attributes (DWORD)
+                file_attributes = u32::from_le_bytes(c[32..36].try_into().unwrap());
+            }
+        } else if attr_type == ATTR_FILE_NAME && !non_resident {
             let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
             let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
             let content_start = off + value_off;
@@ -311,6 +328,8 @@ fn parse_record(record: &[u8]) -> Option<RawEntry> {
         in_use,
         is_base_record,
         real_size,
+        modified: modified_time,
+        attributes: file_attributes,
     })
 }
 
@@ -442,7 +461,13 @@ fn build_subtree(
             } else {
                 file_paths.push(child_path);
                 file_sizes.push(entry.real_size);
-                children_nodes.push(Node::new_file(entry.name.clone(), entry.real_size, file_color()));
+                children_nodes.push(Node::new_file_full(
+                    entry.name.clone(),
+                    entry.real_size,
+                    entry.modified,
+                    entry.attributes,
+                    file_color(),
+                ));
             }
         }
     }

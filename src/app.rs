@@ -14,8 +14,6 @@ use crate::ui::{sidebar, tree_list, TreeAction};
 pub struct DiskUiApp {
     root_path: String,
 
-    /// 所有磁盘分区，每个分区是独立的根节点。
-    /// 多分区时列表顶层显示 C / D / E ... 各一行，用户展开后看子目录。
     partitions: Vec<Node>,
 
     selected: Option<NodePath>,
@@ -26,6 +24,11 @@ pub struct DiskUiApp {
     scanned_count: u64,
     scan_error: Option<String>,
     scan_rx: Option<Receiver<ScanMessage>>,
+
+    /// 实际磁盘总容量（从 GetDiskFreeSpaceExW 获取）
+    disk_total: u64,
+    /// 实际磁盘剩余空间
+    disk_free: u64,
 }
 
 impl Default for DiskUiApp {
@@ -41,6 +44,8 @@ impl Default for DiskUiApp {
             scanned_count: 0,
             scan_error: None,
             scan_rx: None,
+            disk_total: 0,
+            disk_free: 0,
         }
     }
 }
@@ -65,7 +70,15 @@ impl eframe::App for DiskUiApp {
         self.poll_scan();
 
         let total_used: u64 = self.partitions.iter().map(|p| p.size).sum();
-        let total_size = ((total_used as f64) * 1.25).max(1.0) as u64;
+        // 尝试获取真实磁盘容量
+        #[cfg(windows)]
+        if self.disk_total == 0 {
+            if let Some((total, free)) = crate::mft_scan::get_disk_space('C') {
+                self.disk_total = total;
+                self.disk_free = free;
+            }
+        }
+        let total_size = if self.disk_total > 0 { self.disk_total } else { ((total_used as f64) * 1.25).max(1.0) as u64 };
 
         let topbar_action = topbar::show(
             ui,
@@ -83,7 +96,7 @@ impl eframe::App for DiskUiApp {
         }
 
         sidebar::show(ui, total_used, total_size,
-            total_size.saturating_sub(total_used), &self.categories);
+            if self.disk_free > 0 { self.disk_free } else { total_size.saturating_sub(total_used) }, &self.categories);
 
         let action = self.show_central_panel(ui);
         self.apply_action(action);
