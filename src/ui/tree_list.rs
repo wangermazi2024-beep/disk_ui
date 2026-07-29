@@ -54,14 +54,14 @@ fn row_contents(ui: &mut egui::Ui, node: &Node, path: &NodePath, selected: &Opti
     ui.horizontal(|ui| {
         let is_selected = selected.as_deref() == Some(path.as_slice());
         let icon = if node.is_folder() { "📁" } else { "📄" };
-        let resp = ui.selectable_label(is_selected, format!("{icon} {}", node.name));
+        let resp = ui.selectable_label(is_selected, RichText::new(format!("{icon} {}", node.name)).color(Color32::from_rgb(0xF0, 0xF0, 0xF0)).size(13.0));
         if resp.double_clicked() {
             *action = TreeAction::EnterNode(path.clone());
         } else if resp.clicked() {
             *action = TreeAction::Select(path.clone());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(human_size(node.size)).size(11.5).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+            ui.label(RichText::new(human_size(node.size)).size(12.0).color(Color32::from_rgb(0xC0, 0xC0, 0xC0)));
         });
     });
 }

@@ -167,22 +167,8 @@ impl DiskUiApp {
             .show(ui, |ui| {
                 let mut action = TreeAction::None;
 
-                // 当前视图根节点名称 + 面包屑（可点击跳到任意祖先层，一路返回真正的根）。
-                let view_root_name = self.root.navigate(&self.view_path)
-                    .map(|n| n.name.as_str())
-                    .unwrap_or(&self.root.name);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("📂 {}", view_root_name)).strong().size(15.0));
-                    ui.add_space(10.0);
-                    if let Some(a) = self.breadcrumb_ui(ui) {
-                        action = a;
-                    }
-                });
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.label(RichText::new("文件列表").strong().size(14.0));
+                ui.add_space(4.0);
+                ui.label(RichText::new("文件列表").strong().size(14.0).color(Color32::from_rgb(0xF0, 0xF0, 0xF0)));
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
@@ -191,113 +177,6 @@ impl DiskUiApp {
                 action
             })
             .inner
-    }
-
-    /// 顶部面包屑（可点击路径）：`C: / Windows / System32 / drivers`。
-    ///
-    /// 点击任意一段祖先目录，就能直接把 `view_path` 跳到那一层——包括一路
-    /// 点回真正的根目录（比如 `C:` 盘）。这只是切换"当前展示到哪一层"的
-    /// 只读导航状态，不会碰真实的树数据。
-    ///
-    /// 截断算法（Middle Ellipsis）：
-    /// - 始终保留最左一段（根）和最右一段（当前层）。
-    /// - 从左往右贪心地加入中间段，直到剩余宽度不足以再加下一段 + " / … / " + 当前层。
-    /// - 被省略的中间段统一用不可点击的 "…" 替代。
-    fn breadcrumb_ui(&self, ui: &mut egui::Ui) -> Option<TreeAction> {
-        let mut clicked: Option<NodePath> = None;
-
-        if !self.view_path.is_empty() {
-            if ui.small_button("⬆ 上级目录").clicked() {
-                let mut p = self.view_path.clone();
-                p.pop();
-                clicked = Some(p);
-            }
-        }
-
-        // 收集所有路径段（从真正根节点到当前视图根）
-        struct Seg {
-            name: String,
-            path: Vec<usize>,
-        }
-        let mut segs = vec![Seg { name: self.root.name.clone(), path: Vec::new() }];
-        let mut cursor = &self.root;
-        let mut prefix = Vec::new();
-        for &i in &self.view_path {
-            let Some(child) = cursor.children.get(i) else { break };
-            prefix.push(i);
-            segs.push(Seg { name: child.name.clone(), path: prefix.clone() });
-            cursor = child;
-        }
-
-        // 用 egui 测量字符串像素宽度
-        let measure_str = |s: &str| -> f32 {
-            let font = egui::FontId::proportional(12.5);
-            ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font, Color32::WHITE).size().x)
-        };
-        let sep_w = measure_str(" / ");
-        let ellipsis_w = measure_str("…");
-
-        // 可用宽度（留 8px 安全边距）
-        let avail_w = (ui.available_width() - 8.0).max(60.0);
-
-        // Middle-Ellipsis 算法（用下标避免 lifetime 问题）：
-        // - 始终显示首段（index 0）和尾段（index n-1）
-        // - 中间段从左向右贪心填入，装不下就用 None 表示省略
-        // slot = Some(seg_index) 表示显示该段，None 表示"…"
-        let slots: Vec<Option<usize>> = if segs.len() <= 2 {
-            (0..segs.len()).map(Some).collect()
-        } else {
-            let first_w = measure_str(&segs[0].name);
-            let last_w  = measure_str(&segs[segs.len() - 1].name);
-            // 最少空间：first + sep + … + sep + last
-            let min_w = first_w + sep_w + ellipsis_w + sep_w + last_w;
-            let mut remaining = avail_w - min_w;
-
-            let mut middle: Vec<Option<usize>> = Vec::new();
-            let mut need_ellipsis = false;
-            for idx in 1..segs.len() - 1 {
-                let cost = sep_w + measure_str(&segs[idx].name);
-                if remaining >= cost {
-                    middle.push(Some(idx));
-                    remaining -= cost;
-                } else {
-                    need_ellipsis = true;
-                    break;
-                }
-            }
-
-            let mut result = vec![Some(0_usize)];
-            result.extend(middle);
-            if need_ellipsis {
-                result.push(None); // "…"
-            }
-            result.push(Some(segs.len() - 1));
-            result
-        };
-
-        ui.horizontal(|ui| {
-            let total = slots.len();
-            for (slot_idx, slot) in slots.iter().enumerate() {
-                if slot_idx > 0 {
-                    ui.label(RichText::new(" / ").color(Color32::from_rgb(0x65, 0x65, 0x70)).size(12.5));
-                }
-                match slot {
-                    None => {
-                        ui.label(RichText::new("…").color(Color32::from_rgb(0x65, 0x65, 0x70)).size(12.5));
-                    }
-                    Some(seg_idx) => {
-                        let seg = &segs[*seg_idx];
-                        let is_last = slot_idx == total - 1;
-                        let label = RichText::new(&seg.name).size(12.5);
-                        if ui.selectable_label(is_last, label).clicked() && !is_last {
-                            clicked = Some(seg.path.clone());
-                        }
-                    }
-                }
-            }
-        });
-
-        clicked.map(TreeAction::NavigateTo)
     }
 
     fn apply_action(&mut self, action: TreeAction) {
