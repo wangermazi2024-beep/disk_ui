@@ -3,9 +3,10 @@
 //! - **单击文件夹**：在当前块内展开子色块（inline 嵌套）。
 //! - **单击已展开的文件夹**：收起。
 //! - **单击文件**：选中。
-//! - **双击文件夹**：产生 `TreeAction::EnterNode`，由 `app.rs` 把该节点的父节点
-//!   提升为新的根节点——这是纯数据结构变化，本视图不做任何额外处理，
-//!   下一帧照常把（新的）根节点的孩子画出来，和刚打开程序时的顶层视图是同一份代码。
+//! - **双击文件夹**：产生 `TreeAction::EnterNode`，`app.rs` 据此把该节点的父节点
+//!   设为新的"当前视图根"（只是切换 `view_path` 这个只读导航索引，不修改、
+//!   不复制、也不丢弃树里任何一个节点）。下一帧本视图用 `root.navigate(view_path)`
+//!   重新定位到新的视图根，画法和最外层视图完全一样，没有任何特殊分支。
 
 use egui::{Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2};
 
@@ -29,11 +30,19 @@ pub fn show(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     root: &Node,
+    view_path: &[usize],
     selected: &Option<NodePath>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
-    let mut path = Vec::new();
-    draw_children(ui, rect, root, &mut path, 0, selected, &mut action);
+
+    // 只读导航到当前视图根：view_path 失效时（比如目标节点被重新扫描后没了）
+    // 退回真正的根节点，不 panic、不 crash。
+    let (view_root, mut path) = match root.navigate(view_path) {
+        Some(n) => (n, view_path.to_vec()),
+        None => (root, Vec::new()),
+    };
+
+    draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
     action
 }
 

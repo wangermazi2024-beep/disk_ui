@@ -52,25 +52,12 @@ impl Node {
         matches!(self.kind, NodeKind::Folder)
     }
 
-    /// 按路径把某个后代节点从树里“挖出来”，返回其所有权，原树中该节点被移除。
-    ///
-    /// 用途：双击导航时，把被双击节点的父节点提升为新的根节点，
-    /// 这样根到父节点的链路只剩一层（父节点本身就是根），子节点（父节点原有的孩子，
-    /// 含被双击节点及其兄弟）完全不变。因为提升之后原树的其余部分会被整体丢弃，
-    /// 这里不需要保持原树结构完整，直接 `Vec::remove` 取出即可。
-    ///
-    /// `path` 非空，且是相对于 `self` 的路径；路径不存在时返回 `None`。
-    pub fn take_at(&mut self, path: &[usize]) -> Option<Node> {
-        let (&i, rest) = path.split_first()?;
-        if rest.is_empty() {
-            if i < self.children.len() {
-                Some(self.children.remove(i))
-            } else {
-                None
-            }
-        } else {
-            self.children.get_mut(i)?.take_at(rest)
+    pub fn navigate(&self, path: &[usize]) -> Option<&Node> {
+        let mut cur = self;
+        for &i in path {
+            cur = cur.children.get(i)?;
         }
+        Some(cur)
     }
 
     /// 递归清空所有节点的展开标记。
