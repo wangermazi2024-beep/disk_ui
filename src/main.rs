@@ -9,17 +9,24 @@
 //! - `format`     格式化/文本测量小工具
 //! - `app`        顶层状态编排
 //! - `ui::*`      各个具体面板/视图
+//!
+//! 纯逻辑模块（model / scan / format / categorize / disk_info / mft_parse /
+//! mft_scan / mft_verify）放在 `lib.rs` 里，作为 lib target 暴露给
+//! `src/bin/verify_mft.rs` 和单元测试使用，这样它们可以在没有 eframe 的
+//! 环境下（如本机 Linux 沙箱）也编过 / 跑测试。
+//! 本文件（main.rs）只保留 GUI 专有的 `app` / `ui` / `treemap` 模块。
+
+// 把 lib 暴露的模块重新引入到 bin 的 crate 命名空间，
+// 这样 `mod app` 里的代码可以继续用 `crate::model::Node` 之类的路径，
+// 不用改成 `disk_ui::model::Node`。
+pub use disk_ui::{
+    categorize, disk_info, format, mft_parse, model, scan,
+};
+#[cfg(windows)]
+pub use disk_ui::{mft_scan, mft_verify};
 
 mod app;
-mod categorize;
-mod disk_info;
-mod format;
-mod model;
-#[cfg(windows)]
-mod mft_scan;
-#[cfg(windows)]
-mod mft_verify;
-mod scan;
+mod treemap;
 mod ui;
 
 use app::DiskUiApp;

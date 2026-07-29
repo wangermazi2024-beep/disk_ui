@@ -17,12 +17,16 @@
 //! - 只对 NTFS 卷有效；FAT/exFAT/ReFS/网络盘会在探测阶段直接失败，
 //!   调用方应退回标准目录遍历（见 `scan.rs::scan_dir`）。
 //! - 只在 Windows 上编译（`cfg(windows)`），非 Windows 平台这个模块整体不参与构建。
+//!
+//! ## 模块拆分
+//! 纯字节解析逻辑（`apply_fixup` / `parse_record` / `RawEntry`）已经抽到
+//! `crate::mft_parse` 模块，那里没有 `cfg(windows)` 限制，可以在 Linux 上
+//! 跑单元测试（用合成 MFT 字节流验证字段提取正确）。本模块只剩 Windows 专有的
+//! I/O 代码（CreateFileW / DeviceIoControl）。
 
 #![cfg(windows)]
 
 use std::collections::HashMap;
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::PathBuf;
 use std::ptr::null_mut;
@@ -42,13 +46,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 use crate::model::Node;
+use crate::mft_parse::{apply_fixup, parse_record, RawEntry, ROOT_RECORD_INDEX};
 
 const GENERIC_READ: u32 = 0x8000_0000;
-const ATTR_STANDARD_INFORMATION: u32 = 0x10;
-const ATTR_FILE_NAME: u32 = 0x30;
-const ATTR_DATA: u32 = 0x80;
-const ATTR_END: u32 = 0xFFFF_FFFF;
-const ROOT_RECORD_INDEX: u64 = 5; // NTFS 规定根目录固定是第 5 条 MFT 记录。
 
 pub struct MftError(pub String);
 impl std::fmt::Display for MftError {
@@ -217,167 +217,6 @@ fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
         // `file` 在这里 drop 会自动 CloseHandle。
         Ok(buf)
     }
-}
-
-/// 单条 MFT 记录里我们关心的字段。
-struct RawEntry {
-    parent_record: u64,
-    name: String,
-    is_dir: bool,
-    in_use: bool,
-    is_base_record: bool,
-    real_size: u64,
-    /// 来自 $STANDARD_INFORMATION 的 LastModificationTime（FILETIME）。
-    modified_ft: u64,
-    /// 来自 $STANDARD_INFORMATION 的 Flags（FILE_ATTRIBUTE_*）。
-    attributes: u32,
-}
-
-fn apply_fixup(record: &mut [u8], bytes_per_sector: u32) -> bool {
-    if record.len() < 8 {
-        return false;
-    }
-    let usa_offset = u16::from_le_bytes([record[4], record[5]]) as usize;
-    let usa_count = u16::from_le_bytes([record[6], record[7]]) as usize; // 含 USN 本身
-    if usa_count == 0 || usa_offset + usa_count * 2 > record.len() {
-        return false;
-    }
-    let usn = [record[usa_offset], record[usa_offset + 1]];
-    let sector = bytes_per_sector.max(512) as usize;
-    for i in 1..usa_count {
-        let sector_end = i * sector; // 每个扇区最后 2 字节
-        if sector_end > record.len() {
-            break;
-        }
-        let check = &record[sector_end - 2..sector_end];
-        if check != usn {
-            // 该扇区的 USN 不匹配：记录已损坏/不完整，放弃这条记录。
-            return false;
-        }
-        let orig_off = usa_offset + i * 2;
-        record[sector_end - 2] = record[orig_off];
-        record[sector_end - 1] = record[orig_off + 1];
-    }
-    true
-}
-
-/// $STANDARD_INFORMATION 内容布局（resident）：
-///   +0x00 CreationTime      (FILETIME 8B)
-///   +0x08 LastModificationTime (FILETIME 8B)
-///   +0x10 LastMftChangeTime (FILETIME 8B)
-///   +0x18 LastAccessTime    (FILETIME 8B)
-///   +0x20 AllocatedSize     (8B)
-///   +0x28 RealSize          (8B)
-///   +0x30 Flags             (4B, FILE_ATTRIBUTE_*)
-///   +0x34 UsedSize          (4B)
-///   ...
-/// 我们只要 LastModificationTime 和 Flags。
-const STD_INFO_OFFSET_MODIFIED: usize = 0x08;
-const STD_INFO_OFFSET_FLAGS: usize = 0x30;
-const STD_INFO_MIN_LEN: usize = 0x38; // 至少要读到 0x34 + 4
-
-fn parse_record(record: &[u8]) -> Option<RawEntry> {
-    if record.len() < 48 || &record[0..4] != b"FILE" {
-        return None;
-    }
-    let flags = u16::from_le_bytes([record[22], record[23]]);
-    let in_use = flags & 0x0001 != 0;
-    let is_dir = flags & 0x0002 != 0;
-    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
-    let base_record_ref = u64::from_le_bytes(record[32..40].try_into().unwrap());
-    let is_base_record = (base_record_ref & 0x0000_FFFF_FFFF_FFFF) == 0;
-
-    let mut parent_record: u64 = 0;
-    let mut name: Option<String> = None;
-    let mut best_ns = 255u8; // 越小优先级越高，见下方选择逻辑
-    let mut real_size: u64 = 0;
-    let mut modified_ft: u64 = 0;
-    let mut attributes: u32 = 0;
-
-    let mut off = first_attr_offset;
-    while off + 16 <= record.len() {
-        let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
-        if attr_type == ATTR_END {
-            break;
-        }
-        let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
-        if attr_len == 0 || off + attr_len > record.len() {
-            break;
-        }
-        let non_resident = record[off + 8] != 0;
-        // resident 属性的 value_off / value_len 在固定偏移上；non-resident 不一样。
-        let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
-        let value_len =
-            u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
-        let content_start = off + value_off;
-
-        if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
-            if content_start + STD_INFO_MIN_LEN <= record.len() && value_len >= STD_INFO_MIN_LEN {
-                modified_ft = u64::from_le_bytes(
-                    record[content_start + STD_INFO_OFFSET_MODIFIED
-                        ..content_start + STD_INFO_OFFSET_MODIFIED + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-                attributes = u32::from_le_bytes(
-                    record[content_start + STD_INFO_OFFSET_FLAGS
-                        ..content_start + STD_INFO_OFFSET_FLAGS + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-            }
-        } else if attr_type == ATTR_FILE_NAME && !non_resident {
-            if content_start + value_len <= record.len() && value_len >= 66 {
-                let c = &record[content_start..content_start + value_len];
-                let parent_ref = u64::from_le_bytes(c[0..8].try_into().unwrap());
-                let name_len_chars = c[64] as usize;
-                let ns = c[65]; // 0=POSIX 1=WIN32 2=DOS(8.3短名) 3=WIN32&DOS
-                let name_bytes_len = name_len_chars * 2;
-                if 66 + name_bytes_len <= c.len() {
-                    // 优先取 WIN32(1) 或 POSIX(0) 名字；纯 DOS 短名(2) 只在没有更好选择时用。
-                    let priority = match ns {
-                        1 | 0 | 3 => 0,
-                        _ => 1,
-                    };
-                    if priority < best_ns {
-                        best_ns = priority;
-                        let u16s: Vec<u16> = c[66..66 + name_bytes_len]
-                            .chunks_exact(2)
-                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                            .collect();
-                        name = Some(OsString::from_wide(&u16s).to_string_lossy().into_owned());
-                        parent_record = parent_ref & 0x0000_FFFF_FFFF_FFFF; // 低 48 位是记录号
-                        // $FILE_NAME 属性里也有一个 real_size（allocation size + real size），
-                        // 但 $DATA(0x80) 里的更准确，这里不覆盖。
-                    }
-                }
-            }
-        } else if attr_type == ATTR_DATA {
-            // 未命名的 $DATA 才代表文件主体大小；命名的是备用数据流(ADS)，跳过。
-            let name_len = record[off + 9];
-            if name_len == 0 {
-                real_size = if non_resident {
-                    u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
-                } else {
-                    u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
-                };
-            }
-        }
-
-        off += attr_len;
-    }
-
-    let name = name?;
-    Some(RawEntry {
-        parent_record,
-        name,
-        is_dir,
-        in_use,
-        is_base_record,
-        real_size,
-        modified_ft,
-        attributes,
-    })
 }
 
 fn folder_color(depth: usize) -> Color32 {

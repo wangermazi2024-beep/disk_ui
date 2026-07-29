@@ -5,10 +5,16 @@ edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# 默认开启 GUI（eframe）。在 Linux 上做单元测试 / 编译 verify_mft 时
+# 用 `--no-default-features` 跳过 eframe（它依赖的 winit 在无 X11 头的 Linux 上编不过）。
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui_extras"]
+
 [dependencies]
-eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.35"
-egui_extras = "0.35"
+egui_extras = { version = "0.35", optional = true }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
 rand = "0.8"
 
 # 仅 Windows 平台需要：直接读取 NTFS $MFT 的底层 API 绑定。
@@ -22,3 +28,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_System_Threading",
 ] }
+
+# GUI 主程序需要 eframe，所以挂在 gui feature 下。
+[[bin]]
+name = "disk_ui"
+path = "src/main.rs"
+required-features = ["gui"]
+
+# verify_mft 不需要 eframe，可以在没有 GUI 依赖的环境下编译。
+[[bin]]
+name = "verify_mft"
+path = "src/bin/verify_mft.rs"
