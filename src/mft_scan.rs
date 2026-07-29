@@ -91,7 +91,7 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
     if !is_elevated() {
         return false;
     }
-    let path = wide(&format!("\\\\.\\{drive_letter}:"));
+    let path = wide(&format!(r"\.\{}:", drive_letter));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -128,7 +128,7 @@ struct VolumeInfo {
 }
 
 fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
-    let path = wide(&format!("\\\\.\\{drive_letter}:"));
+    let path = wide(&format!(r"\.\{}:", drive_letter));
     unsafe {
         let h = CreateFileW(
             path.as_ptr(),
@@ -169,10 +169,10 @@ fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
 /// 这也是这条路径比标准目录遍历快一个数量级的根本原因。
 fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
     // 方案：打开卷设备 \\.\C:，用 FSCTL 获取 MFT 位置后直接读取（$MFT 文件路径不可靠）
-    let vol_path = wide(&format!("\\\\\\\\.\\\\{drive_letter}:"));
+    let path = wide(&format!(r"\.\{}:", drive_letter));
     unsafe {
         let h = CreateFileW(
-            vol_path.as_ptr(),
+            path.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             null_mut(),
