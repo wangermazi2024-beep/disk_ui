@@ -3,8 +3,8 @@
 //! 这个模块从 `mft_scan.rs` 抽出来，目的有两个：
 //! 1. 让解析逻辑可以在 Linux 上跑单元测试（用合成的 MFT 字节流喂进去），
 //!    验证字段提取是否正确、是否丢属性、Fixup 算法是否对。
-//! 2. 让 `mft_scan.rs` 只剩 Windows 专有的 I/O 代码（CreateFileW / DeviceIoControl），
-//!    职责更清晰。
+//! 2. 让 `mft_scan.rs` 只剩 Windows 专有的 I/O 代码（CreateFileW / DeviceIoControl /
+//!    AdjustTokenPrivileges），职责更清晰。
 //!
 //! 解析逻辑本身是纯字节操作，没有任何 Windows API 调用，所以可以跨平台编译。
 //! 真正在 Windows 上跑时，`mft_scan::scan_drive_via_mft` 会用这里的
@@ -229,7 +229,6 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
 mod tests {
     use super::*;
 
-    /// 把一个 u64 写到 buf 的指定偏移上（小端）。
     fn put_u64(buf: &mut Vec<u8>, off: usize, v: u64) {
         let bytes = v.to_le_bytes();
         buf[off..off + 8].copy_from_slice(&bytes);
@@ -243,15 +242,7 @@ mod tests {
         buf[off..off + 2].copy_from_slice(&bytes);
     }
 
-    /// 构造一个最小的 MFT FILE 记录字节流：
-    /// - "FILE" magic
-    /// - usa_offset / usa_count 指向一个空 USA（count=1，只有 USN 本身，没有扇区要修正）
-    /// - flags = in_use | is_dir
-    /// - 三个 resident 属性：$STANDARD_INFORMATION / $FILE_NAME / $DATA
-    /// - 属性结束标记 0xFFFFFFFF
-    ///
-    /// 这样构造出来的记录可以跑通 apply_fixup（USA count=1 时不进循环）
-    /// 和 parse_record（能拿到全部字段）。
+    /// 构造一个最小的 MFT FILE 记录字节流。
     fn build_test_record(
         name: &str,
         parent_record: u64,
@@ -260,112 +251,70 @@ mod tests {
         modified_ft: u64,
         attributes: u32,
     ) -> Vec<u8> {
-        // 1024 字节的记录是 NTFS 默认大小，足够装下我们这几个属性。
         let mut buf = vec![0u8; 1024];
 
         // ── FILE 头 ──────────────────────────────────────────
         buf[0..4].copy_from_slice(b"FILE");
-        // usa_offset = 0x30（FILE 头之后的标准位置）
-        // usa_count = 1（只有 USN 本身，不修正任何扇区 → apply_fixup 不会进循环）
         put_u16(&mut buf, 4, 0x30); // usa_offset
-        put_u16(&mut buf, 6, 1); // usa_count
-        // 写一个 USN 值（随便填）
-        put_u16(&mut buf, 0x30, 0x0001);
-        // flags: in_use(0x01) + is_dir(0x02 if dir)
+        put_u16(&mut buf, 6, 1); // usa_count = 1（只有 USN 本身，不修正扇区）
+        put_u16(&mut buf, 0x30, 0x0001); // USN 值
         let flags: u16 = 0x01 | if is_dir { 0x02 } else { 0x00 };
         put_u16(&mut buf, 22, flags);
-        // first_attr_offset = 0x38（USA 之后）
-        put_u16(&mut buf, 20, 0x38);
-        // base_record_ref = 0（这是 base record 本身）
-        put_u64(&mut buf, 32, 0);
+        put_u16(&mut buf, 20, 0x38); // first_attr_offset
+        put_u64(&mut buf, 32, 0); // base_record_ref = 0
 
         let mut off = 0x38usize;
 
         // ── $STANDARD_INFORMATION 属性 ─────────────────────
-        let std_attr_content_len: usize = 0x48; // 72 字节，标准长度
-        let std_attr_total_len: usize = 24 /*resident 头*/ + std_attr_content_len;
-        put_u32(&mut buf, off, ATTR_STANDARD_INFORMATION); // attr_type
-        put_u32(&mut buf, off + 4, std_attr_total_len as u32); // attr_len
-        buf[off + 8] = 0; // non_resident = 0
-        put_u32(&mut buf, off + 16, std_attr_content_len as u32); // value_len
+        let std_attr_content_len: usize = 0x48;
+        let std_attr_total_len: usize = 24 + std_attr_content_len;
+        put_u32(&mut buf, off, ATTR_STANDARD_INFORMATION);
+        put_u32(&mut buf, off + 4, std_attr_total_len as u32);
+        buf[off + 8] = 0; // resident
+        put_u32(&mut buf, off + 16, std_attr_content_len as u32);
         put_u16(&mut buf, off + 20, 24); // value_off
-        // 内容：CreationTime / LastModificationTime / LastMftChangeTime / LastAccessTime
         let content_off = off + 24;
         put_u64(&mut buf, content_off + 0x00, 0); // CreationTime
         put_u64(&mut buf, content_off + 0x08, modified_ft); // LastModificationTime
-        put_u64(&mut buf, content_off + 0x10, 0); // LastMftChangeTime
-        put_u64(&mut buf, content_off + 0x18, 0); // LastAccessTime
-        put_u64(&mut buf, content_off + 0x20, real_size); // AllocatedSize
-        put_u64(&mut buf, content_off + 0x28, real_size); // RealSize
-        put_u32(&mut buf, content_off + 0x30, attributes); // Flags
-        put_u32(&mut buf, content_off + 0x34, 0); // UsedSize
+        put_u64(&mut buf, content_off + 0x10, 0);
+        put_u64(&mut buf, content_off + 0x18, 0);
+        put_u64(&mut buf, content_off + 0x20, real_size);
+        put_u64(&mut buf, content_off + 0x28, real_size);
+        put_u32(&mut buf, content_off + 0x30, attributes);
+        put_u32(&mut buf, content_off + 0x34, 0);
         off += std_attr_total_len;
 
         // ── $FILE_NAME 属性 ─────────────────────────────────
-        // 内容布局：
-        //   +0x00 ParentReference (8B)
-        //   +0x08 CreationTime (8B)
-        //   +0x10 ModificationTime (8B)
-        //   +0x18 MftChangeTime (8B)
-        //   +0x20 AccessTime (8B)
-        //   +0x28 AllocatedSize (8B)
-        //   +0x30 RealSize (8B)
-        //   +0x38 Flags (4B)
-        //   +0x3C ReparseValue (4B)
-        //   +0x40 NameNamespace (1B)
-        //   +0x41 NameLengthChars (1B)
-        //   ... 实际是 +0x40 name_ns, +0x41 name_len (NTFS 文档里稍有出入，
-        //       我们以代码里 parse_record 的偏移为准：c[64]=name_len, c[65]=ns)
-        //   +0x42 ... padding to align
-        //   +0x44 ... 不对，parse_record 用的是 c[64] 和 c[65]，
-        //       所以 name_len 在 +0x40，ns 在 +0x41。
-        //   等等，让我再看一下 parse_record：
-        //     let name_len_chars = c[64] as usize;
-        //     let ns = c[65];
-        //   所以 64=name_len, 65=ns。
-        //   名字从 c[66] 开始，每字符 2 字节 UTF-16LE。
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         let name_bytes_len = name_u16.len() * 2;
         let fn_content_len: usize = 66 + name_bytes_len;
-        // resident 属性总长度需要 8 字节对齐
         let fn_attr_total_len: usize = (24 + fn_content_len + 7) & !7;
-        put_u32(&mut buf, off, ATTR_FILE_NAME); // attr_type
-        put_u32(&mut buf, off + 4, fn_attr_total_len as u32); // attr_len
-        buf[off + 8] = 0; // non_resident = 0
-        put_u32(&mut buf, off + 16, fn_content_len as u32); // value_len
-        put_u16(&mut buf, off + 20, 24); // value_off
+        put_u32(&mut buf, off, ATTR_FILE_NAME);
+        put_u32(&mut buf, off + 4, fn_attr_total_len as u32);
+        buf[off + 8] = 0;
+        put_u32(&mut buf, off + 16, fn_content_len as u32);
+        put_u16(&mut buf, off + 20, 24);
         let fn_content_off = off + 24;
-        put_u64(&mut buf, fn_content_off + 0, parent_record); // ParentReference
-        // 时间字段全部填 0
-        put_u64(&mut buf, fn_content_off + 8, 0);
-        put_u64(&mut buf, fn_content_off + 16, 0);
-        put_u64(&mut buf, fn_content_off + 24, 0);
-        put_u64(&mut buf, fn_content_off + 32, 0);
-        put_u64(&mut buf, fn_content_off + 40, 0);
-        put_u64(&mut buf, fn_content_off + 48, 0);
-        // flags / reparse
-        put_u32(&mut buf, fn_content_off + 56, 0);
-        put_u32(&mut buf, fn_content_off + 60, 0);
-        // name_len (1B) at offset 64
-        buf[fn_content_off + 64] = name_u16.len() as u8;
-        // name_namespace (1B) at offset 65: 1 = WIN32
-        buf[fn_content_off + 65] = 1;
-        // 名字 UTF-16LE 从 offset 66 开始
+        put_u64(&mut buf, fn_content_off + 0, parent_record);
+        // 时间字段全 0
+        for i in (8..64).step_by(8) {
+            put_u64(&mut buf, fn_content_off + i, 0);
+        }
+        buf[fn_content_off + 64] = name_u16.len() as u8; // name_len
+        buf[fn_content_off + 65] = 1; // ns = WIN32
         for (i, &c) in name_u16.iter().enumerate() {
             put_u16(&mut buf, fn_content_off + 66 + i * 2, c);
         }
         off += fn_attr_total_len;
 
-        // ── $DATA 属性（只有文件才有，文件夹也常有但 real_size=0） ──
-        // resident $DATA（小文件）：内容长度 = real_size，但我们只关心 header 里的 real_size。
-        // 对于非驻留（大文件），real_size 在 off+48。这里用 resident 模拟。
-        let data_attr_total_len: usize = 32; // 24 头 + 8 字节内容（够装下 real_size 字段位置）
-        put_u32(&mut buf, off, ATTR_DATA); // attr_type
-        put_u32(&mut buf, off + 4, data_attr_total_len as u32); // attr_len
-        buf[off + 8] = 0; // non_resident = 0
-        buf[off + 9] = 0; // name_len = 0（未命名 $DATA）
-        put_u32(&mut buf, off + 16, real_size as u32); // value_len = real_size (resident)
-        put_u16(&mut buf, off + 20, 24); // value_off
+        // ── $DATA 属性（resident） ──────────────────────────
+        let data_attr_total_len: usize = 32;
+        put_u32(&mut buf, off, ATTR_DATA);
+        put_u32(&mut buf, off + 4, data_attr_total_len as u32);
+        buf[off + 8] = 0; // resident
+        buf[off + 9] = 0; // name_len = 0
+        put_u32(&mut buf, off + 16, real_size as u32); // value_len
+        put_u16(&mut buf, off + 20, 24);
         off += data_attr_total_len;
 
         // ── 属性结束标记 ───────────────────────────────────
@@ -373,9 +322,7 @@ mod tests {
         put_u32(&mut buf, off + 4, 0);
         off += 8;
 
-        // 截断到实际使用的长度（保持 8 字节对齐）
         buf.truncate(off);
-        // 补齐到至少 512 字节（apply_fixup 在 sector_end > len 时会 break，不会出错）
         while buf.len() < 512 {
             buf.push(0);
         }
@@ -384,14 +331,10 @@ mod tests {
 
     #[test]
     fn test_parse_file_record() {
-        // 构造一个文件记录：name="hello.txt", parent=42, real_size=123456
-        let modified_ft: u64 = 132_000_000_000_000_000; // 某个 FILETIME
+        let modified_ft: u64 = 132_000_000_000_000_000;
         let attributes: u32 = 0x20; // ARCHIVE
         let mut record = build_test_record("hello.txt", 42, false, 123_456, modified_ft, attributes);
-
-        // apply_fixup 应该通过（USA count=1 不进循环）
         assert!(apply_fixup(&mut record, 512), "apply_fixup should succeed");
-
         let entry = parse_record(&record).expect("parse_record should return Some");
         assert_eq!(entry.name, "hello.txt");
         assert_eq!(entry.parent_record, 42);
@@ -408,7 +351,6 @@ mod tests {
         let modified_ft: u64 = 132_500_000_000_000_000;
         let attributes: u32 = 0x10; // DIRECTORY
         let mut record = build_test_record("MyFolder", 5, true, 0, modified_ft, attributes);
-
         assert!(apply_fixup(&mut record, 512));
         let entry = parse_record(&record).expect("parse_record should return Some");
         assert_eq!(entry.name, "MyFolder");
@@ -419,7 +361,6 @@ mod tests {
 
     #[test]
     fn test_parse_chinese_name() {
-        // 中文名字（UTF-16 多字节）
         let mut record = build_test_record("测试文件.txt", 7, false, 999, 0, 0x20);
         assert!(apply_fixup(&mut record, 512));
         let entry = parse_record(&record).expect("parse_record should return Some");
@@ -431,62 +372,49 @@ mod tests {
     fn test_parse_invalid_magic() {
         let mut buf = vec![0u8; 1024];
         buf[0..4].copy_from_slice(b"BAAD");
-        // apply_fixup 可能通过（USA count 检查），但 parse_record 应返回 None
         let _ = apply_fixup(&mut buf, 512);
-        assert!(parse_record(&buf).is_none(), "non-FILE magic should return None");
+        assert!(parse_record(&buf).is_none());
     }
 
     #[test]
     fn test_parse_too_short() {
         let buf = vec![0u8; 10];
-        assert!(parse_record(&buf).is_none(), "too-short record should return None");
+        assert!(parse_record(&buf).is_none());
     }
 
     #[test]
     fn test_apply_fixup_usn_mismatch() {
-        // 构造一个 record，让 USA 检查失败
         let mut buf = vec![0u8; 1024];
         buf[0..4].copy_from_slice(b"FILE");
-        // usa_offset = 0x30, usa_count = 2（要检查 1 个扇区）
         put_u16(&mut buf, 4, 0x30);
-        put_u16(&mut buf, 6, 2);
-        // USN 值 = 0x1234
-        put_u16(&mut buf, 0x30, 0x1234);
-        // 扇区 512 末尾的 2 字节 = 0x5678（不匹配 USN）
-        put_u16(&mut buf, 510, 0x5678);
-        // apply_fixup 应失败
-        assert!(!apply_fixup(&mut buf, 512), "USN mismatch should fail fixup");
+        put_u16(&mut buf, 6, 2); // usa_count = 2（检查 1 个扇区）
+        put_u16(&mut buf, 0x30, 0x1234); // USN
+        put_u16(&mut buf, 510, 0x5678); // 扇区末尾不匹配
+        assert!(!apply_fixup(&mut buf, 512));
     }
 
     #[test]
     fn test_apply_fixup_usn_match() {
-        // 构造一个 record，让 USA 检查通过
         let mut buf = vec![0u8; 1024];
         buf[0..4].copy_from_slice(b"FILE");
         put_u16(&mut buf, 4, 0x30);
         put_u16(&mut buf, 6, 2);
-        // USN 值 = 0x1234
-        put_u16(&mut buf, 0x30, 0x1234);
-        // 扇区 512 末尾的 2 字节也填 0x1234（匹配）
-        put_u16(&mut buf, 510, 0x1234);
-        // 原 2 字节放在 USA 数组的第 2 项（offset 0x32）
-        put_u16(&mut buf, 0x32, 0xABCD);
-        assert!(apply_fixup(&mut buf, 512), "USN match should pass fixup");
-        // 修正后，扇区末尾的 2 字节应该被替换成原值
+        put_u16(&mut buf, 0x30, 0x1234); // USN
+        put_u16(&mut buf, 510, 0x1234); // 扇区末尾匹配
+        put_u16(&mut buf, 0x32, 0xABCD); // 原值
+        assert!(apply_fixup(&mut buf, 512));
         let restored = u16::from_le_bytes([buf[510], buf[511]]);
-        assert_eq!(restored, 0xABCD, "fixup should restore original bytes");
+        assert_eq!(restored, 0xABCD);
     }
 
-    /// 解析多条记录，验证不丢字段（模拟一个迷你的 MFT）。
     #[test]
     fn test_parse_multiple_records_no_loss() {
         let records_data = vec![
             ("file_a.txt", 5u64, false, 100u64, 132_000_000_000_000_000u64, 0x20u32),
             ("file_b.log", 5, false, 200, 132_100_000_000_000_000, 0x20),
             ("subdir", 5, true, 0, 132_200_000_000_000_000, 0x10),
-            ("file_c.bin", 5, false, 300, 132_300_000_000_000_000, 0xA0), // ARCHIVE|NORMAL
+            ("file_c.bin", 5, false, 300, 132_300_000_000_000_000, 0xA0),
         ];
-
         let mut parsed_count = 0;
         for (name, parent, is_dir, size, mft, attrs) in &records_data {
             let mut rec = build_test_record(name, *parent, *is_dir, *size, *mft, *attrs);
@@ -500,6 +428,6 @@ mod tests {
             assert_eq!(entry.attributes, *attrs);
             parsed_count += 1;
         }
-        assert_eq!(parsed_count, records_data.len(), "应该解析出全部记录，一个都不能丢");
+        assert_eq!(parsed_count, records_data.len(), "应该解析出全部记录");
     }
 }

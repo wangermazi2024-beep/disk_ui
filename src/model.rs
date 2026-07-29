@@ -62,7 +62,7 @@ impl Node {
 
     /// 同上，但允许显式指定本节点自身的修改时间和属性。
     /// 文件夹的"修改时间"在 NTFS 上指的是该目录自身的 LastModificationTime
-    /// （不是子节点里的最大值），所以扫描时单独拿到后用这个构造器覆盖。
+    ///（不是子节点里的最大值），所以扫描时单独拿到后用这个构造器覆盖。
     pub fn new_folder_with_meta(
         name: impl Into<String>,
         color: Color32,
@@ -71,7 +71,6 @@ impl Node {
         attributes: u32,
     ) -> Self {
         let mut node = Self::new_folder(name, color, children);
-        // 优先用本目录自身的时间；如果子节点里有更大的（理论上不该发生）也兜底一下。
         node.modified_ft = modified_ft.max(node.modified_ft);
         node.attributes = if attributes == 0 { 0x10 } else { attributes };
         node
@@ -132,32 +131,23 @@ impl Node {
     /// 1. 把 X 所在层（父节点的所有 children）全部 collapse_all。
     /// 2. 如果 X 之前是折叠的，展开 X（toggle：如果已展开则折叠）。
     /// 3. X 子树内部的旧展开状态也一并清除（换了视图就重置）。
-    ///
-    /// 这样同一层永远只有一个节点展开，和 SpaceSniffer 行为一致。
-    ///
-    /// `path`：目标节点相对于 self 的路径（不含 view_root 的 base_path）。
-    /// 返回 true 表示节点被展开，false 表示被折叠。
     pub fn exclusive_toggle(&mut self, path: &[usize]) -> bool {
         if path.is_empty() {
             return false;
         }
 
         if path.len() == 1 {
-            // 目标节点就在 self.children[path[0]]
             let target_idx = path[0];
-            // 记录目标节点当前状态
             let was_expanded = self
                 .children
                 .get(target_idx)
                 .map(|n| n.expanded)
                 .unwrap_or(false);
 
-            // 先把同层所有兄弟（包括目标）全部折叠
             for child in &mut self.children {
                 child.collapse_all();
             }
 
-            // 如果之前是折叠的，现在展开目标
             if !was_expanded {
                 if let Some(target) = self.children.get_mut(target_idx) {
                     target.expanded = true;
@@ -167,7 +157,6 @@ impl Node {
             return false;
         }
 
-        // 递归到父节点
         let next = path[0];
         if let Some(child) = self.children.get_mut(next) {
             child.exclusive_toggle(&path[1..])

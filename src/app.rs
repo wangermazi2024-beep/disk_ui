@@ -25,6 +25,7 @@ pub struct DiskUiApp {
 
     /// 系统里枚举到的所有分区。当前 UI 只展示 `partitions` 里的（默认只有 C），
     /// 以后做多盘选择时把这个列表显示给用户即可。
+    #[allow(dead_code)]
     all_drives: Vec<DiskInfo>,
 
     selected: Option<NodePath>,
@@ -108,7 +109,6 @@ fn compute_categories_multi(partitions: &[Node]) -> Vec<crate::model::CategorySt
     if partitions.is_empty() {
         return Vec::new();
     }
-    // 用第一个分区做基础，后续分区累加 size
     let mut stats = compute_categories(&partitions[0]);
     for p in &partitions[1..] {
         let more = compute_categories(p);
@@ -212,7 +212,6 @@ impl DiskUiApp {
             match msg {
                 ScanMessage::Progress(n) => self.scanned_count = n,
                 ScanMessage::Done(node, disk_info) => {
-                    // 扫描单个路径时，替换第一个分区（或唯一分区）
                     if self.partitions.is_empty() {
                         self.partitions.push(*node);
                         self.partition_infos.push(disk_info);
@@ -230,7 +229,10 @@ impl DiskUiApp {
                     self.scan_error = Some(e);
                     self.scanning = false;
                     finished = true;
-                    eprintln!("[app] 扫描报错: {}", self.scan_error.as_deref().unwrap_or(""));
+                    eprintln!(
+                        "[app] 扫描报错: {}",
+                        self.scan_error.as_deref().unwrap_or("")
+                    );
                 }
             }
         }
@@ -262,14 +264,11 @@ impl DiskUiApp {
             }
 
             TreeAction::ToggleExpand(path) => {
-                // path[0] = 分区索引，path[1..] = 分区内相对路径
                 if let Some(&pi) = path.first() {
                     if let Some(partition) = self.partitions.get_mut(pi) {
                         if path.len() == 1 {
-                            // 点击分区根节点行
                             partition.expanded = !partition.expanded;
                         } else {
-                            // 点击分区内的子节点
                             partition.exclusive_toggle(&path[1..]);
                         }
                     }
@@ -283,7 +282,7 @@ impl DiskUiApp {
 
             TreeAction::NavigateTo(path) => {
                 self.selected = None;
-                let _ = path; // 当前版本 tree_list 不发送此动作
+                let _ = path;
             }
         }
     }

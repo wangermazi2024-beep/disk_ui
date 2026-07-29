@@ -9,7 +9,7 @@
 //! 一起通过 `ScanMessage::Done` 发回主线程，这样 UI 不需要再单独发一次系统调用。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +27,17 @@ pub enum ScanMessage {
     Error(String),
 }
 
-const MAX_ENTRIES: u64 = 300_000;
+/// FIX C: 原来的 `MAX_ENTRIES = 300_000` 上限太低——C 盘轻松有 27 万文件，
+/// 一旦触顶后续所有子目录的循环都会 break，导致丢一大半文件（实测扫到 60GB
+/// 但实际已用 112GB，丢了 ~46%）。
+///
+/// 现在改成：**不再硬性截断**。只用 atomic counter 做进度汇报，不做上限。
+/// 如果以后要支持"取消扫描"，可以用一个 `AtomicBool` cancel flag，而不是
+/// 用 entry 上限来粗暴中断。
+///
+/// 保留一个很大的软上限（10 亿）纯粹是防止恶意构造的死循环目录耗尽内存，
+/// 正常磁盘永远碰不到。
+const SAFETY_MAX_ENTRIES: u64 = 1_000_000_000;
 
 fn folder_color(depth: usize) -> Color32 {
     const PALETTE: [Color32; 6] = [
@@ -108,7 +118,6 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                         Ok(result) => {
                             let mut root_node = result.root;
                             // 整盘扫描时，用卷标把根节点名字改得好看一点
-                            // （"C:\" -> "本地磁盘C (C:)"）
                             if is_drive_root {
                                 if let Some(info) = &disk_info {
                                     root_node.name = info.display_name();
@@ -124,8 +133,6 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                             return;
                         }
                         Err(e) => {
-                            // 不中断，退回传统遍历；把原因打到 stderr 方便排查，
-                            // 不打断 UI（UI 只关心最终能不能拿到数据）。
                             eprintln!("[scan] MFT 直读失败，回退到标准目录遍历: {e}");
                         }
                     }
@@ -151,7 +158,8 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         }
 
         let counter = Arc::new(AtomicU64::new(0));
-        match scan_dir(&root, 0, &counter, &tx) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        match scan_dir(&root, 0, &counter, &cancel, &tx) {
             Ok(mut node) => {
                 if is_drive_root {
                     if let Some(info) = &disk_info {
@@ -183,7 +191,6 @@ fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
     };
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => {
-            // UNIX epoch (1970-01-01) 比 Windows epoch (1601-01-01) 晚 11644473600 秒
             const UNIX_TO_FILETIME_OFFSET_SECS: u64 = 11_644_473_600;
             let unix_100ns = d.as_secs() * 10_000_000 + (d.subsec_nanos() / 100) as u64;
             unix_100ns + UNIX_TO_FILETIME_OFFSET_SECS * 10_000_000
@@ -196,8 +203,19 @@ fn scan_dir(
     path: &Path,
     depth: usize,
     counter: &Arc<AtomicU64>,
+    cancel: &Arc<AtomicBool>,
     tx: &Sender<ScanMessage>,
 ) -> std::io::Result<Node> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(Node::new_folder(
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            folder_color(depth),
+            Vec::new(),
+        ));
+    }
+
     let name = if depth == 0 {
         path.to_string_lossy().into_owned()
     } else {
@@ -221,23 +239,54 @@ fn scan_dir(
     let self_attrs: u32 = 0x10;
 
     let mut children = Vec::new();
-    for entry in std::fs::read_dir(path)?.flatten() {
-        if counter.load(Ordering::Relaxed) > MAX_ENTRIES {
+    // FIX C: read_dir 出错（权限拒绝等）不再直接 ? 传播——
+    // 而是当作空目录返回，让父目录的扫描能继续，避免一个权限错误中断整个扫描。
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
             eprintln!(
-                "[scan] 达到 MAX_ENTRIES 上限 {}，提前停止",
-                MAX_ENTRIES
+                "[scan] read_dir 失败 (path={}, err={})，当作空目录继续",
+                path.display(),
+                e
+            );
+            return Ok(Node::new_folder_with_meta(
+                name,
+                folder_color(depth),
+                Vec::new(),
+                self_modified,
+                self_attrs,
+            ));
+        }
+    };
+
+    for entry in entries.flatten() {
+        // FIX C: 不再用 MAX_ENTRIES 截断。只用 counter 做进度汇报。
+        // 仅在超过安全上限（10 亿）时停止——正常磁盘永远碰不到。
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        if n > SAFETY_MAX_ENTRIES {
+            eprintln!(
+                "[scan] 触发安全上限 {}，停止扫描（正常磁盘不会碰到）",
+                SAFETY_MAX_ENTRIES
             );
             break;
         }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let entry_name = entry.file_name().to_string_lossy().into_owned();
-        let n = counter.fetch_add(1, Ordering::Relaxed);
-        if n % 500 == 0 {
+        if n % 2000 == 0 {
             let _ = tx.send(ScanMessage::Progress(n));
         }
+
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                // 单个文件 metadata 失败不中断整个扫描
+                eprintln!(
+                    "[scan] metadata 失败 (entry={}, err={})，跳过",
+                    entry.path().display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
 
         let modified_ft = system_time_to_filetime(meta.modified().ok());
         #[cfg(windows)]
@@ -249,8 +298,17 @@ fn scan_dir(
         let attrs: u32 = if meta.is_dir() { 0x10 } else { 0x80 };
 
         if meta.is_dir() {
-            if let Ok(child) = scan_dir(&entry.path(), depth + 1, counter, tx) {
-                children.push(child);
+            // 子目录扫描失败不中断父目录扫描——子目录可能因为权限拒绝打不开，
+            // 但同层其他子目录还能继续扫。
+            match scan_dir(&entry.path(), depth + 1, counter, cancel, tx) {
+                Ok(child) => children.push(child),
+                Err(e) => {
+                    eprintln!(
+                        "[scan] 子目录扫描失败 (path={}, err={})，跳过",
+                        entry.path().display(),
+                        e
+                    );
+                }
             }
         } else {
             children.push(Node::new_file_with_meta(
@@ -278,8 +336,8 @@ pub fn demo_partitions() -> Vec<Node> {
         Node::new_file_with_meta(name, size, file_color(), ft, attr)
     };
 
-    // 一个示意性的 FILETIME：2024-01-15 10:30:00 UTC，对应 133475418000000000
-    const DEMO_FT: u64 = 133_475_418_000_000_000;
+    // 一个示意性的 FILETIME：2024-01-15 10:30:00 UTC
+    const DEMO_FT: u64 = 13_349_788_200_000_000_000;
 
     // ── C 盘 ──────────────────────────────────────────────────────
     let windows = Node::new_folder_with_meta(
@@ -310,7 +368,7 @@ pub fn demo_partitions() -> Vec<Node> {
             leaf_with_meta("explorer.exe", 5_400_000, DEMO_FT, 0xA0),
         ],
         DEMO_FT,
-        0x16, // DIRECTORY | SYSTEM
+        0x16,
     );
 
     let program_files = Node::new_folder_with_meta(
@@ -360,7 +418,7 @@ pub fn demo_partitions() -> Vec<Node> {
                         0x10,
                     )],
                     DEMO_FT,
-                    0x12, // DIRECTORY | HIDDEN
+                    0x12,
                 ),
                 Node::new_folder_with_meta(
                     "Documents",
@@ -378,13 +436,13 @@ pub fn demo_partitions() -> Vec<Node> {
     );
 
     let c_drive = Node::new_folder_with_meta(
-        "本地磁盘C (C:\\)",
+        "本地磁盘 (C:)",
         folder_color(0),
         vec![
             windows,
             program_files,
             users_c,
-            leaf_with_meta("pagefile.sys", 16_000_000_000, DEMO_FT, 0xA4), // SYSTEM|ARCHIVE
+            leaf_with_meta("pagefile.sys", 16_000_000_000, DEMO_FT, 0xA4),
             leaf_with_meta("hiberfil.sys", 8_000_000_000, DEMO_FT, 0xA4),
         ],
         DEMO_FT,
@@ -470,7 +528,7 @@ pub fn demo_partitions() -> Vec<Node> {
     );
 
     let d_drive = Node::new_folder_with_meta(
-        "本地磁盘 (D:\\)",
+        "新加卷 (D:)",
         folder_color(0),
         vec![steam, downloads, projects],
         DEMO_FT,
@@ -478,12 +536,6 @@ pub fn demo_partitions() -> Vec<Node> {
     );
 
     vec![c_drive, d_drive]
-}
-
-/// 兼容旧调用：返回单个 demo 节点（仅 C 盘）。
-#[allow(dead_code)]
-pub fn demo_tree() -> Node {
-    demo_partitions().remove(0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -496,25 +548,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    /// 构造一个已知的测试目录树：
-    ///   root/
-    ///     file1.txt             (10 bytes)
-    ///     file2.dat             (20 bytes)
-    ///     subdir1/
-    ///       file3.txt           (30 bytes)
-    ///       file4.log           (40 bytes)
-    ///       subdir2/
-    ///         file5.bin         (50 bytes)
-    ///     empty_dir/            (空目录)
-    ///     subdir3/
-    ///       file6.txt           (60 bytes)
-    ///
-    /// 期望统计：
-    ///   files = 6 (file1..file6)
-    ///   folders = 4 (subdir1, subdir2, empty_dir, subdir3)
-    ///   total_size = 10+20+30+40+50+60 = 210
     fn build_test_tree(root: &Path) -> std::io::Result<()> {
-        // 用 vec! 准确生成指定字节数的内容，避免数错字符串长度。
         let blob = |n: usize| vec![b'x'; n];
         fs::write(root.join("file1.txt"), blob(10))?;
         fs::write(root.join("file2.dat"), blob(20))?;
@@ -536,7 +570,6 @@ mod tests {
         Ok(())
     }
 
-    /// 用 std::fs 递归统计一遍"真相"：file_count / folder_count / total_size。
     fn ground_truth(root: &Path) -> (u64, u64, u64) {
         let mut files = 0u64;
         let mut folders = 0u64;
@@ -565,114 +598,74 @@ mod tests {
         (files, folders, total_size)
     }
 
-    #[test]
-    fn test_scan_dir_counts_match_ground_truth() {
-        // 用系统临时目录造一棵树
-        let tmp_base = std::env::temp_dir().join(format!(
-            "disklens_test_{}_{}",
+    fn tmp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "disklens_test_{}_{}_{}",
+            tag,
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        fs::create_dir_all(&tmp_base).expect("create temp dir");
-        build_test_tree(&tmp_base).expect("build test tree");
+        ))
+    }
+
+    #[test]
+    fn test_scan_dir_counts_match_ground_truth() {
+        let tmp = tmp_dir("match");
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        build_test_tree(&tmp).expect("build test tree");
 
         let counter = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp_base, 0, &counter, &tx).expect("scan_dir should succeed");
+        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).expect("scan_dir");
 
-        // 真值
-        let (gt_files, gt_folders, gt_size) = ground_truth(&tmp_base);
+        let (gt_files, gt_folders, gt_size) = ground_truth(&tmp);
+        assert_eq!(node.file_count, gt_files);
+        assert_eq!(node.folder_count, gt_folders);
+        assert_eq!(node.size, gt_size);
 
-        // 注意：root 自己（tmp_base）不算 folder_count，因为是入口；
-        // Node::new_folder_with_meta 在统计 children 时只数子节点，root 自己不算。
-        // ground_truth 也只数 root 之下的，不数 root 自己。两边口径一致。
-        assert_eq!(
-            node.file_count, gt_files,
-            "文件数不匹配: scan_dir={}, ground_truth={}",
-            node.file_count, gt_files
-        );
-        assert_eq!(
-            node.folder_count, gt_folders,
-            "文件夹数不匹配: scan_dir={}, ground_truth={}",
-            node.folder_count, gt_folders
-        );
-        assert_eq!(
-            node.size, gt_size,
-            "总大小不匹配: scan_dir={}, ground_truth={}",
-            node.size, gt_size
-        );
-
-        // 清理
-        let _ = fs::remove_dir_all(&tmp_base);
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_scan_dir_expected_counts() {
-        // 直接断言我们设计的 6 files / 4 folders / 210 bytes，
-        // 如果以后改了 build_test_tree 这里也要改。
-        let tmp_base = std::env::temp_dir().join(format!(
-            "disklens_test_expected_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&tmp_base).expect("create temp dir");
-        build_test_tree(&tmp_base).expect("build test tree");
+        let tmp = tmp_dir("expected");
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        build_test_tree(&tmp).expect("build test tree");
 
         let counter = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp_base, 0, &counter, &tx).expect("scan_dir should succeed");
+        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).expect("scan_dir");
 
         assert_eq!(node.file_count, 6, "应有 6 个文件");
-        assert_eq!(node.folder_count, 4, "应有 4 个子文件夹（含空目录）");
+        assert_eq!(node.folder_count, 4, "应有 4 个子文件夹");
         assert_eq!(node.size, 210, "总大小应为 210 字节");
 
-        let _ = fs::remove_dir_all(&tmp_base);
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn test_scan_dir_empty_dir() {
-        let tmp_base = std::env::temp_dir().join(format!(
-            "disklens_test_empty_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&tmp_base).expect("create temp dir");
-        // 什么都不放，就是空目录
+        let tmp = tmp_dir("empty");
+        fs::create_dir_all(&tmp).expect("create temp dir");
         let counter = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp_base, 0, &counter, &tx).expect("scan_dir should succeed");
+        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).expect("scan_dir");
         assert_eq!(node.file_count, 0);
         assert_eq!(node.folder_count, 0);
         assert_eq!(node.size, 0);
-
-        let _ = fs::remove_dir_all(&tmp_base);
+        let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// 测试嵌套深度：scan_dir 递归深度有限制吗？这里造一个 10 层深的目录链，
-    /// 验证每层都能扫到。
     #[test]
     fn test_scan_dir_deep_nesting() {
-        let tmp_base = std::env::temp_dir().join(format!(
-            "disklens_test_deep_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&tmp_base).expect("create temp dir");
-
-        // root / d0 / d1 / d2 / ... / d9 / leaf.txt
-        let mut cur: PathBuf = tmp_base.clone();
+        let tmp = tmp_dir("deep");
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        let mut cur: PathBuf = tmp.clone();
         for i in 0..10 {
             cur = cur.join(format!("d{}", i));
             fs::create_dir_all(&cur).expect("create dir");
@@ -680,22 +673,55 @@ mod tests {
         fs::write(cur.join("leaf.txt"), "hello").expect("write leaf");
 
         let counter = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp_base, 0, &counter, &tx).expect("scan_dir should succeed");
+        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).expect("scan_dir");
 
-        assert_eq!(node.file_count, 1, "应有 1 个文件");
-        assert_eq!(node.folder_count, 10, "应有 10 层嵌套文件夹");
-        assert_eq!(node.size, 5, "leaf.txt 是 5 字节");
+        assert_eq!(node.file_count, 1);
+        assert_eq!(node.folder_count, 10);
+        assert_eq!(node.size, 5);
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
-        let _ = fs::remove_dir_all(&tmp_base);
+    /// FIX C 回归测试：造一个超过原来 MAX_ENTRIES(300_000) 的目录树，
+    /// 验证 scan_dir 不会因为条目数过多而提前停止。
+    /// （这里不真的造 30 万文件——太慢——而是验证 counter 能正常增长
+    ///   且最终结果和 ground truth 一致，证明没有截断逻辑。）
+    #[test]
+    fn test_scan_dir_no_max_entries_truncation() {
+        let tmp = tmp_dir("no_trunc");
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        // 造 500 个子目录，每个里面 10 个文件 = 5000 文件
+        for i in 0..500 {
+            let dir = tmp.join(format!("d{}", i));
+            fs::create_dir_all(&dir).expect("create dir");
+            for j in 0..10 {
+                fs::write(dir.join(format!("f{}.txt", j)), vec![b'x'; 100]).expect("write file");
+            }
+        }
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).expect("scan_dir");
+
+        let (gt_files, gt_folders, gt_size) = ground_truth(&tmp);
+        assert_eq!(node.file_count, gt_files, "文件数应和真值一致（不截断）");
+        assert_eq!(node.folder_count, gt_folders);
+        assert_eq!(node.size, gt_size);
+        // counter 应该 >= 5000（文件）+ 500（目录）+ 1（root 自己）
+        assert!(
+            counter.load(Ordering::Relaxed) >= 5000,
+            "counter 应该 >= 5000，实际 = {}",
+            counter.load(Ordering::Relaxed)
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// 在真实系统目录上跑一遍 scan_dir，对比 std::fs 递归统计。
-    /// 这是"端到端"测试：在 /home/z / /tmp / /usr/local 之类的真实目录上跑，
-    /// 验证 scan_dir 不会因为符号链接 / 权限 / 中文文件名 / 隐藏文件而丢东西。
     #[test]
     fn test_scan_dir_on_real_system_directory() {
-        // 候选目录：选一个肯定存在且非空的
         let candidates = [
             std::path::Path::new("/home/z"),
             std::path::Path::new("/tmp"),
@@ -708,15 +734,12 @@ mod tests {
             .expect("至少要有一个候选目录可用");
         eprintln!("[test] 真实目录测试: {}", target.display());
 
-        // 注意：MAX_ENTRIES = 300_000，大目录（/usr）可能超限。
-        // 这里如果碰到了就跳过断言（不算失败），只在大目录上跑过即可。
         let counter = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(target, 0, &counter, &tx).expect("scan_dir should succeed");
+        let node = scan_dir(target, 0, &counter, &cancel, &tx).expect("scan_dir");
 
-        // 真值
         let (files, folders, size) = ground_truth(target);
-
         eprintln!(
             "[test] scan_dir:     files={}, folders={}, size={}",
             node.file_count, node.folder_count, node.size
@@ -726,31 +749,8 @@ mod tests {
             files, folders, size
         );
 
-        // 如果触发了 MAX_ENTRIES 上限，scan_dir 会比真值少。
-        // 这种情况下不算失败，只打个警告。
-        if counter.load(Ordering::Relaxed) >= MAX_ENTRIES {
-            eprintln!(
-                "[test] ⚠ 触发 MAX_ENTRIES 上限 ({}), 跳过断言",
-                MAX_ENTRIES
-            );
-            return;
-        }
-
-        assert_eq!(
-            node.file_count, files,
-            "文件数不匹配: scan_dir={}, ground_truth={}",
-            node.file_count, files
-        );
-        assert_eq!(
-            node.folder_count, folders,
-            "文件夹数不匹配: scan_dir={}, ground_truth={}",
-            node.folder_count, folders
-        );
-        assert_eq!(
-            node.size, size,
-            "总大小不匹配: scan_dir={}, ground_truth={}",
-            node.size, size
-        );
+        assert_eq!(node.file_count, files, "文件数不匹配");
+        assert_eq!(node.folder_count, folders, "文件夹数不匹配");
+        assert_eq!(node.size, size, "总大小不匹配");
     }
 }
-

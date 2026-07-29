@@ -14,6 +14,4 @@ pub mod mft_parse;
 pub mod model;
 #[cfg(windows)]
 pub mod mft_scan;
-#[cfg(windows)]
-pub mod mft_verify;
 pub mod scan;

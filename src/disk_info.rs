@@ -30,10 +30,15 @@ pub struct DiskInfo {
 }
 
 impl DiskInfo {
-    /// 给 UI 用的展示名：如果有卷标就用 "卷标 (X:)"，否则用 "本地磁盘 X:"。
+    /// 给 UI 用的展示名，和 Windows 资源管理器保持一致：
+    /// - 有卷标时：`卷标 (X:)`，例如 `新加卷 (E:)`
+    /// - 无卷标时：`本地磁盘 (X:)`，例如 `本地磁盘 (C:)`
+    ///
+    /// 注意括号格式：盘符必须包在括号里，否则像 `本地磁盘 C:` 这种写法
+    /// 在 UI 里容易被误读成"本地磁盘" + "C:" 两段。
     pub fn display_name(&self) -> String {
         if self.volume_label.is_empty() {
-            format!("本地磁盘 {}:", self.drive_letter)
+            format!("本地磁盘 ({}:)", self.drive_letter)
         } else {
             format!("{} ({}:)", self.volume_label, self.drive_letter)
         }
@@ -51,9 +56,7 @@ impl DiskInfo {
 #[cfg(windows)]
 pub fn enumerate_drives() -> Vec<DiskInfo> {
     use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetLogicalDriveStringsW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
 
     // GetDriveTypeW 返回值。windows-sys 0.59 把它们放在
     // Win32::System::WindowsProgramming 下，需要单独开 feature，
@@ -64,7 +67,8 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
     let mut result = Vec::new();
 
     // GetLogicalDriveStringsW 返回形如 "C:\\\0D:\\\0\0" 的双 null 结尾字符串数组。
-    let mut buffer = [0u16; 260];
+    // 多留一些缓冲区，避免盘符多时被截断。
+    let mut buffer = [0u16; 520];
     let len = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) };
     if len == 0 {
         eprintln!(
@@ -239,4 +243,52 @@ pub fn query_disk_info(_drive_letter: char) -> Option<DiskInfo> {
 #[cfg(not(windows))]
 pub fn default_partition() -> Option<DiskInfo> {
     None
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 单元测试（跨平台）
+// ─────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_name_with_label() {
+        let info = DiskInfo {
+            drive_letter: 'E',
+            volume_label: "新加卷".into(),
+            file_system: "NTFS".into(),
+            total_bytes: 0,
+            free_bytes: 0,
+            used_bytes: 0,
+        };
+        assert_eq!(info.display_name(), "新加卷 (E:)");
+    }
+
+    #[test]
+    fn test_display_name_without_label() {
+        // FIX A: 空卷标时应该返回 "本地磁盘 (C:)" 而不是 "本地磁盘 C:"
+        let info = DiskInfo {
+            drive_letter: 'C',
+            volume_label: String::new(),
+            file_system: "NTFS".into(),
+            total_bytes: 0,
+            free_bytes: 0,
+            used_bytes: 0,
+        };
+        assert_eq!(info.display_name(), "本地磁盘 (C:)");
+    }
+
+    #[test]
+    fn test_root_path() {
+        let info = DiskInfo {
+            drive_letter: 'D',
+            volume_label: String::new(),
+            file_system: String::new(),
+            total_bytes: 0,
+            free_bytes: 0,
+            used_bytes: 0,
+        };
+        assert_eq!(info.root_path(), "D:\\");
+    }
 }
