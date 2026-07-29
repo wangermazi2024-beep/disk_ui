@@ -38,6 +38,7 @@ fn os_string_from_wide(u16s: &[u16]) -> OsString {
 }
 
 pub const ATTR_STANDARD_INFORMATION: u32 = 0x10;
+pub const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 pub const ATTR_FILE_NAME: u32 = 0x30;
 pub const ATTR_DATA: u32 = 0x80;
 pub const ATTR_END: u32 = 0xFFFF_FFFF;
@@ -58,20 +59,38 @@ pub struct RawEntry {
     pub attributes: u32,
 }
 
-/// $STANDARD_INFORMATION 内容布局（resident）：
+/// $STANDARD_INFORMATION 内容布局（resident，NTFS 3.0+ 是 72 字节，1.x 是 48 字节）：
 ///   +0x00 CreationTime      (FILETIME 8B)
-///   +0x08 LastModificationTime (FILETIME 8B)
+///   +0x08 LastModificationTime (FILETIME 8B)  ← 我们要的修改时间
 ///   +0x10 LastMftChangeTime (FILETIME 8B)
 ///   +0x18 LastAccessTime    (FILETIME 8B)
-///   +0x20 AllocatedSize     (8B)
-///   +0x28 RealSize          (8B)
-///   +0x30 Flags             (4B, FILE_ATTRIBUTE_*)
-///   +0x34 UsedSize          (4B)
-///   ...
-/// 我们只要 LastModificationTime 和 Flags。
+///   +0x20 Flags             (4B, FILE_ATTRIBUTE_*)  ← 注意是 0x20，不是 0x30！
+///   +0x24 MaximumVersions   (4B)
+///   +0x28 Version           (4B)
+///   +0x2C ClassId           (4B)
+///   ── 以上 48 字节是 NTFS 1.x ──
+///   +0x30 OwnerId           (4B, NTFS 3.0+)
+///   +0x34 SecurityId        (4B)
+///   +0x38 QuotaCharged      (8B)
+///   +0x40 USN               (8B)
+///
+/// **重要修正**（v11）：之前把 Flags 放在 +0x30 是错的！正确是 +0x20。
+/// $STANDARD_INFORMATION 里**没有** AllocatedSize / RealSize 字段（那些在 $FILE_NAME 里）。
+/// 来源：ColinFinck/ntfs standard_information.rs + flatcap/linux-ntfs 文档。
 pub const STD_INFO_OFFSET_MODIFIED: usize = 0x08;
-pub const STD_INFO_OFFSET_FLAGS: usize = 0x30;
-pub const STD_INFO_MIN_LEN: usize = 0x38; // 至少要读到 0x34 + 4
+pub const STD_INFO_OFFSET_FLAGS: usize = 0x20;
+pub const STD_INFO_MIN_LEN: usize = 0x24; // 至少要读到 0x20 + 4
+
+/// $ATTRIBUTE_LIST 条目布局（每条 26 字节，8 字节对齐）：
+///   +0x00 type              (4B, 属性类型，如 0x80=$DATA)
+///   +0x04 length            (2B, 本条目长度)
+///   +0x06 name_length       (1B)
+///   +0x07 name_offset       (1B)
+///   +0x08 starting_vcn      (8B, 即 lowest_vcn)
+///   +0x10 base_file_reference (8B, 低 48 位是 MFT 记录号)
+///   +0x18 attribute_id      (2B)
+/// 来源：flatcap/linux-ntfs attribute_list.html
+pub const ATTR_LIST_ENTRY_SIZE: usize = 26;
 
 /// 对单条 MFT 记录做 Fixup 修正。
 ///
@@ -110,31 +129,163 @@ pub fn apply_fixup(record: &mut [u8], bytes_per_sector: u32) -> bool {
     true
 }
 
+/// `$ATTRIBUTE_LIST` 的一条条目（指向扩展记录里的属性）。
+#[derive(Debug, Clone)]
+pub struct AttributeListEntry {
+    pub attr_type: u32,
+    pub lowest_vcn: u64,
+    /// MFT 记录号（已从 base_file_reference 低 48 位提取）
+    pub record_number: u64,
+    pub attribute_id: u16,
+}
+
+/// 解析 `$ATTRIBUTE_LIST` 属性内容（resident 或 non-resident 的 value bytes），
+/// 返回所有条目。用来找扩展记录里的 `$DATA` 属性。
+///
+/// 每条 26 字节，8 字节对齐（实际长度由 entry.length 字段决定）。
+pub fn parse_attribute_list(content: &[u8]) -> Vec<AttributeListEntry> {
+    let mut entries = Vec::new();
+    let mut off = 0usize;
+    while off + ATTR_LIST_ENTRY_SIZE <= content.len() {
+        let attr_type = u32::from_le_bytes(content[off..off + 4].try_into().unwrap());
+        // 0xFFFFFFFF 是结束标记
+        if attr_type == ATTR_END {
+            break;
+        }
+        let entry_len = u16::from_le_bytes(content[off + 4..off + 6].try_into().unwrap()) as usize;
+        if entry_len < ATTR_LIST_ENTRY_SIZE {
+            break;
+        }
+        let lowest_vcn = u64::from_le_bytes(content[off + 8..off + 16].try_into().unwrap());
+        let base_ref = u64::from_le_bytes(content[off + 16..off + 24].try_into().unwrap());
+        let record_number = base_ref & 0x0000_FFFF_FFFF_FFFF; // 低 48 位
+        let attribute_id = u16::from_le_bytes(content[off + 24..off + 26].try_into().unwrap());
+        entries.push(AttributeListEntry {
+            attr_type,
+            lowest_vcn,
+            record_number,
+            attribute_id,
+        });
+        off += entry_len;
+        // 8 字节对齐
+        off = (off + 7) & !7;
+    }
+    entries
+}
+
+/// 在一条 MFT 记录里找未命名的 `$DATA` 属性（attr_type=0x80, name_len=0），
+/// 返回它的逻辑大小（data_size）。
+///
+/// - resident: value_len（attr+16）
+/// - non-resident: data_size（attr+48）—— 但只在 lowest_vcn==0 的 extent 才有效
+///
+/// **注意**：如果 base record 里有 $DATA，那它就是 lowest_vcn==0 的 extent，data_size 是总大小。
+/// 如果 base record 里没有 $DATA（被推到了扩展记录），这个函数返回 None，
+/// 调用方需要用 `parse_attribute_list` 找到扩展记录再调本函数。
+pub fn find_unnamed_data_size(record: &[u8]) -> Option<u64> {
+    if record.len() < 48 || &record[0..4] != b"FILE" {
+        return None;
+    }
+    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
+    let mut off = first_attr_offset;
+    while off + 16 <= record.len() {
+        let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+        if attr_type == ATTR_END {
+            break;
+        }
+        let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+        if attr_len == 0 || off + attr_len > record.len() {
+            break;
+        }
+        let non_resident = record[off + 8] != 0;
+        let name_len = record[off + 9];
+
+        // 只看未命名的 $DATA 属性（name_len == 0）
+        if attr_type == ATTR_DATA && name_len == 0 {
+            let size = if non_resident {
+                // non-resident $DATA: data_size 在 attr+48（逻辑大小 = Explorer 显示的 Size）
+                if off + 56 <= record.len() {
+                    u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
+                } else {
+                    0
+                }
+            } else {
+                // resident $DATA: value_len 在 attr+16
+                u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
+            };
+            return Some(size);
+        }
+        off += attr_len;
+    }
+    None
+}
+
+/// 在一条 MFT 记录里找 `$ATTRIBUTE_LIST` 属性（attr_type=0x20），
+/// 返回它的内容字节（resident 的 value，或 non-resident 我们暂时不支持）。
+///
+/// **注意**：$ATTRIBUTE_LIST 本身也可能是 non-resident（当条目太多时），
+/// 这种情况我们暂时返回 None（fallback 到 $FILE_NAME.RealSize，虽然不准但比 0 强）。
+/// 大多数文件的 $ATTRIBUTE_LIST 是 resident 的。
+pub fn find_attribute_list_content<'a>(record: &'a [u8]) -> Option<&'a [u8]> {
+    if record.len() < 48 || &record[0..4] != b"FILE" {
+        return None;
+    }
+    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
+    let mut off = first_attr_offset;
+    while off + 16 <= record.len() {
+        let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+        if attr_type == ATTR_END {
+            break;
+        }
+        let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+        if attr_len == 0 || off + attr_len > record.len() {
+            break;
+        }
+        let non_resident = record[off + 8] != 0;
+        let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
+        let content_start = off + value_off;
+
+        if attr_type == ATTR_ATTRIBUTE_LIST && !non_resident {
+            // resident $ATTRIBUTE_LIST：直接返回内容切片
+            if content_start + value_len <= record.len() {
+                return Some(&record[content_start..content_start + value_len]);
+            }
+        }
+        // non-resident $ATTRIBUTE_LIST 暂不支持（需要读 data runs），返回 None
+        off += attr_len;
+    }
+    None
+}
+
 /// 解析单条 MFT FILE 记录，提取我们关心的字段。
 ///
 /// 输入是已经过 `apply_fixup` 的字节切片。返回 `None` 表示这条记录
-/// 不是有效的 FILE 记录（magic 不对 / 长度不够）。
+/// 不是有效的 FILE 记录（magic 不对 / 长度不够 / 没有 $FILE_NAME）。
 ///
-/// **注意**：即使没有 `$FILE_NAME` 属性（某些系统元数据文件可能没有），
-/// 也返回 `Some`，name 用 `"<FRN_NNN>"` 占位——这样不丢记录，建树时
-/// 它们会挂到根目录或被忽略（取决于 parent_record）。
+/// **v11 修正**：
+/// - 不再返回 `<FRN_0>` 占位条目。没 $FILE_NAME 的记录（系统元数据文件 12-15、
+///   扩展记录等）返回 None，由调用方跳过——和 WizTree/SpaceSniffer 行为一致。
+/// - `real_size` 只从 base record 的未命名 $DATA 拿。如果 base record 没有 $DATA
+///   （大文件 $DATA 在扩展记录），这里返回 0，由扫描阶段用 `resolve_file_size`
+///   跟 $ATTRIBUTE_LIST 去扩展记录拿真实大小。
+/// - 不再用 $FILE_NAME.RealSize（它是 stale 的，只在改名时更新，不可靠）。
+/// - `$STANDARD_INFORMATION` 的 Flags 改成 +0x20（之前错误地用 +0x30）。
 pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
     if record.len() < 48 || &record[0..4] != b"FILE" {
         return None;
     }
     let flags = u16::from_le_bytes([record[22], record[23]]);
     let in_use = flags & 0x0001 != 0;
-    let is_dir = flags & 0x0002 != 0;
+    let is_dir = flags & 0x0002 != 0; // is_dir 从 FILE record header flags 拿，最可靠
     let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
     let base_record_ref = u64::from_le_bytes(record[32..40].try_into().unwrap());
     let is_base_record = (base_record_ref & 0x0000_FFFF_FFFF_FFFF) == 0;
 
-    let mut parent_record: u64 = 0;
     // 收集所有 $FILE_NAME 属性，最后按优先级选最好的一个。
-    // 这样能处理"先遇到 DOS 名、后遇到 WIN32 名"的情况，避免 PROGRA~1 覆盖 Program Files。
-    // 每个元素: (namespace, name, parent_ref, real_size_from_filename)
-    let mut file_names: Vec<(u8, String, u64, u64)> = Vec::new();
-    let mut real_size: u64 = 0; // 来自 $DATA 属性（最准确，但可能在大文件的扩展记录里）
+    // 每个元素: (namespace, name, parent_ref)
+    let mut file_names: Vec<(u8, String, u64)> = Vec::new();
+    let mut real_size: u64 = 0; // 来自 base record 的 $DATA（可能为 0，需扫描阶段 resolve）
     let mut modified_ft: u64 = 0;
     let mut attributes: u32 = 0;
 
@@ -149,13 +300,12 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
             break;
         }
         let non_resident = record[off + 8] != 0;
-        // resident 属性的 value_off / value_len 在固定偏移上；non-resident 不一样。
         let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
-        let value_len =
-            u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
         let content_start = off + value_off;
 
         if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
+            // v11 修正：Flags 在 +0x20（不是 +0x30）
             if content_start + STD_INFO_MIN_LEN <= record.len() && value_len >= STD_INFO_MIN_LEN {
                 modified_ft = u64::from_le_bytes(
                     record[content_start + STD_INFO_OFFSET_MODIFIED
@@ -171,17 +321,17 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
                 );
             }
         } else if attr_type == ATTR_FILE_NAME && !non_resident {
-            // $FILE_NAME 内容布局：
+            // $FILE_NAME 内容布局（v11 确认）：
             //   +0  ParentReference (8B)
             //   +8  CreationTime (8B)
             //   +16 ModificationTime (8B)
             //   +24 MftChangeTime (8B)
             //   +32 AccessTime (8B)
             //   +40 AllocatedSize (8B)
-            //   +48 RealSize (8B)  ← 文件真实大小，作为 $DATA 在扩展记录时的 fallback
-            //   +56 Flags (4B)
+            //   +48 RealSize (8B)  ← stale！不用来拿大小
+            //   +56 Flags (4B)     ← stale！不用来拿属性
             //   +60 ReparseValue (4B)
-            //   +64 NameLength (1B, 字符数)
+            //   +64 NameLength (1B)
             //   +65 Namespace (1B)
             //   +66 Name (UTF-16LE)
             if content_start + value_len <= record.len() && value_len >= 66 {
@@ -196,22 +346,14 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
                         .map(|b| u16::from_le_bytes([b[0], b[1]]))
                         .collect();
                     let name_str = os_string_from_wide(&u16s).to_string_lossy().into_owned();
-                    // 从 $FILE_NAME 拿 real_size 作为 fallback
-                    //（当 $DATA 在扩展记录里时，$FILE_NAME 的大小是唯一的来源）
-                    let fname_real_size = if c.len() >= 56 {
-                        u64::from_le_bytes(c[48..56].try_into().unwrap())
-                    } else {
-                        0
-                    };
-                    file_names.push((ns, name_str, parent_ref & 0x0000_FFFF_FFFF_FFFF, fname_real_size));
+                    file_names.push((ns, name_str, parent_ref & 0x0000_FFFF_FFFF_FFFF));
                 }
             }
         } else if attr_type == ATTR_DATA {
-            // 未命名的 $DATA 才代表文件主体大小；命名的是备用数据流(ADS)，跳过。
+            // 未命名的 $DATA（name_len==0）才有文件主体大小
             let name_len = record[off + 9];
             if name_len == 0 {
                 real_size = if non_resident {
-                    // non-resident $DATA: real_size 在 off+48
                     if off + 56 <= record.len() {
                         u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
                     } else {
@@ -226,38 +368,26 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
         off += attr_len;
     }
 
+    // v11: 没 $FILE_NAME 的记录返回 None（跳过，不显示）
+    // 这些是系统元数据文件（记录 12-15）或扩展记录，WizTree 也不显示。
+    if file_names.is_empty() {
+        return None;
+    }
+
     // 从收集到的 $FILE_NAME 列表里选最好的一个。
     // 优先级：WIN32(1) > WIN32&DOS(3) > POSIX(0) > DOS(2) > 其他
-    // 这样 "Program Files" (ns=1 或 3) 胜过 "PROGRA~1" (ns=2)。
-    let (name, fname_parent, fname_real_size) = if file_names.is_empty() {
-        (format!("<FRN_{}>", 0u64), 0u64, 0u64)
-    } else {
-        let ns_priority = |ns: u8| -> u32 {
-            match ns {
-                1 => 0, // WIN32 - 最高优先级（长文件名）
-                3 => 1, // WIN32&DOS - 第二（既是长名又是短名）
-                0 => 2, // POSIX - 第三（通常也是长名）
-                2 => 3, // DOS - 最低（8.3 短名，如 PROGRA~1）
-                _ => 4,
-            }
-        };
-        let best = file_names
-            .iter()
-            .min_by_key(|(ns, _, _, _)| ns_priority(*ns))
-            .unwrap();
-        (best.1.clone(), best.2, best.3)
+    let ns_priority = |ns: u8| -> u32 {
+        match ns {
+            1 => 0, // WIN32 - 最高优先级（长文件名）
+            3 => 1, // WIN32&DOS - 第二
+            0 => 2, // POSIX - 第三
+            2 => 3, // DOS - 最低（8.3 短名，如 PROGRA~1）
+            _ => 4,
+        }
     };
-
-    // 如果 parent_record 还没设置，用 $FILE_NAME 的 parent
-    if parent_record == 0 && fname_parent != 0 {
-        parent_record = fname_parent;
-    }
-    // FIX: 如果 $DATA 的 real_size 是 0（大文件的 $DATA 在扩展记录里），
-    // 用 $FILE_NAME 的 real_size 作为 fallback。
-    // 这样 Hermes.exe (204MB) 即使 $DATA 在扩展记录，也能从 $FILE_NAME 拿到大小。
-    if real_size == 0 && fname_real_size > 0 {
-        real_size = fname_real_size;
-    }
+    let best = file_names.iter().min_by_key(|(ns, _, _)| ns_priority(*ns)).unwrap();
+    let name = best.1.clone();
+    let parent_record = best.2;
 
     Some(RawEntry {
         parent_record,
@@ -356,14 +486,17 @@ mod tests {
         put_u32(&mut buf, off + 16, std_attr_content_len as u32);
         put_u16(&mut buf, off + 20, 24); // value_off
         let content_off = off + 24;
+        // v11 $STANDARD_INFORMATION 布局：
+        //   +0x00 CreationTime, +0x08 ModificationTime, +0x10 MftChangeTime, +0x18 AccessTime
+        //   +0x20 Flags(4B), +0x24 MaxVersions, +0x28 Version, +0x2C ClassId
         put_u64(&mut buf, content_off + 0x00, 0); // CreationTime
-        put_u64(&mut buf, content_off + 0x08, modified_ft); // LastModificationTime
-        put_u64(&mut buf, content_off + 0x10, 0);
-        put_u64(&mut buf, content_off + 0x18, 0);
-        put_u64(&mut buf, content_off + 0x20, real_size);
-        put_u64(&mut buf, content_off + 0x28, real_size);
-        put_u32(&mut buf, content_off + 0x30, attributes);
-        put_u32(&mut buf, content_off + 0x34, 0);
+        put_u64(&mut buf, content_off + 0x08, modified_ft); // ModificationTime
+        put_u64(&mut buf, content_off + 0x10, 0); // MftChangeTime
+        put_u64(&mut buf, content_off + 0x18, 0); // AccessTime
+        put_u32(&mut buf, content_off + 0x20, attributes); // Flags ← v11 修正位置
+        put_u32(&mut buf, content_off + 0x24, 0); // MaxVersions
+        put_u32(&mut buf, content_off + 0x28, 0); // Version
+        put_u32(&mut buf, content_off + 0x2C, 0); // ClassId
         off += std_attr_total_len;
 
         // ── $FILE_NAME 属性 ─────────────────────────────────
@@ -513,12 +646,11 @@ mod tests {
         assert_eq!(parsed_count, records_data.len(), "应该解析出全部记录");
     }
 
-    /// 测试文件大小 fallback：当 $DATA 属性不在 base record 里（大文件用扩展记录），
-    /// 应该从 $FILE_NAME 的 RealSize 字段拿大小，而不是返回 0。
+    /// v11 测试：当 $DATA 不在 base record 里（大文件用扩展记录），
+    /// parse_record 应该返回 real_size=0（不再用 $FILE_NAME.RealSize fallback，
+    /// 因为它是 stale 的）。真实大小由扫描阶段跟 $ATTRIBUTE_LIST 去扩展记录拿。
     #[test]
-    fn test_real_size_fallback_from_file_name() {
-        // 构造一个只有 $STANDARD_INFORMATION + $FILE_NAME（带 RealSize）但没有 $DATA 的记录
-        // 模拟大文件的 base record（$DATA 在扩展记录里）
+    fn test_real_size_zero_when_no_data_in_base_record() {
         let mut buf = vec![0u8; 1024];
         buf[0..4].copy_from_slice(b"FILE");
         put_u16(&mut buf, 4, 0x30); // usa_offset
@@ -530,7 +662,7 @@ mod tests {
 
         let mut off = 0x38usize;
 
-        // $STANDARD_INFORMATION（简短）
+        // $STANDARD_INFORMATION（v11 布局，Flags 在 +0x20）
         let std_len: usize = 0x48;
         let std_total: usize = 24 + std_len;
         put_u32(&mut buf, off, ATTR_STANDARD_INFORMATION);
@@ -538,14 +670,16 @@ mod tests {
         buf[off + 8] = 0;
         put_u32(&mut buf, off + 16, std_len as u32);
         put_u16(&mut buf, off + 20, 24);
+        let std_off = off + 24;
+        put_u64(&mut buf, std_off + 0x08, 13_200_000_000_000_000_000u64); // ModificationTime
+        put_u32(&mut buf, std_off + 0x20, 0x20); // Flags = ARCHIVE
         off += std_total;
 
-        // $FILE_NAME（带 RealSize = 214281216，模拟 Hermes.exe 204MB）
-        let expected_size: u64 = 214_281_216;
+        // $FILE_NAME（带 RealSize = 214281216，但 v11 不再用它）
+        let fname_size: u64 = 214_281_216;
         let name = "Hermes.exe";
         let name_u16: Vec<u16> = name.encode_utf16().collect();
-        let name_bytes_len = name_u16.len() * 2;
-        let fn_content_len: usize = 66 + name_bytes_len;
+        let fn_content_len: usize = 66 + name_u16.len() * 2;
         let fn_total: usize = (24 + fn_content_len + 7) & !7;
         put_u32(&mut buf, off, ATTR_FILE_NAME);
         put_u32(&mut buf, off + 4, fn_total as u32);
@@ -553,15 +687,8 @@ mod tests {
         put_u32(&mut buf, off + 16, fn_content_len as u32);
         put_u16(&mut buf, off + 20, 24);
         let fn_off = off + 24;
-        put_u64(&mut buf, fn_off + 0, 5); // parent = root (5)
-        // 时间字段全 0
-        // AllocatedSize at +40
-        put_u64(&mut buf, fn_off + 40, expected_size);
-        // RealSize at +48  ← 这是关键
-        put_u64(&mut buf, fn_off + 48, expected_size);
-        // Flags at +56
-        put_u32(&mut buf, fn_off + 56, 0x20); // ARCHIVE
-        put_u32(&mut buf, fn_off + 60, 0);
+        put_u64(&mut buf, fn_off + 0, 5);
+        put_u64(&mut buf, fn_off + 48, fname_size); // $FILE_NAME.RealSize（stale，不用）
         buf[fn_off + 64] = name_u16.len() as u8;
         buf[fn_off + 65] = 1; // ns = WIN32
         for (i, &c) in name_u16.iter().enumerate() {
@@ -573,15 +700,16 @@ mod tests {
         put_u32(&mut buf, off, ATTR_END);
         put_u32(&mut buf, off + 4, 0);
 
-        // apply_fixup + parse
         assert!(apply_fixup(&mut buf, 512));
         let entry = parse_record(&buf).expect("parse should succeed");
         assert_eq!(entry.name, "Hermes.exe");
-        // 关键断言：real_size 应该从 $FILE_NAME 拿到，不是 0
+        // v11: real_size 应该是 0（$DATA 不在 base record），不是从 $FILE_NAME 拿
         assert_eq!(
-            entry.real_size, expected_size,
-            "real_size 应该从 $FILE_NAME 的 RealSize fallback 拿到，而不是 0"
+            entry.real_size, 0,
+            "real_size 应该是 0（$DATA 在扩展记录），扫描阶段再解析"
         );
+        // 但 attributes 应该从 $STANDARD_INFORMATION 拿到（ARCHIVE=0x20）
+        assert_eq!(entry.attributes, 0x20, "attributes 应该从 $STANDARD_INFORMATION.Flags(+0x20) 拿");
     }
 
     /// 测试文件名优先级：WIN32 名应该胜过 DOS 8.3 短名。
