@@ -15,7 +15,6 @@ mod categorize;
 mod format;
 mod model;
 mod scan;
-mod treemap;
 mod ui;
 
 use app::DiskUiApp;

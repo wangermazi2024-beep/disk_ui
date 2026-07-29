@@ -1,7 +1,6 @@
 pub mod sidebar;
 pub mod topbar;
 pub mod tree_list;
-pub mod treemap_view;
 
 use crate::model::NodePath;
 
