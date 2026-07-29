@@ -29,8 +29,8 @@ pub fn spawn_scan(path: PathBuf, tx: Sender<ScanMessage>) {
         // 先尝试 MFT 直读（仅适用于 NTFS 卷）
         if path.starts_with(r"C:\") || path.starts_with("C:") || path.starts_with(r"D:\") || path.starts_with("D:") {
             let drive_letter = path.to_string_lossy().chars().next().unwrap_or('C');
-            let mft_path = format!(r"\\.\{}:\$MFT", drive_letter);
-            match scan_via_mft(&mft_path, &tx) {
+            let _ = format!(r"\\.\{}:\$MFT", drive_letter); // 保持旧路径引用（无用但无害）
+            match scan_via_mft(drive_letter, &tx) {
                 Ok(node) => {
                     let _ = tx.send(ScanMessage::Done(Box::new(node)));
                     return;
@@ -56,28 +56,266 @@ pub fn spawn_scan(path: PathBuf, tx: Sender<ScanMessage>) {
 // 仅在 Windows NTFS 卷上可用，需要管理员权限。
 
 /// 通过 `mft`  crate 直接解析 `$MFT`，重建目录树。
+/// 需要管理员权限运行。
 #[cfg(windows)]
-fn scan_via_mft(mft_path: &str, tx: &Sender<ScanMessage>) -> Result<Node, Box<dyn std::error::Error>> {
+fn scan_via_mft(drive_letter: char, tx: &Sender<ScanMessage>) -> Result<Node, Box<dyn std::error::Error>> {
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt as _;
-    use mft::MftParser;
 
     let _ = tx.send(ScanMessage::Progress(1));
 
-    // 以 Backup Semantics 打开 \$MFT（需要管理员权限）
-    let mut file = std::fs::OpenOptions::new()
+    // 启用 SeBackupPrivilege（让管理员能绕过部分 ACL 访问 $MFT）
+    enable_backup_privilege();
+
+    let mft_path = format!(r"\\.\{}:\$MFT", drive_letter);
+
+    // 尝试直接打开 $MFT 文件
+    let mft_data = match std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0x7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
         .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
-        .open(mft_path)?;
+        .open(&mft_path)
+    {
+        Ok(mut file) => {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)?;
+            buf
+        }
+        Err(e) => {
+            // $MFT 直接打开失败, 尝试从卷设备读取
+            read_mft_from_volume(drive_letter)?
+        }
+    };
 
     let _ = tx.send(ScanMessage::Progress(2));
+    parse_mft_records(&mft_data, tx)
+}
 
-    // 读出整个 \$MFT 到内存
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+/// 启用 SeBackupPrivilege，使管理员能打开受保护的系统文件。
+#[cfg(windows)]
+fn enable_backup_privilege() {
+    use std::mem;
+    use std::ptr;
 
-    let mut parser = MftParser::from_buffer(buf)?;
+    type HANDLE = isize;
+    type BOOL = i32;
+
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> HANDLE;
+        fn OpenProcessToken(
+            ProcessHandle: HANDLE,
+            DesiredAccess: u32,
+            TokenHandle: *mut HANDLE,
+        ) -> BOOL;
+        fn AdjustTokenPrivileges(
+            TokenHandle: HANDLE,
+            DisableAllPrivileges: BOOL,
+            NewState: *const TOKEN_PRIVILEGES,
+            BufferLength: u32,
+            PreviousState: *mut TOKEN_PRIVILEGES,
+            ReturnLength: *mut u32,
+        ) -> BOOL;
+        fn LookupPrivilegeValueW(
+            lpSystemName: *const u16,
+            lpName: *const u16,
+            lpLuid: *mut u64,
+        ) -> BOOL;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+    }
+
+    const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const SE_PRIVILEGE_ENABLED: u32 = 2;
+
+    #[repr(C)]
+    struct LUID_AND_ATTRIBUTES {
+        luid: u64,
+        attributes: u32,
+    }
+    #[repr(C)]
+    struct TOKEN_PRIVILEGES {
+        privilege_count: u32,
+        privileges: [LUID_AND_ATTRIBUTES; 1],
+    }
+
+    unsafe {
+        let cur_proc = GetCurrentProcess();
+        let mut token: HANDLE = 0;
+        let ret = OpenProcessToken(cur_proc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token);
+        if ret == 0 || token == 0 {
+            return;
+        }
+
+        let mut luid: u64 = 0;
+        let name: Vec<u16> = "SeBackupPrivilege\0".encode_utf16().collect();
+        let ret = LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut luid);
+        if ret == 0 {
+            let _ = CloseHandle(token);
+            return;
+        }
+
+        let mut tp = TOKEN_PRIVILEGES {
+            privilege_count: 1,
+            privileges: [LUID_AND_ATTRIBUTES {
+                luid,
+                attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let _ = AdjustTokenPrivileges(token, 0, &tp, 0, ptr::null_mut(), ptr::null_mut());
+        let _ = CloseHandle(token);
+    }
+}
+
+/// 从卷设备（\\.\C:）直接读取 $MFT 的原始字节。
+#[cfg(windows)]
+fn read_mft_from_volume(drive_letter: char) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::mem;
+    use std::ptr;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle;
+
+    type HANDLE = isize;
+    type BOOL = i32;
+    type DWORD = u32;
+
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            hDevice: HANDLE,
+            dwIoControlCode: DWORD,
+            lpInBuffer: *const std::ffi::c_void,
+            nInBufferSize: DWORD,
+            lpOutBuffer: *mut std::ffi::c_void,
+            nOutBufferSize: DWORD,
+            lpBytesReturned: *mut DWORD,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> BOOL;
+        fn SetFilePointerEx(
+            hFile: HANDLE,
+            liDistanceToMove: i64,
+            lpNewFilePointer: *mut i64,
+            dwMoveMethod: DWORD,
+        ) -> BOOL;
+        fn ReadFile(
+            hFile: HANDLE,
+            lpBuffer: *mut std::ffi::c_void,
+            nNumberOfBytesToRead: DWORD,
+            lpNumberOfBytesRead: *mut DWORD,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> BOOL;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn GetLastError() -> DWORD;
+    }
+
+    const FSCTL_GET_NTFS_VOLUME_DATA: DWORD = 0x00090064; // CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 28, METHOD_BUFFERED, FILE_ANY_ACCESS)
+    const FILE_BEGIN: DWORD = 0;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct NTFS_VOLUME_DATA_BUFFER {
+        VolumeSerialNumber: u64,
+        NumberSectors: i64,
+        TotalClusters: i64,
+        FreeClusters: i64,
+        TotalReserved: i64,
+        BytesPerSector: DWORD,
+        BytesPerCluster: DWORD,
+        BytesPerFileRecordSegment: DWORD,
+        ClustersPerFileRecordSegment: DWORD,
+        MftValidDataLength: i64,
+        MftStartLcn: i64,
+        Mft2StartLcn: i64,
+        MftZoneStart: i64,
+        MftZoneEnd: i64,
+    }
+
+    let vol_path = format!(r"\\.\{}:", drive_letter);
+
+    // 打开卷设备（需要管理员权限）
+    let vol_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_NO_BUFFERING)
+        .open(&vol_path)
+        .map_err(|e| format!("打开卷设备失败: {}", e))?;
+
+    let handle = vol_file.as_raw_handle() as HANDLE;
+
+    // 获取 NTFS 卷元信息
+    let mut nvdb: NTFS_VOLUME_DATA_BUFFER = unsafe { mem::zeroed() };
+    let mut bytes_ret: DWORD = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle as HANDLE,
+            FSCTL_GET_NTFS_VOLUME_DATA,
+            ptr::null(),
+            0,
+            &mut nvdb as *mut _ as *mut std::ffi::c_void,
+            mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as DWORD,
+            &mut bytes_ret,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(format!("FSCTL_GET_NTFS_VOLUME_DATA 失败 (win32={})", err).into());
+    }
+
+    let bytes_per_cluster = nvdb.BytesPerCluster as u64;
+    let bytes_per_sector = nvdb.BytesPerSector as u64;
+    let bytes_per_record = nvdb.BytesPerFileRecordSegment as usize;
+    let mft_start_lcn = nvdb.MftStartLcn as u64;
+    let mft_valid_len = nvdb.MftValidDataLength as u64;
+
+    // MFT 字节偏移
+    let mft_byte_off = mft_start_lcn * bytes_per_cluster;
+    let mft_size = mft_valid_len as usize;
+
+    // 扇区对齐（FILE_FLAG_NO_BUFFERING 要求）
+    let sector_mask = bytes_per_sector as u64 - 1;
+    let aligned_off = mft_byte_off & !sector_mask;
+    let read_start = (mft_byte_off - aligned_off) as usize;
+    let aligned_size = ((mft_size + read_start + bytes_per_sector as usize - 1)
+        / bytes_per_sector as usize)
+        * bytes_per_sector as usize;
+
+    // 定位到对齐的偏移
+    unsafe {
+        SetFilePointerEx(
+            handle,
+            aligned_off as i64,
+            ptr::null_mut(),
+            FILE_BEGIN,
+        );
+    }
+
+    // 读取（必须用 ReadFile, 因为 FILE_FLAG_NO_BUFFERING 不允许 std Read）
+    let mut raw = vec![0u8; aligned_size];
+    let mut read_bytes: DWORD = 0;
+    let ok = unsafe {
+        ReadFile(
+            handle,
+            raw.as_mut_ptr() as *mut std::ffi::c_void,
+            aligned_size as DWORD,
+            &mut read_bytes,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(format!("ReadFile MFT 失败 (win32={})", err).into());
+    }
+
+    Ok(raw[read_start..read_start + mft_size].to_vec())
+}
+
+/// 解析 MFT 记录并重建目录树。
+#[cfg(windows)]
+fn parse_mft_records(mft_data: &[u8], tx: &Sender<ScanMessage>) -> Result<Node, Box<dyn std::error::Error>> {
+    use mft::MftParser;
+
+    let mut parser = MftParser::from_buffer(mft_data.to_vec())?;
 
     // 第一遍：收集所有有效条目
     // key = MFT record number, value = parsed entry data
@@ -195,17 +433,13 @@ fn scan_via_mft(mft_path: &str, tx: &Sender<ScanMessage>) -> Result<Node, Box<dy
         for &ri in &root_indices {
             children.push(build_node(&entries, &children_of, ri, 1));
         }
-        let drive_letter = std::path::Path::new(mft_path)
-            .to_string_lossy()
-            .chars()
-            .next()
-            .unwrap_or('C');
-        Ok(Node::new_folder(format!("{}:\\\\", drive_letter), folder_color(0), children))
+        // 使用 C: 作为默认驱动器名
+        Ok(Node::new_folder("C:\\\\".to_string(), folder_color(0), children))
     }
 }
 
 #[cfg(not(windows))]
-fn scan_via_mft(_mft_path: &str, _tx: &Sender<ScanMessage>) -> Result<Node, Box<dyn std::error::Error>> {
+fn scan_via_mft(_drive_letter: char, _tx: &Sender<ScanMessage>) -> Result<Node, Box<dyn std::error::Error>> {
     Err("MFT 扫描仅在 Windows 上可用".into())
 }
 
