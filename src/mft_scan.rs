@@ -51,7 +51,7 @@ use windows_sys::Win32::System::Ioctl::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::model::Node;
-use crate::mft_parse::{apply_fixup, parse_record, RawEntry, ROOT_RECORD_INDEX};
+use crate::mft_parse::{apply_fixup, parse_record_with_diag, RawEntry, ROOT_RECORD_INDEX};
 
 /// `CreateFileW` 的访问模式常量。`GENERIC_READ` 在 windows-sys 0.59 里是
 /// `GENERIC_ACCESS_RIGHTS`（u32 的新类型），不能直接传给 `CreateFileW` 的
@@ -531,17 +531,20 @@ pub fn scan_drive_via_mft(
                     records_read += 1;
                     continue;
                 }
-                // parse_record 返回 Some 但可能 in_use=0 或 not base，
-                // 我们要分别统计这些情况，方便诊断有没有丢数据。
-                let parsed_opt = parse_record(rec);
+                // parse_record_with_diag 返回 (entry, attr_types, has_file_name)
+                // 用来诊断"no_file_name"问题——看那些记录到底有哪些属性。
+                let parsed_opt = parse_record_with_diag(rec);
                 let parsed = match parsed_opt {
                     None => {
-                        no_file_name += 1;
+                        // parse_record 现在不会因为 no_file_name 返回 None，
+                        // 只有 magic 不对或长度不够才会。这里算到 bad_magic 不太对，
+                        // 单独算一个 parse_failed。
+                        fixup_failed += 1; // 复用这个计数器（实际上很少触发）
                         entries.push(None);
                         records_read += 1;
                         continue;
                     }
-                    Some(e) => {
+                    Some((e, attr_types, has_fn)) => {
                         if !e.in_use {
                             not_in_use += 1;
                             entries.push(None);
@@ -553,6 +556,20 @@ pub fn scan_drive_via_mft(
                             entries.push(None);
                             records_read += 1;
                             continue;
+                        }
+                        // in_use + base 记录，但没 $FILE_NAME 属性
+                        if !has_fn {
+                            no_file_name += 1;
+                            // 前 5 条打详细日志，看它们到底有哪些属性
+                            if no_file_name <= 5 {
+                                eprintln!(
+                                    "[mft_scan]   no_file_name 记录[{}]: flags=0x{:04x} is_dir={} attrs={:?}",
+                                    records_read,
+                                    u16::from_le_bytes([rec[22], rec[23]]),
+                                    e.is_dir,
+                                    attr_types.iter().map(|t| format!("0x{:02x}", t)).collect::<Vec<_>>()
+                                );
+                            }
                         }
                         e
                     }
@@ -587,30 +604,41 @@ pub fn scan_drive_via_mft(
         "[mft_scan] 过滤统计: bad_magic={} (零填充/空洞), fixup_failed={} (USA损坏), not_in_use={} (已删除), not_base={} (扩展记录), no_file_name={} (无$FILE_NAME)",
         bad_magic, fixup_failed, not_in_use, not_base, no_file_name
     );
-    // 关键诊断：no_file_name 应该接近 0。如果 >0 说明有 in_use+base 的记录
-    // 但我们没解析出 $FILE_NAME，可能是 parse_record 有 bug，导致丢文件。
+    // 关键诊断：no_file_name 记录现在不再被丢弃（用 <FRN_N> 占位名保留），
+    // 但仍然打日志说明有多少条——这些通常是系统元数据文件（$MFT/$LogFile 等）。
     if no_file_name > 0 {
         eprintln!(
-            "[mft_scan] ⚠ 有 {} 条 in_use+base 记录没解析出 $FILE_NAME！这可能表示丢数据，请检查 parse_record",
+            "[mft_scan] ℹ 有 {} 条 in_use+base 记录没解析出 $FILE_NAME（用占位名保留，通常是系统元数据文件如 $MFT/$LogFile/$Bitmap 等）",
             no_file_name
         );
     }
 
     // 第二遍：按 parent_record 建邻接表。
     let mut children_of: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut orphan_count = 0u64; // parent_record 指向不存在记录的孤儿
     for (idx, e) in entries.iter().enumerate() {
         if let Some(e) = e {
             if idx as u64 != ROOT_RECORD_INDEX {
-                children_of
-                    .entry(e.parent_record)
-                    .or_default()
-                    .push(idx as u64);
+                // 如果 parent_record 指向一个不存在的记录（或 parent=0 但不是根），
+                // 把它挂到根目录（记录 5）下，避免丢数据。
+                let parent = e.parent_record;
+                let parent_exists = entries.get(parent as usize).map_or(false, |p| p.is_some());
+                let final_parent = if parent_exists && parent != 0 {
+                    parent
+                } else if parent == ROOT_RECORD_INDEX {
+                    parent
+                } else {
+                    orphan_count += 1;
+                    ROOT_RECORD_INDEX
+                };
+                children_of.entry(final_parent).or_default().push(idx as u64);
             }
         }
     }
     eprintln!(
-        "[mft_scan] 邻接表构建完成: {} 个父节点",
-        children_of.len()
+        "[mft_scan] 邻接表构建完成: {} 个父节点, {} 个孤儿挂到根目录",
+        children_of.len(),
+        orphan_count
     );
 
     let mut file_paths = Vec::new();

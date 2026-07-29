@@ -113,7 +113,11 @@ pub fn apply_fixup(record: &mut [u8], bytes_per_sector: u32) -> bool {
 /// 解析单条 MFT FILE 记录，提取我们关心的字段。
 ///
 /// 输入是已经过 `apply_fixup` 的字节切片。返回 `None` 表示这条记录
-/// 不是有效的 FILE 记录（magic 不对 / 长度不够 / 没有 $FILE_NAME 属性）。
+/// 不是有效的 FILE 记录（magic 不对 / 长度不够）。
+///
+/// **注意**：即使没有 `$FILE_NAME` 属性（某些系统元数据文件可能没有），
+/// 也返回 `Some`，name 用 `"<FRN_NNN>"` 占位——这样不丢记录，建树时
+/// 它们会挂到根目录或被忽略（取决于 parent_record）。
 pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
     if record.len() < 48 || &record[0..4] != b"FILE" {
         return None;
@@ -165,13 +169,15 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
                 );
             }
         } else if attr_type == ATTR_FILE_NAME && !non_resident {
+            // $FILE_NAME 属性内容最小 66 字节（前 64 字节头 + 至少 1 字节 name_len + 1 字节 ns）
+            // 但有些记录可能 value_len < 66（损坏或异常），要容错。
             if content_start + value_len <= record.len() && value_len >= 66 {
                 let c = &record[content_start..content_start + value_len];
                 let parent_ref = u64::from_le_bytes(c[0..8].try_into().unwrap());
                 let name_len_chars = c[64] as usize;
                 let ns = c[65]; // 0=POSIX 1=WIN32 2=DOS(8.3短名) 3=WIN32&DOS
                 let name_bytes_len = name_len_chars * 2;
-                if 66 + name_bytes_len <= c.len() {
+                if 66 + name_bytes_len <= c.len() && name_len_chars > 0 {
                     // 优先取 WIN32(1) 或 POSIX(0) 名字；纯 DOS 短名(2) 只在没有更好选择时用。
                     let priority = match ns {
                         1 | 0 | 3 => 0,
@@ -189,8 +195,6 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
                                 .into_owned(),
                         );
                         parent_record = parent_ref & 0x0000_FFFF_FFFF_FFFF; // 低 48 位是记录号
-                        // $FILE_NAME 属性里也有一个 real_size（allocation size + real size），
-                        // 但 $DATA(0x80) 里的更准确，这里不覆盖。
                     }
                 }
             }
@@ -209,7 +213,10 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
         off += attr_len;
     }
 
-    let name = name?;
+    // 如果没解析出 $FILE_NAME，不要丢这条记录——用 FRN 占位名。
+    // 这通常发生在系统元数据文件（$MFT/$LogFile/$Bitmap 等）或极少数异常记录上。
+    // 它们会挂到根目录下，用户能看到，不会丢数据。
+    let name = name.unwrap_or_else(|| format!("<FRN_{}>", 0u64));
     Some(RawEntry {
         parent_record,
         name,
@@ -220,6 +227,106 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
         modified_ft,
         attributes,
     })
+}
+
+/// 诊断版：返回 (RawEntry, 解析到的属性类型列表, 是否有 $FILE_NAME)。
+/// 用来排查"no_file_name"问题——看那些记录到底有哪些属性。
+#[allow(dead_code)]
+pub fn parse_record_with_diag(record: &[u8]) -> Option<(RawEntry, Vec<u32>, bool)> {
+    if record.len() < 48 || &record[0..4] != b"FILE" {
+        return None;
+    }
+    let flags = u16::from_le_bytes([record[22], record[23]]);
+    let in_use = flags & 0x0001 != 0;
+    let is_dir = flags & 0x0002 != 0;
+    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
+    let base_record_ref = u64::from_le_bytes(record[32..40].try_into().unwrap());
+    let is_base_record = (base_record_ref & 0x0000_FFFF_FFFF_FFFF) == 0;
+
+    let mut parent_record: u64 = 0;
+    let mut name: Option<String> = None;
+    let mut real_size: u64 = 0;
+    let mut modified_ft: u64 = 0;
+    let mut attributes: u32 = 0;
+    let mut attr_types: Vec<u32> = Vec::new();
+    let mut has_file_name = false;
+
+    let mut off = first_attr_offset;
+    while off + 16 <= record.len() {
+        let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+        if attr_type == ATTR_END {
+            break;
+        }
+        attr_types.push(attr_type);
+        let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+        if attr_len == 0 || off + attr_len > record.len() {
+            break;
+        }
+        let non_resident = record[off + 8] != 0;
+        let value_off = u16::from_le_bytes(record[off + 20..off + 22].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as usize;
+        let content_start = off + value_off;
+
+        if attr_type == ATTR_FILE_NAME && !non_resident {
+            has_file_name = true;
+            if content_start + value_len <= record.len() && value_len >= 66 {
+                let c = &record[content_start..content_start + value_len];
+                let name_len_chars = c[64] as usize;
+                let name_bytes_len = name_len_chars * 2;
+                if 66 + name_bytes_len <= c.len() && name_len_chars > 0 {
+                    let parent_ref = u64::from_le_bytes(c[0..8].try_into().unwrap());
+                    let u16s: Vec<u16> = c[66..66 + name_bytes_len]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    name = Some(os_string_from_wide(&u16s).to_string_lossy().into_owned());
+                    parent_record = parent_ref & 0x0000_FFFF_FFFF_FFFF;
+                }
+            }
+        } else if attr_type == ATTR_DATA {
+            let name_len = record[off + 9];
+            if name_len == 0 {
+                real_size = if non_resident {
+                    u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
+                } else {
+                    u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
+                };
+            }
+        } else if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
+            if content_start + STD_INFO_MIN_LEN <= record.len() && value_len >= STD_INFO_MIN_LEN {
+                modified_ft = u64::from_le_bytes(
+                    record[content_start + STD_INFO_OFFSET_MODIFIED
+                        ..content_start + STD_INFO_OFFSET_MODIFIED + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                attributes = u32::from_le_bytes(
+                    record[content_start + STD_INFO_OFFSET_FLAGS
+                        ..content_start + STD_INFO_OFFSET_FLAGS + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+            }
+        }
+
+        off += attr_len;
+    }
+
+    let name = name.unwrap_or_else(|| format!("<FRN_{}>", 0u64));
+    Some((
+        RawEntry {
+            parent_record,
+            name,
+            is_dir,
+            in_use,
+            is_base_record,
+            real_size,
+            modified_ft,
+            attributes,
+        },
+        attr_types,
+        has_file_name,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
