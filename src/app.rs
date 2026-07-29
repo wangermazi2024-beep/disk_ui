@@ -28,6 +28,7 @@ pub struct DiskUiApp {
     /// 当前选中节点，treemap 色块和文件列表树共用同一个选中状态实现联动高亮。
     selected: Option<NodePath>,
 
+
     categories: Vec<crate::model::CategoryStat>,
 
     scanning: bool,
@@ -35,10 +36,12 @@ pub struct DiskUiApp {
     scan_error: Option<String>,
     scan_rx: Option<Receiver<ScanMessage>>,
 
-    /// 单击/双击去抖：egui 的 `clicked()` 会在双击的第一下就先触发一次，
-    /// 这时候还不知道紧接着会不会来第二下。所以单击对应的 Select/ToggleExpand
-    /// 不立即生效，而是先记下来，等一小段时间没有等到双击（ZoomTo）再真正应用；
-    /// 如果双击如期而至，这里记的单击就直接作废，不会先展开再放大。
+    /// 单击/双击去抖：egui 的 clicked() 在双击的第一下就会先触发一次
+    /// （见 response.rs 里 clicked_by/double_clicked_by 共用同一个 CLICKED 标志位，
+    /// 只是 double_clicked 额外多判断了一次点击计数），这时候还不知道
+    /// 紧接着会不会来第二下。所以单击对应的 Select/ToggleExpand 不立即生效，
+    /// 先记下来，等一小段时间没等到双击（ZoomTo）再真正应用；
+    /// 双击如期而至的话，这里记的单击直接作废。
     pending_click: Option<(TreeAction, f64)>,
 }
 
@@ -91,8 +94,8 @@ impl eframe::App for DiskUiApp {
 
         sidebar::show(ui, self.root.size, self.total_size, self.total_size.saturating_sub(self.root.size), &self.categories);
 
-        let now = ui.ctx().input(|i| i.time);
         let action = self.show_central_panel(ui);
+        let now = ui.ctx().input(|i| i.time);
         self.apply_action(action, now);
         self.flush_pending_click(now);
 
@@ -188,12 +191,12 @@ impl DiskUiApp {
                     None
                 } else {
                     let parent_path = &self.zoom_path[..self.zoom_path.len() - 1];
-                    Some((parent_path, self.root.navigate(parent_path)))
+                    self.root.navigate(parent_path)
                 };
-                let tm_action = if let Some((parent_path, Some(parent))) = parent_node {
-                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, Some(parent), Some(parent_path))
+                let tm_action = if let Some(parent) = parent_node {
+                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, Some(parent))
                 } else {
-                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, None, None)
+                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, None)
                 };
                 action.merge(tm_action);
 
@@ -316,18 +319,15 @@ impl DiskUiApp {
         clicked.map(TreeAction::ZoomTo)
     }
 
-    /// 只处理"立刻生效"的动作：
-    /// - `ZoomTo`（双击 / 面包屑跳转）没有歧义，直接生效，并且作废掉
-    ///   任何还在等待中的单击（避免先展开一下再放大）。
-    /// - `Select` / `ToggleExpand` 来自单击，可能是双击的前半部分，
-    ///   不能立刻应用，先存进 `pending_click` 等 `flush_pending_click` 处理。
     fn apply_action(&mut self, action: TreeAction, now: f64) {
         match action {
             TreeAction::None => {}
             TreeAction::Select(_) | TreeAction::ToggleExpand(_) => {
+                // 不立即生效，先登记，等 flush_pending_click 确认没有双击跟上再应用。
                 self.pending_click = Some((action, now));
             }
             TreeAction::ZoomTo(path) => {
+                // 双击没有歧义，直接生效，并作废掉刚才还在等待的单击。
                 self.pending_click = None;
                 self.zoom_path = path.clone();
                 // 清理整棵树所有节点的 inline 展开状态：
@@ -339,8 +339,8 @@ impl DiskUiApp {
         }
     }
 
-    /// 单击去抖的另一半：等待窗口（默认 0.3 秒，跟 egui 判定双击的间隔量级一致）
-    /// 过去了还没等到第二下点击（也就没有产生 ZoomTo 把 pending_click 作废），
+    /// 单击去抖的另一半：等待窗口（0.3 秒，跟系统双击判定间隔量级一致）过去了
+    /// 还没等到第二次点击（也就没有 ZoomTo 把 pending_click 作废），
     /// 才说明这确实是一次单纯的单击，这时候才真正应用 Select/ToggleExpand。
     fn flush_pending_click(&mut self, now: f64) {
         const DOUBLE_CLICK_WINDOW: f64 = 0.3;
@@ -358,6 +358,11 @@ impl DiskUiApp {
                 // path 是绝对路径（从 root 出发），zoom_path 是当前视图根。
                 // exclusive_toggle 需要「相对于视图根」的路径，这样才能
                 // 把同层兄弟节点的展开状态一并清理。
+                //
+                // 例如：zoom_path=[0]，path=[0,2,1]
+                // → 相对路径 = [2,1]，视图根节点 = root.children[0]
+                // exclusive_toggle 在 root.children[0].children[2] 这一层
+                // 折叠所有兄弟，只展开 [2]，再递归进去。
                 if path.starts_with(&self.zoom_path) {
                     let rel = &path[self.zoom_path.len()..];
                     if let Some(view_root) = self.root.navigate_mut(&self.zoom_path) {
