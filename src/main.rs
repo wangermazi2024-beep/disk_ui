@@ -14,6 +14,10 @@ mod app;
 mod categorize;
 mod format;
 mod model;
+#[cfg(windows)]
+mod mft_scan;
+#[cfg(windows)]
+mod mft_verify;
 mod scan;
 mod ui;
 
