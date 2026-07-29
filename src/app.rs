@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
-use egui::{Color32, RichText, Vec2};
+use egui::{Color32, Vec2};
 
 use crate::categorize::compute_categories;
 use crate::model::{Node, NodePath};
@@ -168,19 +168,8 @@ impl DiskUiApp {
                 let mut action = TreeAction::None;
 
                 ui.add_space(4.0);
-                // 表头（固定，不滚动）
-                let header_action = tree_list::show_header(ui);
-                action.merge(header_action);
-                ui.add_space(2.0);
-                ui.separator();
-                // 树行（可滚动）
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-                    .show(ui, |ui| {
-                    let list_action = tree_list::show_body(ui, &self.root, &[], &self.selected);
-                    action.merge(list_action);
-                });
+                let list_action = tree_list::show(ui, &self.root, &self.selected);
+                action.merge(list_action);
                 action
             })
             .inner
