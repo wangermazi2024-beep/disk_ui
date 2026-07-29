@@ -1,60 +1,62 @@
 //! 直接读取 NTFS `$MFT`（Master File Table）来枚举整个卷的文件/文件夹，
 //! 原理和 WizTree / Everything 一致：
 //!
-//!   1. 用 `FSCTL_GET_NTFS_VOLUME_DATA` 拿到该卷每条 MFT 记录的字节数；
-//!   2. 直接打开 `\\.\X:\$MFT` 这个特殊路径，把整张表顺序读入内存；
-//!   3. 逐条解析 FILE 记录：先做 Fixup（每扇区末 2 字节的 USA 修正），
-//!      再遍历属性链，取出 `$FILE_NAME`(0x30) 里的父目录引用号和名字、
-//!      `$DATA`(0x80) 的真实大小，以及 `$STANDARD_INFORMATION`(0x10) 里
-//!      的修改时间和文件属性位；
-//!   4. 用"父记录号 -> 子记录号列表"的邻接表在内存里重建目录树（O(n)，
-//!      不发起任何一次逐目录的系统调用）。
+//! ## 正确的 MFT 读取方法（关键！）
 //!
-//! ## 重要限制（已通过检索官方资料确认，不是这份实现自己猜的）
-//! - 打开 `$MFT` 需要 **管理员权限 + 启用 `SeBackupPrivilege`**。
-//!   光是管理员身份还不够：`SeBackupPrivilege` 在 token 里默认存在但**未启用**，
-//!   必须用 `AdjustTokenPrivileges` 显式 enable，否则
-//!   `CreateFileW(r"\\.\C:\$MFT", GENERIC_READ, ...)` 会返回
-//!   `ERROR_ACCESS_DENIED (GetLastError=5)`。WizTree / Everything 都是这么做的。
-//!   （上一版 bug 就是：`mft_scan_available` 只检查了管理员身份 + 打开卷设备
-//!    `\\.\C:`，没启用 SeBackupPrivilege，结果"可用"检查通过但实际读 `$MFT`
-//!    时 ACCESS_DENIED，被错误地 fallback 到标准遍历。）
-//! - 只对 NTFS 卷有效；FAT/exFAT/ReFS/网络盘会在探测阶段直接失败，
-//!   调用方应退回标准目录遍历（见 `scan.rs::scan_dir`）。
-//! - 只在 Windows 上编译（`cfg(windows)`），非 Windows 平台这个模块整体不参与构建。
+//! **不要打开 `\\.\X:\$MFT` 文件**——NTFS 驱动在 `NtfsCommonCreate` 里硬性
+//! 禁止用户态 `ReadFile` 读 `$MFT`，这是驱动层的检查（不是 ACL 检查），
+//! 连 SYSTEM + SeBackupPrivilege 都绕不过去，会返回 `ACCESS_DENIED (5)`。
+//!
+//! 正确做法（Everything / WizTree / `ntfs-reader` 都用的方法）：
+//! 1. 打开**卷设备** `\\.\X:`（用 GENERIC_READ + FILE_FLAG_NO_BUFFERING），
+//!    这个句柄能成功拿到——和 `FSCTL_GET_NTFS_VOLUME_DATA` 用的是同一个。
+//! 2. 用 `FSCTL_GET_NTFS_VOLUME_DATA` 拿 `MftStartLcn`（MFT 在卷上的起始簇）。
+//! 3. **处理 MFT 碎片**：用 `FILE_READ_ATTRIBUTES`（这个能成功）打开 `X:\$MFT`
+//!    作为文件，调 `FSCTL_GET_RETRIEVAL_POINTERS` 拿 MFT 的簇映射表（run list）。
+//!    如果 MFT 是单个连续 run（常见情况），就直接用 `MftStartLcn`。
+//! 4. 在卷设备句柄上 `SetFilePointerEx` 定位到 MFT 的物理偏移，`ReadFile`
+//!    按 128 条记录的块读取。
+//! 5. 每条记录做 USA Fixup，遍历属性链提取 `$FILE_NAME` / `$DATA` / `$STANDARD_INFORMATION`。
+//!
+//! 这个方法不需要 `SeBackupPrivilege`（因为不读 `$MFT` 文件，只读卷设备），
+//! 也不需要 `SeManageVolumePrivilege`。只要管理员身份 + 卷设备 GENERIC_READ。
 //!
 //! ## 模块拆分
-//! 纯字节解析逻辑（`apply_fixup` / `parse_record` / `RawEntry`）已经抽到
-//! `crate::mft_parse` 模块，那里没有 `cfg(windows)` 限制，可以在 Linux 上
-//! 跑单元测试。本模块只剩 Windows 专有的 I/O 代码。
+//! 纯字节解析逻辑在 `crate::mft_parse`，本模块只剩 Windows 专有的 I/O。
 
 #![cfg(windows)]
 
 use std::collections::HashMap;
-use std::os::windows::io::FromRawHandle;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::mpsc::Sender;
 
 use egui::Color32;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, SE_BACKUP_NAME,
-    SE_PRIVILEGE_ENABLED, TokenElevation, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION,
-    TOKEN_PRIVILEGES, TOKEN_QUERY,
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetDiskFreeSpaceExW, ReadFile, SetFilePointerEx, FILE_BEGIN,
+    FILE_FLAG_NO_BUFFERING, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_SHARE_DELETE, FILE_FLAG_BACKUP_SEMANTICS, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::{
+    FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS,
+    NTFS_VOLUME_DATA_BUFFER, RETRIEVAL_POINTERS_BUFFER, STARTING_VCN_INPUT_BUFFER,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::model::Node;
 use crate::mft_parse::{apply_fixup, parse_record, RawEntry, ROOT_RECORD_INDEX};
 
-const GENERIC_READ: u32 = 0x8000_0000;
+/// `CreateFileW` 的访问模式常量。`GENERIC_READ` 在 windows-sys 0.59 里是
+/// `GENERIC_ACCESS_RIGHTS`（u32 的新类型），不能直接传给 `CreateFileW` 的
+/// `dwDesiredAccess: u32` 参数，这里转成裸 u32。
+const GENERIC_READ_U32: u32 = GENERIC_READ;
 
 pub struct MftError(pub String);
 impl std::fmt::Display for MftError {
@@ -66,8 +68,7 @@ fn last_err(ctx: &str) -> MftError {
     MftError(format!("{} (GetLastError={})", ctx, unsafe { GetLastError() }))
 }
 
-/// 当前进程是否以管理员身份提升运行。读 `$MFT` 强制要求这个，
-/// 提前检测出来可以给用户一个明确提示，而不是让它在打开文件时才报错。
+/// 当前进程是否以管理员身份提升运行。读卷设备 `$MFT` 区域需要这个。
 pub fn is_elevated() -> bool {
     unsafe {
         let mut token: HANDLE = null_mut();
@@ -88,114 +89,32 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// **FIX B 的核心**：在当前进程的 token 上启用 `SeBackupPrivilege`。
-///
-/// 这是读 `$MFT` 的强制前置步骤——光是管理员身份不够，必须在 token 上
-/// 显式 enable 这个 privilege，否则 `CreateFileW(r"\\.\C:\$MFT", ...)`
-/// 会返回 `ERROR_ACCESS_DENIED (5)`。
-///
-/// 返回 true 表示成功启用（或已经启用）。失败时打印 GetLastError 并返回 false。
-fn enable_backup_privilege() -> bool {
-    unsafe {
-        let mut token: HANDLE = null_mut();
-        // 需要 TOKEN_ADJUST_PRIVILEGES 才能改 token；同时带 QUERY 以便排查。
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        ) == 0
-        {
-            eprintln!(
-                "[mft_scan] enable_backup_privilege: OpenProcessToken 失败 GetLastError={}",
-                GetLastError()
-            );
-            return false;
-        }
-
-        // 查 SeBackupPrivilege 的 LUID
-        // SE_BACKUP_NAME 是 PCWSTR（*const u16），直接传，不用 encode_utf16
-        let mut luid = LUID {
-            LowPart: 0,
-            HighPart: 0,
-        };
-        if LookupPrivilegeValueW(null_mut(), SE_BACKUP_NAME, &mut luid) == 0 {
-            eprintln!(
-                "[mft_scan] enable_backup_privilege: LookupPrivilegeValueW(SeBackupPrivilege) 失败 GetLastError={}",
-                GetLastError()
-            );
-            CloseHandle(token);
-            return false;
-        }
-
-        // 构造 TOKEN_PRIVILEGES：1 个 privilege，启用 SE_PRIVILEGE_ENABLED
-        let mut tp = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            Privileges: [std::mem::MaybeUninit::zeroed().assume_init()],
-        };
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-        let ok = AdjustTokenPrivileges(
-            token,
-            0, // FALSE = 启用（不是禁用）
-            &mut tp,
-            0,
-            null_mut(),
-            null_mut(),
-        );
-        let last_err = GetLastError();
-        CloseHandle(token);
-
-        if ok == 0 {
-            eprintln!(
-                "[mft_scan] enable_backup_privilege: AdjustTokenPrivileges 失败 GetLastError={}",
-                last_err
-            );
-            return false;
-        }
-        // 注意：AdjustTokenPrivileges 即使部分 privilege 不存在也会返回 TRUE，
-        // 必须 GetLastError == ERROR_SUCCESS (0) 才是真的全部成功。
-        // ERROR_NOT_ALL_ASSIGNED (1300) 表示至少有一个没启用。
-        if last_err != 0 {
-            eprintln!(
-                "[mft_scan] enable_backup_privilege: AdjustTokenPrivileges 返回 TRUE 但 GetLastError={}（可能 token 里没有 SeBackupPrivilege，需要管理员身份）",
-                last_err
-            );
-            return false;
-        }
-        eprintln!("[mft_scan] enable_backup_privilege: SeBackupPrivilege 已启用");
-        true
-    }
-}
-
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 判断某个盘符是否为 NTFS，且当前权限下可以直接读 `$MFT`。
+/// 判断某个盘符是否为 NTFS，且当前权限下可以直接读卷设备。
 ///
-/// **注意**：这里只检查"管理员身份 + 卷是 NTFS"。真正的 `$MFT` 读取权限
-/// 要靠 `enable_backup_privilege()` 启用 SeBackupPrivilege 后才能拿到，
-/// 那一步在 `scan_drive_via_mft` 入口做。如果在这里返回 true 但实际读
-/// `$MFT` 时 ACCESS_DENIED，说明 enable_backup_privilege 失败了
-///（常见于 token 里没有 SeBackupPrivilege，需要管理员身份运行）。
+/// **注意**：这个检查只验证"管理员身份 + 卷是 NTFS + 能打开卷设备"。
+/// 真正读 MFT 是通过卷设备的 raw read，不需要 `SeBackupPrivilege`。
 pub fn mft_scan_available(drive_letter: char) -> bool {
     if !is_elevated() {
         eprintln!(
-            "[mft_scan] 不可用：当前进程非管理员，无法读 $MFT (drive={})",
+            "[mft_scan] 不可用：当前进程非管理员 (drive={})",
             drive_letter
         );
         return false;
     }
     let path = wide(&format!(r"\\.\{drive_letter}:"));
     unsafe {
+        // 注意：这里用 FILE_FLAG_NO_BUFFERING，和真正读 MFT 时一致。
         let h = CreateFileW(
             path.as_ptr(),
-            GENERIC_READ,
+            GENERIC_READ_U32,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             null_mut(),
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_NO_BUFFERING,
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
@@ -228,33 +147,49 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
             return false;
         }
         eprintln!(
-            "[mft_scan] 可用：drive={} 是 NTFS，BytesPerFileRecordSegment={}, BytesPerSector={}",
-            drive_letter, buf.BytesPerFileRecordSegment, buf.BytesPerSector
+            "[mft_scan] 可用：drive={} 是 NTFS，BytesPerCluster={}, BytesPerFileRecordSegment={}, BytesPerSector={}, MftStartLcn={}, MftValidDataLength={}",
+            drive_letter,
+            buf.BytesPerCluster,
+            buf.BytesPerFileRecordSegment,
+            buf.BytesPerSector,
+            buf.MftStartLcn,
+            buf.MftValidDataLength
         );
         true
     }
 }
 
 struct VolumeInfo {
-    bytes_per_file_record_segment: u32,
+    bytes_per_cluster: u64,
     bytes_per_sector: u32,
+    bytes_per_file_record_segment: u32,
+    mft_start_lcn: u64,
+    mft_valid_data_length: u64,
 }
 
-fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
+/// 打开卷设备 `\\.\X:`，拿 `NTFS_VOLUME_DATA_BUFFER`，返回句柄 + 卷信息。
+///
+/// 句柄用 `GENERIC_READ + FILE_FLAG_NO_BUFFERING` 打开，后续用来 raw-read MFT。
+fn open_volume_and_get_info(drive_letter: char) -> Result<(HANDLE, VolumeInfo), MftError> {
     let path = wide(&format!(r"\\.\{drive_letter}:"));
     unsafe {
+        eprintln!("[mft_scan] 打开卷设备: \\\\.\\{drive_letter}:");
         let h = CreateFileW(
             path.as_ptr(),
-            GENERIC_READ,
+            GENERIC_READ_U32,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             null_mut(),
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_NO_BUFFERING,
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            return Err(last_err("无法打开卷设备句柄（需要管理员权限）"));
+            return Err(last_err(&format!(
+                "无法打开卷设备 \\\\.\\{drive_letter}:（需要管理员权限）"
+            )));
         }
+        eprintln!("[mft_scan] 卷设备句柄已打开: handle={:p}", h as *const ());
+
         let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
         let mut ret = 0u32;
         let ok = DeviceIoControl(
@@ -267,49 +202,171 @@ fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
             &mut ret,
             null_mut(),
         );
-        CloseHandle(h);
         if ok == 0 {
-            return Err(last_err("FSCTL_GET_NTFS_VOLUME_DATA 失败（该卷可能不是 NTFS）"));
+            let e = last_err("FSCTL_GET_NTFS_VOLUME_DATA 失败（该卷可能不是 NTFS）");
+            CloseHandle(h);
+            return Err(e);
         }
-        Ok(VolumeInfo {
-            bytes_per_file_record_segment: buf.BytesPerFileRecordSegment,
+        let info = VolumeInfo {
+            bytes_per_cluster: buf.BytesPerCluster as u64,
             bytes_per_sector: buf.BytesPerSector,
-        })
+            bytes_per_file_record_segment: buf.BytesPerFileRecordSegment,
+            mft_start_lcn: buf.MftStartLcn as u64,
+            mft_valid_data_length: buf.MftValidDataLength as u64,
+        };
+        eprintln!(
+            "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerSector={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={} ({:.2} MB)",
+            info.bytes_per_cluster,
+            info.bytes_per_sector,
+            info.bytes_per_file_record_segment,
+            info.mft_start_lcn,
+            info.mft_valid_data_length,
+            info.mft_valid_data_length as f64 / 1e6
+        );
+        Ok((h, info))
     }
 }
 
-/// 把整张 `$MFT` 顺序读入内存。这是一次大块顺序 I/O，而不是逐文件调用系统 API，
-/// 这也是这条路径比标准目录遍历快一个数量级的根本原因。
+/// MFT 的一个物理连续段（run）：起始 VCN、起始 LCN、簇数。
+struct MftRun {
+    start_vcn: u64,
+    start_lcn: u64,
+    cluster_count: u64,
+}
+
+/// 用 `FSCTL_GET_RETRIEVAL_POINTERS` 拿 MFT 的簇映射表。
 ///
-/// **调用此函数前必须已经 `enable_backup_privilege()`**，否则 CreateFileW 会 ACCESS_DENIED。
-fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
-    let path = wide(&format!(r"\\.\{drive_letter}:\$MFT"));
+/// 这是处理 MFT 碎片化的正确方法——MFT 本身可能被分到多个不连续的物理区域。
+/// 打开 `X:\$MFT` 用 `FILE_READ_ATTRIBUTES`（这个能成功，不像 GENERIC_READ 会被拒），
+/// 然后查它的 retrieval pointers。
+///
+/// 失败时返回空 vec，调用方应该退回到"单 run 假设"（用 `MftStartLcn`）。
+fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
+    let mft_path = wide(&format!(r"{}:\$MFT", drive_letter));
     unsafe {
+        eprintln!("[mft_scan] 打开 $MFT 文件（FILE_READ_ATTRIBUTES）拿 retrieval pointers");
         let h = CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            mft_path.as_ptr(),
+            FILE_READ_ATTRIBUTES as u32,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null_mut(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAG_BACKUP_SEMANTICS,
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            return Err(last_err("无法打开 \\\\.\\X:\\$MFT（需要管理员权限 + SeBackupPrivilege）"));
+            eprintln!(
+                "[mft_scan] 打开 $MFT 失败 (GetLastError={})，退回到单 run 假设（用 MftStartLcn）",
+                GetLastError()
+            );
+            // fallback：单 run，从 MftStartLcn 开始，覆盖整个 MftValidDataLength
+            let cluster_count = info.mft_valid_data_length / info.bytes_per_cluster;
+            return vec![MftRun {
+                start_vcn: 0,
+                start_lcn: info.mft_start_lcn,
+                cluster_count,
+            }];
         }
-        let mut file = std::fs::File::from_raw_handle(h as *mut _);
-        use std::io::Read;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)
-            .map_err(|e| MftError(format!("读取 $MFT 失败: {e}")))?;
-        eprintln!(
-            "[mft_scan] $MFT 已读入内存: drive={}, {} 字节 ({:.2} MB)",
-            drive_letter,
-            buf.len(),
-            buf.len() as f64 / 1e6
+
+        let mut input = STARTING_VCN_INPUT_BUFFER { StartingVcn: 0 };
+        // 给一个足够大的输出缓冲区。每个 extent 占 16 字节，1024 个 extent 足够大多数卷。
+        const MAX_EXTENTS: usize = 1024;
+        let out_size = std::mem::size_of::<u32>() + std::mem::size_of::<i64>()
+            + MAX_EXTENTS * (std::mem::size_of::<i64>() + std::mem::size_of::<i64>());
+        let mut out_buf: Vec<u8> = vec![0u8; out_size];
+        let mut ret = 0u32;
+        let ok = DeviceIoControl(
+            h,
+            FSCTL_GET_RETRIEVAL_POINTERS,
+            &mut input as *mut _ as *mut _,
+            std::mem::size_of::<STARTING_VCN_INPUT_BUFFER>() as u32,
+            out_buf.as_mut_ptr() as *mut _,
+            out_size as u32,
+            &mut ret,
+            null_mut(),
         );
-        // `file` 在这里 drop 会自动 CloseHandle。
-        Ok(buf)
+        CloseHandle(h);
+
+        if ok == 0 {
+            eprintln!(
+                "[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 失败 (GetLastError={})，退回到单 run 假设",
+                GetLastError()
+            );
+            let cluster_count = info.mft_valid_data_length / info.bytes_per_cluster;
+            return vec![MftRun {
+                start_vcn: 0,
+                start_lcn: info.mft_start_lcn,
+                cluster_count,
+            }];
+        }
+
+        // 解析 RETRIEVAL_POINTERS_BUFFER
+        let rp = &*(out_buf.as_ptr() as *const RETRIEVAL_POINTERS_BUFFER);
+        let extent_count = rp.ExtentCount as usize;
+        eprintln!(
+            "[mft_scan] MFT 有 {} 个 extent（连续段），StartingVcn={}",
+            extent_count, rp.StartingVcn
+        );
+
+        if extent_count == 0 {
+            eprintln!("[mft_scan] MFT 没有 extent？退回到单 run 假设");
+            let cluster_count = info.mft_valid_data_length / info.bytes_of_cluster();
+            return vec![MftRun {
+                start_vcn: 0,
+                start_lcn: info.mft_start_lcn,
+                cluster_count,
+            }];
+        }
+
+        // Extents 是 [RETRIEVAL_POINTERS_BUFFER_0; 1]，但实际是柔性数组。
+        // 用指针偏移读出所有 extent。
+        use windows_sys::Win32::System::Ioctl::RETRIEVAL_POINTERS_BUFFER_0;
+        let extents_ptr: *const RETRIEVAL_POINTERS_BUFFER_0 = &rp.Extents[0];
+        let mut runs = Vec::with_capacity(extent_count);
+        let mut prev_vcn = rp.StartingVcn as u64;
+        for i in 0..extent_count {
+            let ext = &*extents_ptr.add(i);
+            let next_vcn = ext.NextVcn as u64;
+            let lcn = ext.Lcn as u64;
+            // Lcn == -1 表示 sparse（洞），跳过
+            if lcn != u64::MAX {
+                let count = next_vcn.saturating_sub(prev_vcn);
+                runs.push(MftRun {
+                    start_vcn: prev_vcn,
+                    start_lcn: lcn,
+                    cluster_count: count,
+                });
+                eprintln!(
+                    "[mft_scan]   extent[{}]: VCN={} LCN={} clusters={}",
+                    i, prev_vcn, lcn, count
+                );
+            } else {
+                eprintln!(
+                    "[mft_scan]   extent[{}]: VCN={} SPARSE (跳过)",
+                    i, prev_vcn
+                );
+            }
+            prev_vcn = next_vcn;
+        }
+        if runs.is_empty() {
+            eprintln!("[mft_scan] 所有 extent 都是 sparse？退回到单 run 假设");
+            let cluster_count = info.mft_valid_data_length / info.bytes_per_cluster;
+            return vec![MftRun {
+                start_vcn: 0,
+                start_lcn: info.mft_start_lcn,
+                cluster_count,
+            }];
+        }
+        runs
+    }
+}
+
+impl VolumeInfo {
+    fn bytes_per_cluster(&self) -> u64 {
+        self.bytes_per_cluster
+    }
+    fn bytes_of_cluster(&self) -> u64 {
+        self.bytes_per_cluster
     }
 }
 
@@ -331,83 +388,163 @@ fn file_color() -> Color32 {
 /// 扫描结果：树 + 用于抽测/校验的辅助信息。
 pub struct MftScanResult {
     pub root: Node,
-    /// 仅保存文件（非目录）的完整路径，供 verify_mft 做抽测比对用。
     pub file_paths: Vec<PathBuf>,
-    /// 与 `file_paths` 一一对应：该文件在 MFT 记录里解析出的大小。
     pub file_sizes: Vec<u64>,
 }
 
-/// 核心入口：对给定盘符做一次完整的 `$MFT` 直读扫描，返回内存里重建好的目录树。
+/// 核心入口：对给定盘符做一次完整的 MFT 直读扫描。
 ///
 /// 步骤：
 /// 1. 检查管理员权限
-/// 2. **启用 SeBackupPrivilege**（FIX B）
-/// 3. 拿卷信息（记录大小 / 扇区大小）
-/// 4. 读整张 $MFT 到内存
-/// 5. 逐条解析 + 建邻接表
-/// 6. 从根目录（记录 5）递归建树
+/// 2. 打开卷设备 `\\.\X:` + 拿 `NTFS_VOLUME_DATA_BUFFER`
+/// 3. 拿 MFT 的簇映射表（处理碎片化）
+/// 4. 按 run 逐块 ReadFile，解析每条记录
+/// 5. 建邻接表 + 从根目录（记录 5）递归建树
 pub fn scan_drive_via_mft(
     drive_letter: char,
     tx: &Sender<crate::scan::ScanMessage>,
 ) -> Result<MftScanResult, MftError> {
     if !is_elevated() {
         return Err(MftError(
-            "直读 $MFT 需要管理员权限运行本程序（右键\"以管理员身份运行\"）".into(),
+            "直读 MFT 需要管理员权限运行本程序（右键\"以管理员身份运行\"）".into(),
         ));
     }
 
-    // FIX B: 必须在打开 $MFT 之前启用 SeBackupPrivilege，否则 ACCESS_DENIED。
-    if !enable_backup_privilege() {
-        return Err(MftError(
-            "启用 SeBackupPrivilege 失败：请确保以管理员身份运行（右键 → 以管理员身份运行）".into(),
-        ));
-    }
+    let (vol_handle, info) = open_volume_and_get_info(drive_letter)?;
+    let record_size = info.bytes_per_file_record_segment.max(1024) as usize;
+    let sector_size = info.bytes_per_sector.max(512) as u64;
+    let cluster_size = info.bytes_per_cluster.max(sector_size);
 
-    let vol = get_volume_info(drive_letter)?;
-    let record_size = vol.bytes_per_file_record_segment.max(1024) as usize;
-    let sector_size = vol.bytes_per_sector.max(512);
-
-    let mft_bytes = read_whole_mft(drive_letter)?;
-    let total_records = mft_bytes.len() / record_size;
+    let total_records = info.mft_valid_data_length / record_size as u64;
     eprintln!(
-        "[mft_scan] 开始解析 MFT 记录: total_records={}, record_size={}B",
-        total_records, record_size
+        "[mft_scan] 开始读 MFT: total_records={}, record_size={}B, sector_size={}B, cluster_size={}B",
+        total_records, record_size, sector_size, cluster_size
     );
 
-    // 第一遍：解析所有记录。索引 == MFT 记录号。
-    let mut entries: Vec<Option<RawEntry>> = Vec::with_capacity(total_records);
+    // 拿 MFT 的簇映射表（处理碎片化）
+    let runs = get_mft_runs(drive_letter, &info);
+    eprintln!("[mft_scan] MFT 共 {} 个物理 run", runs.len());
+
+    // 第一遍：按 run 顺序读 MFT 数据，解析所有记录。
+    // MFT 记录号 = (已读字节数 / record_size)。因为 run 是按 VCN 升序的，
+    // VCN 0 对应记录 0，所以连续读下来记录号是连续递增的。
+    let mut entries: Vec<Option<RawEntry>> = Vec::with_capacity(total_records as usize);
     let mut valid_count = 0usize;
     let mut dir_count = 0usize;
     let mut file_count = 0usize;
-    for i in 0..total_records {
-        let start = i * record_size;
-        let end = start + record_size;
-        if end > mft_bytes.len() {
-            break;
-        }
-        let mut rec = mft_bytes[start..end].to_vec();
-        if !apply_fixup(&mut rec, sector_size) {
-            entries.push(None);
-            continue;
-        }
-        let parsed = parse_record(&rec).filter(|e| e.in_use && e.is_base_record);
-        if let Some(p) = &parsed {
-            valid_count += 1;
-            if p.is_dir {
-                dir_count += 1;
-            } else {
-                file_count += 1;
+    let mut records_read: u64 = 0;
+
+    // 一次读 128 条记录（约 128KB），按 sector 对齐
+    const RECORDS_PER_CHUNK: usize = 128;
+    let chunk_records = RECORDS_PER_CHUNK;
+    let chunk_bytes_unaligned = chunk_records * record_size;
+    let chunk_bytes = (chunk_bytes_unaligned + sector_size as usize - 1)
+        / sector_size as usize
+        * sector_size as usize;
+    let mut chunk_buf: Vec<u8> = vec![0u8; chunk_bytes];
+    eprintln!(
+        "[mft_scan] 读取块大小: {} 字节 ({} 条记录，sector 对齐)",
+        chunk_bytes, chunk_records
+    );
+
+    for (run_idx, run) in runs.iter().enumerate() {
+        let run_bytes = run.cluster_count * cluster_size;
+        let run_records = run_bytes / record_size as u64;
+        let run_offset_bytes = run.start_lcn * cluster_size;
+        eprintln!(
+            "[mft_scan] 处理 run[{}]: 起始记录={}, LCN={}, 字节={} ({:.2} MB), 记录数={}",
+            run_idx,
+            records_read,
+            run.start_lcn,
+            run_bytes,
+            run_bytes as f64 / 1e6,
+            run_records
+        );
+
+        // 定位到 run 的物理偏移
+        unsafe {
+            let mut new_pos: i64 = 0;
+            let ok = SetFilePointerEx(
+                vol_handle,
+                run_offset_bytes as i64,
+                &mut new_pos,
+                FILE_BEGIN,
+            );
+            if ok == 0 {
+                let e = last_err(&format!(
+                    "SetFilePointerEx 失败 (run={}, offset={})",
+                    run_idx, run_offset_bytes
+                ));
+                CloseHandle(vol_handle);
+                return Err(e);
             }
         }
-        entries.push(parsed);
 
-        if i % 20_000 == 0 {
-            let _ = tx.send(crate::scan::ScanMessage::Progress(i as u64));
+        // 逐块读
+        let mut records_in_run_left = run_records as usize;
+        while records_in_run_left > 0 {
+            let recs_this = records_in_run_left.min(chunk_records);
+            let to_read_unaligned = recs_this * record_size;
+            let to_read = (to_read_unaligned + sector_size as usize - 1)
+                / sector_size as usize
+                * sector_size as usize;
+            let mut bytes_returned: u32 = 0;
+            let ok = unsafe {
+                ReadFile(
+                    vol_handle,
+                    chunk_buf.as_mut_ptr(),
+                    to_read as u32,
+                    &mut bytes_returned,
+                    null_mut(),
+                )
+            };
+            if ok == 0 || bytes_returned == 0 {
+                eprintln!(
+                    "[mft_scan] ReadFile 提前结束 (run={}, records_read={}, bytes_returned={}, GetLastError={})",
+                    run_idx, records_read, bytes_returned, unsafe { GetLastError() }
+                );
+                break;
+            }
+            // 实际读到的记录数（可能比请求的少，比如最后一个块）
+            let actual_recs = (bytes_returned as usize / record_size).min(recs_this);
+            for i in 0..actual_recs {
+                let start = i * record_size;
+                let end = start + record_size;
+                let rec = &mut chunk_buf[start..end];
+                // apply_fixup 会修改 rec，但 chunk_buf 下一轮会被覆盖，所以直接改没问题
+                if !apply_fixup(rec, sector_size as u32) {
+                    entries.push(None);
+                    records_read += 1;
+                    continue;
+                }
+                let parsed = parse_record(rec).filter(|e| e.in_use && e.is_base_record);
+                if let Some(p) = &parsed {
+                    valid_count += 1;
+                    if p.is_dir {
+                        dir_count += 1;
+                    } else {
+                        file_count += 1;
+                    }
+                }
+                entries.push(parsed);
+                records_read += 1;
+            }
+            records_in_run_left -= actual_recs;
+
+            if records_read % 20_000 < chunk_records as u64 {
+                let _ = tx.send(crate::scan::ScanMessage::Progress(records_read));
+            }
         }
     }
+    // 关闭卷设备句柄
+    unsafe { CloseHandle(vol_handle); }
+
     eprintln!(
         "[mft_scan] 解析完成: 总记录={}, 有效={}, 目录={}, 文件={}",
-        total_records, valid_count, dir_count, file_count
+        entries.len(),
+        valid_count,
+        dir_count,
+        file_count
     );
 
     // 第二遍：按 parent_record 建邻接表。
@@ -466,9 +603,8 @@ fn build_subtree(
     file_sizes: &mut Vec<u64>,
 ) -> Node {
     let mut children_nodes = Vec::new();
-    // 本目录自身的元信息：默认 0，如果 MFT 记录里有就从记录里取。
     let mut self_modified: u64 = 0;
-    let mut self_attrs: u32 = 0x10; // DIRECTORY
+    let mut self_attrs: u32 = 0x10;
     if let Some(Some(entry)) = entries.get(record_idx as usize) {
         self_modified = entry.modified_ft;
         self_attrs = if entry.attributes == 0 {
@@ -518,10 +654,7 @@ fn build_subtree(
     )
 }
 
-/// 用 `GetDiskFreeSpaceExW` 拿该盘符官方报告的总容量/可用空间，
-/// 用来和扫描结果的汇总大小做一个"量级是否合理"的旁证
-///（注意：文件逻辑大小之和天然会小于"已用空间"，因为它不包含簇内部碎片、
-/// NTFS 元数据本身、卷影副本等——这是预期内的差异，不是 bug）。
+/// 用 `GetDiskFreeSpaceExW` 拿该盘符官方报告的总容量/可用空间。
 pub fn get_disk_space(drive_letter: char) -> Option<(u64, u64)> {
     let path = wide(&format!("{drive_letter}:\\"));
     unsafe {
