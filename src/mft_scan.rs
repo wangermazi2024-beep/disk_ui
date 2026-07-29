@@ -63,7 +63,7 @@ fn last_err(ctx: &str) -> MftError {
 /// 提前检测出来可以给用户一个明确提示，而不是让它在打开文件时才报错。
 pub fn is_elevated() -> bool {
     unsafe {
-        let mut token: HANDLE = 0;
+        let mut token: HANDLE = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return false;
         }
@@ -100,9 +100,9 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
             null_mut(),
             OPEN_EXISTING,
             0,
-            0,
+            null_mut(),
         );
-        if h == INVALID_HANDLE_VALUE || h == 0 {
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
             return false;
         }
         let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
@@ -137,9 +137,9 @@ fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
             null_mut(),
             OPEN_EXISTING,
             0,
-            0,
+            null_mut(),
         );
-        if h == INVALID_HANDLE_VALUE || h == 0 {
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
             return Err(last_err("无法打开卷设备句柄（需要管理员权限）"));
         }
         let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
@@ -177,9 +177,9 @@ fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
             null_mut(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL,
-            0,
+            null_mut(),
         );
-        if h == INVALID_HANDLE_VALUE || h == 0 {
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
             return Err(last_err("无法打开 \\\\.\\X:\\$MFT（需要管理员权限）"));
         }
         let mut file = std::fs::File::from_raw_handle(h as *mut _);

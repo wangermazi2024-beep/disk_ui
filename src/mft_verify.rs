@@ -13,7 +13,7 @@
 use rand::seq::SliceRandom;
 use std::path::PathBuf;
 
-use crate::mft_scan::{get_disk_space, MftScanResult};
+use crate::mft_scan::get_disk_space;
 
 pub struct SpotCheckReport {
     pub sample_count: usize,
