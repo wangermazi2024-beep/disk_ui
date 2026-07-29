@@ -65,10 +65,14 @@ fn scan_dir(
     counter: &Arc<AtomicU64>,
     tx: &Sender<ScanMessage>,
 ) -> std::io::Result<Node> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    // 根节点（depth==0）显示完整路径（如 "C:\" / "/home"），子目录只显示文件夹名
+    let name = if depth == 0 {
+        path.to_string_lossy().into_owned()
+    } else {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    };
 
     let mut children = Vec::new();
     let entries = std::fs::read_dir(path)?;

@@ -168,7 +168,7 @@ impl DiskUiApp {
                 let mut action = TreeAction::None;
 
                 ui.add_space(4.0);
-                let list_action = tree_list::show(ui, &self.root, &self.selected);
+                let list_action = tree_list::show(ui, &self.root, &self.selected, &self.root_path);
                 action.merge(list_action);
                 action
             })
