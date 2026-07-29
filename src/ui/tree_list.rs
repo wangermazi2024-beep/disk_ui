@@ -38,7 +38,7 @@ pub fn show_header(ui: &mut egui::Ui) -> TreeAction {
         egui::Align2::LEFT_CENTER,
         "名称",
         egui::FontId::proportional(12.0),
-        Color32::from_rgb(0xF0, 0xF0, 0xF0),
+        Color32::WHITE,
     );
 
     // 大小列
@@ -49,7 +49,7 @@ pub fn show_header(ui: &mut egui::Ui) -> TreeAction {
         egui::Align2::RIGHT_CENTER,
         "大小",
         egui::FontId::proportional(12.0),
-        Color32::from_rgb(0xF0, 0xF0, 0xF0),
+        Color32::WHITE,
     );
 
     // 分隔条拖拽
@@ -104,7 +104,7 @@ fn draw_children(
             let coll_id = ui.make_persistent_id(("tree_row", path.clone()));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), coll_id, false)
                 .show_header(ui, |ui| {
-                    ui.style_mut().visuals.widgets.inactive.fg_stroke.color = Color32::from_rgb(0xF0, 0xF0, 0xF0);
+                    ui.style_mut().visuals.widgets.inactive.fg_stroke.color = Color32::WHITE;
                     row_contents(ui, child, path, selected, action, name_w);
                 })
                 .body(|ui| {
@@ -141,7 +141,7 @@ fn row_contents(
 
         // 名称列
         let label = RichText::new(format!("{icon} {}", node.name))
-            .color(Color32::from_rgb(0xF0, 0xF0, 0xF0))
+            .color(Color32::WHITE)
             .size(13.0);
         let resp = ui.add_sized(
             egui::vec2(name_w - 4.0, ui.available_height()),
