@@ -168,27 +168,76 @@ fn get_volume_info(drive_letter: char) -> Result<VolumeInfo, MftError> {
 /// 把整张 `$MFT` 顺序读入内存。这是一次大块顺序 I/O，而不是逐文件调用系统 API，
 /// 这也是这条路径比标准目录遍历快一个数量级的根本原因。
 fn read_whole_mft(drive_letter: char) -> Result<Vec<u8>, MftError> {
-    let path = wide(&format!("\\\\.\\{drive_letter}:\\$MFT"));
+    // 方案：打开卷设备 \\.\C:，用 FSCTL 获取 MFT 位置后直接读取（$MFT 文件路径不可靠）
+    let vol_path = wide(&format!("\\\\\\\\.\\\\{drive_letter}:"));
     unsafe {
         let h = CreateFileW(
-            path.as_ptr(),
+            vol_path.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             null_mut(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL,
+            0,
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            return Err(last_err("无法打开 \\\\.\\X:\\$MFT（需要管理员权限）"));
+            return Err(last_err("无法打开卷设备（需要管理员权限）"));
         }
-        let mut file = std::fs::File::from_raw_handle(h as *mut _);
-        use std::io::Read;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)
-            .map_err(|e| MftError(format!("读取 $MFT 失败: {e}")))?;
-        // `file` 在这里 drop 会自动 CloseHandle。
-        Ok(buf)
+
+        // 获取 MFT 位置
+        let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
+        let mut ret = 0u32;
+        let ok = DeviceIoControl(
+            h,
+            FSCTL_GET_NTFS_VOLUME_DATA,
+            null_mut(),
+            0,
+            &mut buf as *mut _ as *mut _,
+            std::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
+            &mut ret,
+            null_mut(),
+        );
+        if ok == 0 {
+            CloseHandle(h);
+            return Err(last_err("FSCTL_GET_NTFS_VOLUME_DATA 失败"));
+        }
+
+        let bps = buf.BytesPerSector as u64;
+        let bpc = buf.BytesPerCluster as u64;
+        let mft_lcn = buf.MftStartLcn as u64;
+        let mft_len = buf.MftValidDataLength as u64;
+        let rec_size = buf.BytesPerFileRecordSegment;
+
+        // 扇区对齐读取 MFT
+        let mft_byte_off = mft_lcn * bpc;
+        let sector_mask = bps - 1;
+        let aligned_off = mft_byte_off & !sector_mask;
+        let read_start = (mft_byte_off - aligned_off) as usize;
+        let aligned_sz = ((mft_len as usize + read_start + bps as usize - 1) / bps as usize) * bps as usize;
+
+        // 定位
+        let mut raw_buf = vec![0u8; aligned_sz];
+        let mut read_bytes = 0u32;
+
+        // SetFilePointerEx
+        use windows_sys::Win32::Storage::FileSystem::{SetFilePointerEx, ReadFile, FILE_BEGIN};
+
+        SetFilePointerEx(h, aligned_off as i64, null_mut(), FILE_BEGIN);
+        let ok = ReadFile(
+            h,
+            raw_buf.as_mut_ptr() as *mut _,
+            aligned_sz as u32,
+            &mut read_bytes,
+            null_mut(),
+        );
+        CloseHandle(h);
+
+        if ok == 0 {
+            return Err(last_err("ReadFile MFT 失败"));
+        }
+
+        raw_buf.truncate(read_bytes as usize);
+        Ok(raw_buf[read_start..read_start + mft_len as usize].to_vec())
     }
 }
 
