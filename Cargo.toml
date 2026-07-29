@@ -9,6 +9,7 @@ edition = "2024"
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.35"
 egui_extras = "0.35"
+jwalk = "0.8"
 rand = "0.8"
 
 # 仅 Windows 平台需要：直接读取 NTFS $MFT 的底层 API 绑定。

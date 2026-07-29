@@ -96,19 +96,29 @@ fn scan_dir(
     };
 
     let mut children = Vec::new();
-    for entry in std::fs::read_dir(path)?.flatten() {
+    // jwalk 多线程遍历，自动跳过权限拒绝的目录
+    let entries: Vec<_> = jwalk::WalkDir::new(path)
+        .max_depth(1)
+        .sort(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.depth() == 1)
+        .collect();
+
+    for entry in &entries {
         if counter.load(Ordering::Relaxed) > MAX_ENTRIES { break; }
-        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let ft = entry.file_type();
         let entry_name = entry.file_name().to_string_lossy().into_owned();
         let n = counter.fetch_add(1, Ordering::Relaxed);
         if n % 500 == 0 { let _ = tx.send(ScanMessage::Progress(n)); }
 
-        if meta.is_dir() {
+        if ft.is_dir() {
             if let Ok(child) = scan_dir(&entry.path(), depth + 1, counter, tx) {
                 children.push(child);
             }
         } else {
-            children.push(Node::new_file(entry_name, meta.len(), file_color()));
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            children.push(Node::new_file(entry_name, size, file_color()));
         }
     }
     Ok(Node::new_folder(name, folder_color(depth), children))
