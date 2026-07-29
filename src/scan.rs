@@ -58,13 +58,26 @@ pub fn spawn_scan(path: PathBuf, tx: Sender<ScanMessage>) {
 /// 通过 `mft`  crate 直接解析 `$MFT`，重建目录树。
 #[cfg(windows)]
 fn scan_via_mft(mft_path: &str, tx: &Sender<ScanMessage>) -> Result<Node, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt as _;
     use mft::MftParser;
 
     let _ = tx.send(ScanMessage::Progress(1));
 
-    // 打开 \$MFT 文件（需要管理员权限）
-    let mut parser = MftParser::from_path(mft_path)?;
+    // 以 Backup Semantics 打开 \$MFT（需要管理员权限）
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(mft_path)?;
+
     let _ = tx.send(ScanMessage::Progress(2));
+
+    // 读出整个 \$MFT 到内存
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+
+    let mut parser = MftParser::from_buffer(buf)?;
 
     // 第一遍：收集所有有效条目
     // key = MFT record number, value = parsed entry data
