@@ -13,7 +13,7 @@ use crate::categorize::compute_categories;
 use crate::model::{Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
-use crate::ui::{sidebar, tree_list, treemap_view, TreeAction};
+use crate::ui::{sidebar, tree_list, TreeAction};
 
 pub struct DiskUiApp {
     root_path: String,
@@ -106,8 +106,8 @@ impl DiskUiApp {
         // 之前用 override_text_color 只对"没有显式设色"的文字生效，
         // .strong() 这类样式会绕过它，导致暗底配深色字看不清。
         ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals {
-            window_fill: Color32::from_rgb(0x3A, 0x3A, 0x3E),
-            panel_fill: Color32::from_rgb(0x32, 0x32, 0x35),
+            window_fill: Color32::from_rgb(0x36, 0x36, 0x3A),
+            panel_fill: Color32::from_rgb(0x36, 0x36, 0x3A),
             ..Default::default()
         });
         ctx.style_mut_of(egui::Theme::Dark, |style| {
@@ -161,15 +161,13 @@ impl DiskUiApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(Color32::from_rgb(0x1E, 0x1F, 0x22))
+                    .fill(Color32::from_rgb(0x36, 0x36, 0x3A))
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ui, |ui| {
                 let mut action = TreeAction::None;
 
                 // 当前视图根节点名称 + 面包屑（可点击跳到任意祖先层，一路返回真正的根）。
-                // 这里的"当前视图根"只是 view_path 指向的一个只读位置，
-                // 树里真实的数据（self.root）从头到尾都没有被改过。
                 let view_root_name = self.root.navigate(&self.view_path)
                     .map(|n| n.name.as_str())
                     .unwrap_or(&self.root.name);
@@ -181,30 +179,12 @@ impl DiskUiApp {
                     }
                 });
                 ui.add_space(8.0);
-
-                let total_h = ui.available_height();
-                let treemap_h = (total_h * 0.5).clamp(220.0, 420.0);
-                let (rect, _resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), treemap_h), egui::Sense::hover());
-
-                let tm_action = treemap_view::show(
-                    ui,
-                    rect,
-                    &self.root,
-                    &self.view_path,
-                    &self.selected,
-                    self.pending_auto_select.as_ref(),
-                );
-                action.merge(tm_action);
-
-                ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
 
                 ui.label(RichText::new("文件列表").strong().size(14.0));
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    // 文件列表树始终从真正的根节点展示完整的树，不受 treemap 当前
-                    // 导航到哪个子目录影响——两者是共享同一份数据、各自独立的浏览方式。
                     let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
                     action.merge(list_action);
                 });
