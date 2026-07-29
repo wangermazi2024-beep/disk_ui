@@ -168,13 +168,17 @@ impl DiskUiApp {
                 let mut action = TreeAction::None;
 
                 ui.add_space(4.0);
-                ui.label(RichText::new("文件列表").strong().size(14.0).color(Color32::from_rgb(0xF0, 0xF0, 0xF0)));
-                ui.add_space(4.0);
+                // 表头（固定，不滚动）
+                let header_action = tree_list::show_header(ui);
+                action.merge(header_action);
+                ui.add_space(2.0);
+                ui.separator();
+                // 树行（可滚动）
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .show(ui, |ui| {
-                    let list_action = tree_list::show(ui, &self.root, &[], &self.selected);
+                    let list_action = tree_list::show_body(ui, &self.root, &[], &self.selected);
                     action.merge(list_action);
                 });
                 action
