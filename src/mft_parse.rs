@@ -176,13 +176,17 @@ pub fn parse_attribute_list(content: &[u8]) -> Vec<AttributeListEntry> {
 /// 在一条 MFT 记录里找未命名的 `$DATA` 属性（attr_type=0x80, name_len=0），
 /// 返回它的逻辑大小（data_size）。
 ///
-/// - resident: value_len（attr+16）
-/// - non-resident: data_size（attr+48）—— 但只在 lowest_vcn==0 的 extent 才有效
+/// **v12 关键修正**（搜索微软文档 + ColinFinck/ntfs 确认）：
+/// - non-resident $DATA 的 data_size 在 attr+0x30（attr+48）= FileSize = 逻辑大小
+/// - **但只有 LowestVcn==0 的 extent 才有有效 data_size！**
+///   微软文档原话："FileSize is not valid if LowestVcn is nonzero."
+///   continuation extent（LowestVcn!=0）的 data_size 是 0 或垃圾值。
+/// - 所以这个函数跳过 LowestVcn!=0 的 non-resident $DATA，只从 LowestVcn==0 的拿大小。
+/// - resident $DATA：value_len（attr+0x10）= 文件大小（resident 文件总是单个 extent）
 ///
-/// **注意**：如果 base record 里有 $DATA，那它就是 lowest_vcn==0 的 extent，data_size 是总大小。
-/// 如果 base record 里没有 $DATA（被推到了扩展记录），这个函数返回 None，
-/// 调用方需要用 `parse_attribute_list` 找到扩展记录再调本函数。
-pub fn find_unnamed_data_size(record: &[u8]) -> Option<u64> {
+/// 可选的 instance_id 匹配：当从 $ATTRIBUTE_LIST 跟到扩展记录时，需要匹配 instance_id
+///（attr+0x0E）来确保拿到正确的属性（扩展记录里可能有多个 $DATA extent）。
+pub fn find_unnamed_data_size(record: &[u8], want_instance: Option<u16>) -> Option<u64> {
     if record.len() < 48 || &record[0..4] != b"FILE" {
         return None;
     }
@@ -199,21 +203,33 @@ pub fn find_unnamed_data_size(record: &[u8]) -> Option<u64> {
         }
         let non_resident = record[off + 8] != 0;
         let name_len = record[off + 9];
+        let instance_id = u16::from_le_bytes([record[off + 14], record[off + 15]]);
 
         // 只看未命名的 $DATA 属性（name_len == 0）
         if attr_type == ATTR_DATA && name_len == 0 {
-            let size = if non_resident {
-                // non-resident $DATA: data_size 在 attr+48（逻辑大小 = Explorer 显示的 Size）
-                if off + 56 <= record.len() {
-                    u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
-                } else {
-                    0
+            // 如果指定了 instance_id，必须匹配（用于扩展记录查找）
+            if let Some(want) = want_instance {
+                if instance_id != want {
+                    off += attr_len;
+                    continue;
                 }
-            } else {
-                // resident $DATA: value_len 在 attr+16
-                u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
-            };
-            return Some(size);
+            }
+            if !non_resident {
+                // resident $DATA: value_len 在 attr+0x10（总是单个 extent，直接返回）
+                return Some(u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64);
+            }
+            // non-resident $DATA: 检查 LowestVcn（attr+0x10）
+            // 只有 LowestVcn==0 的 extent 才有有效 data_size
+            if off + 56 > record.len() {
+                off += attr_len;
+                continue;
+            }
+            let lowest_vcn = u64::from_le_bytes(record[off + 16..off + 24].try_into().unwrap());
+            if lowest_vcn == 0 {
+                // data_size 在 attr+0x30（attr+48）= FileSize = 逻辑大小
+                return Some(u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap()));
+            }
+            // LowestVcn!=0 的 continuation extent：data_size 无效，继续找下一个
         }
         off += attr_len;
     }
@@ -353,15 +369,21 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
             // 未命名的 $DATA（name_len==0）才有文件主体大小
             let name_len = record[off + 9];
             if name_len == 0 {
-                real_size = if non_resident {
-                    if off + 56 <= record.len() {
-                        u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap())
-                    } else {
-                        0
-                    }
+                if !non_resident {
+                    // resident $DATA: value_len 在 attr+0x10
+                    real_size = u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64;
                 } else {
-                    u32::from_le_bytes(record[off + 16..off + 20].try_into().unwrap()) as u64
-                };
+                    // v12 关键修正：non-resident $DATA 的 data_size 在 attr+0x30，
+                    // 但只有 LowestVcn==0 的 extent 才有效！
+                    // continuation extent（LowestVcn!=0）的 data_size 是 0/垃圾。
+                    if off + 56 <= record.len() {
+                        let lowest_vcn = u64::from_le_bytes(record[off + 16..off + 24].try_into().unwrap());
+                        if lowest_vcn == 0 {
+                            real_size = u64::from_le_bytes(record[off + 48..off + 56].try_into().unwrap());
+                        }
+                        // else: continuation extent，跳过（data_size 无效）
+                    }
+                }
             }
         }
 

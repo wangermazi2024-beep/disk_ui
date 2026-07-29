@@ -647,25 +647,25 @@ pub fn scan_drive_via_mft(
             );
         } else {
             // 需要读的扩展记录号集合（从 $ATTRIBUTE_LIST 里解析出来）
-            // 为了减少 SetFilePointerEx 次数，先收集所有要读的记录号，再批量读
             let mut ext_records_to_read: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            // (base_record_number, ext_record_numbers[]) 映射
-            let mut base_to_ext: HashMap<u64, Vec<u64>> = HashMap::new();
+            // v12: (base_record_number, Vec<(ext_record_number, instance_id)>) 映射
+            // instance_id 用来在扩展记录里精确匹配 $DATA 属性（扩展记录里可能有多个 $DATA extent）
+            let mut base_to_ext: HashMap<u64, Vec<(u64, u16)>> = HashMap::new();
             for (base_rec_num, rec_bytes) in &records_needing_size {
                 if let Some(alist_content) = find_attribute_list_content(rec_bytes) {
                     let alist_entries = parse_attribute_list(alist_content);
                     for entry in &alist_entries {
-                        // 找 type==0x80($DATA) && lowest_vcn==0 的条目
+                        // v12: 找 type==0x80($DATA, 未命名) && lowest_vcn==0 的条目
                         //（lowest_vcn==0 的 extent 才有完整 data_size）
                         if entry.attr_type == crate::mft_parse::ATTR_DATA && entry.lowest_vcn == 0 {
                             ext_records_to_read.insert(entry.record_number);
-                            base_to_ext.entry(*base_rec_num).or_default().push(entry.record_number);
+                            base_to_ext.entry(*base_rec_num).or_default().push((entry.record_number, entry.attribute_id));
                         }
                     }
                 }
             }
             eprintln!(
-                "[mft_scan] v11: 需要读 {} 个扩展记录来解析大小",
+                "[mft_scan] v12: 需要读 {} 个扩展记录来解析大小",
                 ext_records_to_read.len()
             );
 
@@ -716,10 +716,11 @@ pub fn scan_drive_via_mft(
                 let Some(entry) = entry_opt.as_mut() else { continue };
                 let mut found_size: Option<u64> = None;
                 if let Some(ext_recs) = base_to_ext.get(base_rec_num) {
-                    for ext_rec_num in ext_recs {
+                    for (ext_rec_num, instance_id) in ext_recs {
                         if let Some(ext_bytes) = ext_record_bytes.get(ext_rec_num) {
-                            // 在扩展记录里找未命名 $DATA 的 data_size
-                            if let Some(size) = find_unnamed_data_size(ext_bytes) {
+                            // v12: 用 instance_id 精确匹配扩展记录里的 $DATA 属性
+                            // 这样能避免拿到 continuation extent（LowestVcn!=0，data_size 无效）
+                            if let Some(size) = find_unnamed_data_size(ext_bytes, Some(*instance_id)) {
                                 found_size = Some(size);
                                 break;
                             }
