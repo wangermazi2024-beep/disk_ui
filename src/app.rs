@@ -186,18 +186,7 @@ impl DiskUiApp {
                 let treemap_h = (total_h * 0.5).clamp(220.0, 420.0);
                 let (rect, _resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), treemap_h), egui::Sense::hover());
 
-                let view_root = self.root.navigate(&self.zoom_path).unwrap_or(&self.root);
-                let parent_node = if self.zoom_path.is_empty() {
-                    None
-                } else {
-                    let parent_path = &self.zoom_path[..self.zoom_path.len() - 1];
-                    self.root.navigate(parent_path)
-                };
-                let tm_action = if let Some(parent) = parent_node {
-                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, Some(parent))
-                } else {
-                    treemap_view::show(ui, rect, view_root, &self.zoom_path, &self.selected, None)
-                };
+                let tm_action = treemap_view::show(ui, rect, &self.root, &self.zoom_path, &self.selected);
                 action.merge(tm_action);
 
                 ui.add_space(12.0);
