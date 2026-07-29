@@ -1,12 +1,14 @@
 //! 文件列表树（扁平渲染 + `egui_extras::TableBuilder` 原生表头）。
 //!
 //! 修复：
-//! - 拖动名称列不再影响整个列表宽度（改用 initial 列 + clip，不用 remainder）。
-//! - 展开/收起支持整行任意位置点击（箭头 / 名称文字 / 大小列 / 进度条列均响应）。
-//! - 新增"占比"列，显示当前行容量占根节点总容量的百分比彩色进度条。
-//! - 根节点行显示磁盘分区路径（root_label 由调用方传入）。
+//! - 拖动名称列不影响整体宽度（min_scrolled_width + initial 列）。
+//! - 根节点整行可点击展开/收缩。
+//! - 子节点整行（含名称列空白处）均可点击展开/收缩。
+//! - 每一行都有占比进度条，用 painter 直接绘制，不会超出列边界。
 
-use egui::{Color32, RichText, Sense, Rect, Vec2, Pos2};
+use std::cell::Cell;
+
+use egui::{Color32, Rect, Sense, Vec2, Pos2};
 
 use crate::format::human_size;
 use crate::model::{Node, NodePath};
@@ -21,10 +23,10 @@ pub fn show(
     selected: &Option<NodePath>,
     root_label: &str,
 ) -> TreeAction {
-    let mut action = TreeAction::None;
+    // 用 Cell 在 ScrollArea / TableBuilder 闭包链之间传递最终动作
+    let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
     let total_size = view_root.size.max(1);
 
-    // ScrollArea 防止表格 auto-shrink 压缩父容器
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -32,102 +34,139 @@ pub fn show(
                 .striped(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .auto_shrink([false, false])
-                // 名称列：initial 宽度 + clip，拖动时不影响其他列或整体宽度
-                .column(
+                .min_scrolled_width(400.0)          // 防止拖动列宽缩小整个表格
+                .column(                             // 名称列
                     egui_extras::Column::initial(260.0)
                         .at_least(120.0)
                         .clip(true)
                         .resizable(true),
                 )
-                // 大小列
-                .column(
+                .column(                             // 大小列
                     egui_extras::Column::initial(90.0)
                         .at_least(50.0)
                         .resizable(true),
                 )
-                // 占比进度条列
-                .column(
-                    egui_extras::Column::initial(120.0)
-                        .at_least(60.0)
+                .column(                             // 占比列
+                    egui_extras::Column::initial(130.0)
+                        .at_least(80.0)
                         .resizable(true),
                 )
                 .header(ROW_H, |mut header| {
                     header.col(|ui| {
-                        ui.label(RichText::new("名称").strong().size(12.0).color(Color32::WHITE));
+                        ui.label(egui::RichText::new("名称").strong().size(12.0).color(Color32::WHITE));
                     });
                     header.col(|ui| {
-                        ui.label(RichText::new("大小").strong().size(12.0).color(Color32::WHITE));
+                        ui.label(egui::RichText::new("大小").strong().size(12.0).color(Color32::WHITE));
                     });
                     header.col(|ui| {
-                        ui.label(RichText::new("占比").strong().size(12.0).color(Color32::WHITE));
+                        ui.label(egui::RichText::new("占比").strong().size(12.0).color(Color32::WHITE));
                     });
                 })
                 .body(|mut body| {
-                    // 根节点行（磁盘分区）
+                    // ── 根节点行（磁盘分区）──────────────────────────
+                    let root_clicked  = Cell::new(false);
+                    let root_dbl      = Cell::new(false);
+
                     body.row(ROW_H, |mut row| {
+                        // 名称列：整列感应
                         row.col(|ui| {
-                            ui.colored_label(
+                            let rect = ui.available_rect_before_wrap();
+                            let resp = ui.allocate_rect(rect, Sense::click());
+                            let p = ui.painter();
+                            // 箭头
+                            p.text(
+                                Pos2::new(rect.min.x + 2.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                if view_root.expanded { "▼" } else { "▶" },
+                                egui::FontId::proportional(10.0),
                                 Color32::from_rgb(0xAA, 0xCC, 0xFF),
-                                RichText::new("▼").size(10.0),
                             );
-                            let icon = "💾";
-                            ui.label(
-                                RichText::new(format!("{icon} {root_label}"))
-                                    .color(Color32::from_rgb(0xFF, 0xD7, 0x00))
-                                    .size(13.0)
-                                    .strong(),
+                            // 图标 + 标签
+                            p.text(
+                                Pos2::new(rect.min.x + 18.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                format!("💾 {root_label}"),
+                                egui::FontId::proportional(13.0),
+                                Color32::from_rgb(0xFF, 0xD7, 0x00),
                             );
+                            if resp.double_clicked() { root_dbl.set(true); }
+                            else if resp.clicked()   { root_clicked.set(true); }
                         });
+                        // 大小列
                         row.col(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(human_size(view_root.size))
-                                        .size(12.0)
-                                        .color(Color32::from_rgb(0xC0, 0xC0, 0xC0)),
-                                );
-                            });
+                            let rect = ui.available_rect_before_wrap();
+                            let resp = ui.allocate_rect(rect, Sense::click());
+                            ui.painter().text(
+                                egui::pos2(rect.max.x - 4.0, rect.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                human_size(view_root.size),
+                                egui::FontId::proportional(12.0),
+                                Color32::from_rgb(0xC0, 0xC0, 0xC0),
+                            );
+                            if resp.double_clicked() { root_dbl.set(true); }
+                            else if resp.clicked()   { root_clicked.set(true); }
                         });
+                        // 占比列（100%）
                         row.col(|ui| {
-                            draw_bar(ui, 1.0, Color32::from_rgb(0xFF, 0xD7, 0x00));
+                            let rect = ui.available_rect_before_wrap();
+                            let resp = ui.allocate_rect(rect, Sense::click());
+                            draw_bar(ui.painter(), rect, 1.0, Color32::from_rgb(0xFF, 0xD7, 0x00));
+                            if resp.double_clicked() { root_dbl.set(true); }
+                            else if resp.clicked()   { root_clicked.set(true); }
                         });
                     });
 
+                    // 根节点交互处理
+                    if root_dbl.get() {
+                        action_cell.set(TreeAction::EnterNode(vec![]));
+                    } else if root_clicked.get() {
+                        action_cell.set(TreeAction::ToggleExpand(vec![]));
+                    }
+
+                    // ── 子节点递归行 ─────────────────────────────────
                     let mut path: NodePath = Vec::new();
+                    let mut child_action = TreeAction::None;
                     draw_rows(
                         &mut body,
                         view_root,
                         &mut path,
                         0,
                         selected,
-                        &mut action,
+                        &mut child_action,
                         total_size,
                     );
+                    // 子节点动作优先于根节点动作（后发生的覆盖）
+                    if !matches!(child_action, TreeAction::None) {
+                        action_cell.set(child_action);
+                    }
                 });
         });
 
-    action
+    action_cell.into_inner()
 }
 
-/// 绘制容量占比进度条（含百分比文字）
-fn draw_bar(ui: &mut egui::Ui, pct: f32, color: Color32) {
-    let avail = ui.available_rect_before_wrap();
+/// 用 `Painter` 在给定 cell rect 内绘制进度条，完全不消耗 UI 布局空间。
+fn draw_bar(painter: &egui::Painter, cell_rect: Rect, pct: f32, color: Color32) {
+    let pad = 4.0;
     let bar_h = 10.0;
-    let bar_w = (avail.width() - 6.0).max(0.0);
+    let bar_w = (cell_rect.width() - pad * 2.0).max(0.0);
     let bar_rect = Rect::from_min_size(
-        Pos2::new(avail.min.x + 3.0, avail.center().y - bar_h / 2.0),
+        Pos2::new(cell_rect.min.x + pad, cell_rect.center().y - bar_h / 2.0),
         Vec2::new(bar_w, bar_h),
     );
 
-    let painter = ui.painter();
     // 背景槽
     painter.rect_filled(bar_rect, 2.0, Color32::from_rgb(0x48, 0x48, 0x52));
-    // 前景填充
+    // 前景
     let fill_w = (bar_w * pct.clamp(0.0, 1.0)).max(0.0);
     if fill_w > 0.5 {
-        let fill_rect = Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, bar_h));
-        painter.rect_filled(fill_rect, 2.0, color);
+        painter.rect_filled(
+            Rect::from_min_size(bar_rect.min, Vec2::new(fill_w, bar_h)),
+            2.0,
+            color,
+        );
     }
-    // 百分比文字
+    // 百分比文字（绘制在 bar_rect 中央，clip 由列宽保证不越界）
     painter.text(
         bar_rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -137,7 +176,6 @@ fn draw_bar(ui: &mut egui::Ui, pct: f32, color: Color32) {
     );
 }
 
-/// 深度调色板
 fn depth_color(depth: u32, is_folder: bool) -> Color32 {
     if !is_folder {
         return Color32::from_rgb(0x6C, 0x75, 0x7D);
@@ -170,64 +208,79 @@ fn draw_rows(
         let is_folder = !child.children.is_empty();
         path.push(i);
 
-        let current_path = path.clone();
-        let is_selected = selected.as_deref() == Some(path.as_slice());
-        let pct = child.size as f32 / total_size as f32;
-        let bar_color = depth_color(depth, is_folder);
+        let current_path  = path.clone();
+        let is_selected   = selected.as_deref() == Some(path.as_slice());
+        let pct           = child.size as f32 / total_size as f32;
+        let bar_color     = depth_color(depth, is_folder);
 
-        // 收集三列的交互信号
-        let mut any_clicked = false;
-        let mut any_dbl = false;
-        let mut arrow_clicked = false;
+        // Cell 传递闭包间信号
+        let clicked       = Cell::new(false);
+        let dbl_clicked   = Cell::new(false);
+        let arrow_clicked = Cell::new(false);
 
         body.row(ROW_H, |mut row| {
-            // ── 名称列 ─────────────────────────────────────────────
+            // ── 名称列 ───────────────────────────────────────────
             row.col(|ui| {
-                let indent = depth as f32 * 16.0;
-                if indent > 0.0 {
-                    ui.add_space(indent);
+                let indent    = depth as f32 * 16.0 + 2.0;
+                let cell_rect = ui.available_rect_before_wrap();
+
+                // 整列底层感应区（箭头在上层覆盖它）
+                let full_resp = ui.allocate_rect(cell_rect, Sense::click());
+
+                // 选中高亮背景
+                if is_selected {
+                    ui.painter().rect_filled(
+                        cell_rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(0x4C, 0x8B, 0xF5, 0x40),
+                    );
                 }
+
+                let p = ui.painter();
 
                 if is_folder {
-                    let arrow = if child.expanded { "▼" } else { "▶" };
-                    let arrow_resp = ui.add(
-                        egui::Button::new(
-                            RichText::new(arrow)
-                                .size(10.0)
-                                .color(Color32::from_rgb(0xAA, 0xCC, 0xFF)),
-                        )
-                        .frame(false)
-                        .min_size(Vec2::new(16.0, ROW_H)),
+                    // 箭头：独立感应区，覆盖在底层感应区之上
+                    let arrow_rect = Rect::from_min_size(
+                        Pos2::new(cell_rect.min.x + indent, cell_rect.min.y),
+                        Vec2::new(16.0, ROW_H),
+                    );
+                    let arrow_resp = ui.allocate_rect(arrow_rect, Sense::click());
+                    p.text(
+                        arrow_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if child.expanded { "▼" } else { "▶" },
+                        egui::FontId::proportional(10.0),
+                        Color32::from_rgb(0xAA, 0xCC, 0xFF),
                     );
                     if arrow_resp.clicked() {
-                        arrow_clicked = true;
+                        arrow_clicked.set(true);
                     }
-                } else {
-                    ui.add_space(16.0);
                 }
 
+                // 图标 + 文件名（painter 绘制，不产生额外感应区）
                 let icon = if is_folder { "📁" } else { "📄" };
-                let text_color = if is_folder {
+                let text_color = if is_selected {
+                    Color32::from_rgb(0xFF, 0xFF, 0x80)
+                } else if is_folder {
                     Color32::WHITE
                 } else {
                     Color32::from_rgb(0xCC, 0xCC, 0xCC)
                 };
-                let label = ui.selectable_label(
-                    is_selected,
-                    RichText::new(format!("{icon} {}", child.name))
-                        .color(text_color)
-                        .size(13.0),
+                ui.painter().text(
+                    Pos2::new(cell_rect.min.x + indent + 18.0, cell_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{icon} {}", child.name),
+                    egui::FontId::proportional(13.0),
+                    text_color,
                 );
-                if label.double_clicked() {
-                    any_dbl = true;
-                } else if label.clicked() {
-                    any_clicked = true;
-                }
+
+                // 整行感应（箭头区域已经有自己的 sense，这里是其余空白区域）
+                if full_resp.double_clicked() { dbl_clicked.set(true); }
+                else if full_resp.clicked()   { clicked.set(true); }
             });
 
-            // ── 大小列（整列响应点击）──────────────────────────────
+            // ── 大小列 ───────────────────────────────────────────
             row.col(|ui| {
-                // allocate 整列区域来捕获点击，再在其中绘制文字
                 let rect = ui.available_rect_before_wrap();
                 let resp = ui.allocate_rect(rect, Sense::click());
                 ui.painter().text(
@@ -237,37 +290,32 @@ fn draw_rows(
                     egui::FontId::proportional(12.0),
                     Color32::from_rgb(0xC0, 0xC0, 0xC0),
                 );
-                if resp.double_clicked() {
-                    any_dbl = true;
-                } else if resp.clicked() {
-                    any_clicked = true;
-                }
+                if resp.double_clicked() { dbl_clicked.set(true); }
+                else if resp.clicked()   { clicked.set(true); }
             });
 
-            // ── 占比进度条列（整列响应点击）───────────────────────
+            // ── 占比列 ───────────────────────────────────────────
             row.col(|ui| {
                 let rect = ui.available_rect_before_wrap();
                 let resp = ui.allocate_rect(rect, Sense::click());
-                draw_bar(ui, pct, bar_color);
-                if resp.double_clicked() {
-                    any_dbl = true;
-                } else if resp.clicked() {
-                    any_clicked = true;
-                }
+                // painter 绘制，绝对不会超出列宽
+                draw_bar(ui.painter(), rect, pct, bar_color);
+                if resp.double_clicked() { dbl_clicked.set(true); }
+                else if resp.clicked()   { clicked.set(true); }
             });
         });
 
-        // ── 处理交互 ──────────────────────────────────────────────
-        if arrow_clicked {
+        // ── 交互处理（闭包外）────────────────────────────────────
+        if arrow_clicked.get() {
             *action = TreeAction::ToggleExpand(current_path);
-        } else if any_dbl {
+        } else if dbl_clicked.get() {
             *action = TreeAction::EnterNode(current_path);
-        } else if any_clicked {
-            if is_folder {
-                *action = TreeAction::ToggleExpand(current_path);
+        } else if clicked.get() {
+            *action = if is_folder {
+                TreeAction::ToggleExpand(current_path)
             } else {
-                *action = TreeAction::Select(current_path);
-            }
+                TreeAction::Select(current_path)
+            };
         }
 
         if child.expanded && is_folder {

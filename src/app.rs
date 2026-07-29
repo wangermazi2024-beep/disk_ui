@@ -187,15 +187,23 @@ impl DiskUiApp {
                 self.selected = Some(path);
             }
             TreeAction::ToggleExpand(path) => {
-                // path 已经是"从真正根节点出发"的绝对路径，直接在真实数据上操作即可：
-                // exclusive_toggle 会自己递归到目标节点所在层，折叠兄弟、展开目标；
-                // 返回 true 表示这次操作的结果是"展开"，false 表示"收起"。
-                let expanded_now = self.root.exclusive_toggle(&path);
-                self.selected = Some(path.clone());
-                if expanded_now {
-                    // 新展开出来的子色块里还没有天然合理的选中项，标记这一层，
-                    // 下一帧交给 treemap_view 自动选中第一个真正渲染出来的色块。
-                    self.pending_auto_select = Some(path);
+                if path.is_empty() {
+                    // 空路径 = 根节点自身展开/收缩
+                    self.root.expanded = !self.root.expanded;
+                    if self.root.expanded {
+                        self.pending_auto_select = Some(vec![]);
+                    }
+                } else {
+                    // path 已经是"从真正根节点出发"的绝对路径，直接在真实数据上操作即可：
+                    // exclusive_toggle 会自己递归到目标节点所在层，折叠兄弟、展开目标；
+                    // 返回 true 表示这次操作的结果是"展开"，false 表示"收起"。
+                    let expanded_now = self.root.exclusive_toggle(&path);
+                    self.selected = Some(path.clone());
+                    if expanded_now {
+                        // 新展开出来的子色块里还没有天然合理的选中项，标记这一层，
+                        // 下一帧交给 treemap_view 自动选中第一个真正渲染出来的色块。
+                        self.pending_auto_select = Some(path);
+                    }
                 }
             }
             TreeAction::EnterNode(path) => {
