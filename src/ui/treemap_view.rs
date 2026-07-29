@@ -3,9 +3,9 @@
 //! - **单击文件夹**：在当前块内展开子色块（inline 嵌套）。
 //! - **单击已展开的文件夹**：收起。
 //! - **单击文件**：选中。
-//! - **双击文件夹**：ZoomTo，画面保留父层背景，当前层作为父层内展开的一个大子块。
-//!
-//! 布局间距由 treemap 算法层统一处理，渲染时不再二次 shrink。
+//! - **双击文件夹**：产生 `TreeAction::EnterNode`，由 `app.rs` 把该节点的父节点
+//!   提升为新的根节点——这是纯数据结构变化，本视图不做任何额外处理，
+//!   下一帧照常把（新的）根节点的孩子画出来，和刚打开程序时的顶层视图是同一份代码。
 
 use egui::{Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2};
 
@@ -28,16 +28,15 @@ const FILE_BORDER: Color32 = Color32::from_rgb(0x6A, 0x7B, 0x8C);
 pub fn show(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    view_root: &Node,
+    root: &Node,
     selected: &Option<NodePath>,
 ) -> TreeAction {
     let mut action = TreeAction::None;
     let mut path = Vec::new();
-    draw_children(ui, rect, view_root, &mut path, 0, selected, &mut action);
+    draw_children(ui, rect, root, &mut path, 0, selected, &mut action);
     action
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_children(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -72,8 +71,9 @@ fn draw_children(
             painter.rect_stroke(*r, CornerRadius::same(2), Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
         }
 
+        let expanded = child.expanded;
         let can_inline_expand = !is_file
-            && child.expanded
+            && expanded
             && depth + 1 < MAX_DEPTH
             && r.width() > MIN_EXPAND_W
             && r.height() > MIN_EXPAND_H;
@@ -82,11 +82,9 @@ fn draw_children(
 
         let id = ui.id().with(("block", path.clone()));
         let resp = ui.interact(*r, id, egui::Sense::click());
-        let was_clicked = resp.clicked();
-        let was_dbl = resp.double_clicked();
 
         if ui.rect_contains_pointer(*r) {
-            show_tooltip(ui, id, child, !can_inline_expand && child.expanded && !is_file);
+            show_tooltip(ui, id, child, !can_inline_expand && expanded && !is_file);
         }
 
         if can_inline_expand {
@@ -99,10 +97,11 @@ fn draw_children(
             }
         }
 
-        if was_clicked && matches!(*action, TreeAction::None) {
-            if was_dbl {
+        // 单击/双击处理（double_clicked 优先）
+        if resp.clicked() && matches!(*action, TreeAction::None) {
+            if resp.double_clicked() {
                 if !child.children.is_empty() {
-                    *action = TreeAction::ZoomTo(path.clone());
+                    *action = TreeAction::EnterNode(path.clone());
                 }
             } else if is_file {
                 *action = TreeAction::Select(path.clone());

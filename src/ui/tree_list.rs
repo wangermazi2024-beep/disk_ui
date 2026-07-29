@@ -3,10 +3,9 @@
 //! - 文件夹前面带箭头，点箭头/文字展开下一层子节点（`egui::CollapsingState` 自带的
 //!   折叠状态是持久化的，靠 `path` 生成的 `Id` 区分每一行，重新渲染也不会丢展开状态）。
 //! - 单击一行：选中该节点（跟 treemap 那边的高亮联动）。
-//! - 双击一行：等价于在 treemap 里双击对应色块——放大导航到那个节点。
+//! - 双击一行：等价于在 treemap 里双击对应色块——把该节点的父节点提升为新的根节点。
 //!
-//! 这个视图始终从"真实根节点"展示完整树，不受 treemap 当前放大到哪一层影响，
-//! 两者是两种独立但共享同一份数据模型的浏览方式。
+//! 这个视图始终从当前根节点展示完整树，和 treemap 是两种独立但共享同一份数据模型的浏览方式。
 
 use egui::{Color32, RichText};
 
@@ -57,7 +56,7 @@ fn row_contents(ui: &mut egui::Ui, node: &Node, path: &NodePath, selected: &Opti
         let icon = if node.is_folder() { "📁" } else { "📄" };
         let resp = ui.selectable_label(is_selected, format!("{icon} {}", node.name));
         if resp.double_clicked() {
-            *action = TreeAction::ZoomTo(path.clone());
+            *action = TreeAction::EnterNode(path.clone());
         } else if resp.clicked() {
             *action = TreeAction::Select(path.clone());
         }
