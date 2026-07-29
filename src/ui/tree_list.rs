@@ -33,7 +33,6 @@ pub fn show(
                 .striped(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .auto_shrink([false, false])
-                .min_scrolled_width(400.0)
                 .column(                         // 名称列
                     egui_extras::Column::initial(260.0)
                         .at_least(120.0)
