@@ -6,12 +6,10 @@
 //! - **双击文件夹**：产生 `TreeAction::EnterNode`，`app.rs` 据此把该节点的父节点
 //!   设为新的"当前视图根"（只是切换 `view_path` 这个只读导航索引，不修改、
 //!   不复制、也不丢弃树里任何一个节点）。下一帧本视图用 `root.navigate(view_path)`
-//!   重新定位到新的视图根，画法和最外层视图完全一样，没有任何特殊分支。
-//! - **顶部"⬆ 上级目录"标题条**：代表"当前视图根自己"这一个色块。双击它，
-//!   产生的 `TreeAction::EnterNode` 携带的正是当前视图根自己的绝对路径——
-//!   跟双击普通子色块走的是完全同一条处理逻辑（取父路径设为新根），
-//!   所以效果是"再上一级的目录"变成新的最外层，用户可以一路双击这个标题条
-//!   逐层返回，直到回到真正的根目录（比如 C 盘）。
+//!   重新定位到新的视图根，画法和最外层视图完全一样，没有任何特殊分支/边框/
+//!   标题条——看起来就跟直接从那个上级目录重新扫描出来的画面一模一样。
+//!   往上回退用的是 `app.rs` 里已有的面包屑 / "⬆ 上级目录" 按钮，
+//!   不在 treemap 画布里额外加任何"代表当前目录自己"的色块。
 
 use egui::{Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2};
 
@@ -27,8 +25,6 @@ const MIN_RENDER_H: f32 = 6.0;
 const MIN_EXPAND_W: f32 = 36.0;
 const MIN_EXPAND_H: f32 = 28.0;
 const NEST_TOP: f32 = 14.0;
-/// 顶部"当前视图根"标题条的高度，双击它等价于双击一个"代表当前目录自己"的色块。
-const ROOT_HEADER_H: f32 = 22.0;
 
 const FILE_COLOR: Color32 = Color32::from_rgb(0x5A, 0x6B, 0x7C);
 const FILE_BORDER: Color32 = Color32::from_rgb(0x6A, 0x7B, 0x8C);
@@ -57,87 +53,21 @@ pub fn show(
 
     // 只读导航到当前视图根：view_path 失效时（比如目标节点被重新扫描后没了）
     // 退回真正的根节点，不 panic、不 crash。
-    let (view_root, root_path) = match root.navigate(view_path) {
+    let (view_root, mut path) = match root.navigate(view_path) {
         Some(n) => (n, view_path.to_vec()),
         None => (root, Vec::new()),
     };
 
-    // 只有当前视图根不是"真正的根"时，才画这条"⬆ 上级目录"标题条——
-    // 已经是真正根目录的话，再往上没有地方可去了。
-    let children_rect = if !root_path.is_empty() {
-        let header_rect = Rect::from_min_max(
-            rect.min,
-            Pos2::new(rect.max.x, (rect.min.y + ROOT_HEADER_H).min(rect.max.y)),
-        );
-        draw_root_header(ui, header_rect, view_root, &root_path, &mut action, &mut hover);
-        Rect::from_min_max(
-            Pos2::new(rect.min.x, (rect.min.y + ROOT_HEADER_H).min(rect.max.y)),
-            rect.max,
-        )
-    } else {
-        rect
-    };
-
-    let mut path = root_path;
-    draw_children(ui, children_rect, view_root, &mut path, 0, selected, auto_select, &mut action, &mut hover);
+    // 子色块直接铺满整个 rect，跟"顶层视图"用的是同一个函数、同一套布局，
+    // 没有任何特殊分支——双击进入某个目录后，画面看起来就跟直接把这个
+    // 目录当成起点重新扫描出来的一模一样。
+    draw_children(ui, rect, view_root, &mut path, 0, selected, auto_select, &mut action, &mut hover);
 
     if let Some(h) = hover {
         show_tooltip(ui, h);
     }
 
     action
-}
-
-/// 顶部"⬆ 上级目录"标题条：代表当前视图根自己的一个可交互色块。
-/// 双击它和双击普通子色块走同一个 `TreeAction::EnterNode`，只是携带的路径
-/// 是"自己"而不是某个孩子——`app.rs` 一律取其父路径作为新的视图根，
-/// 所以效果自然就是"再上一级目录变成新的最外层"，可以一路双击点回真正的根。
-fn draw_root_header(
-    ui: &egui::Ui,
-    rect: Rect,
-    node: &Node,
-    path: &NodePath,
-    action: &mut TreeAction,
-    hover: &mut Option<HoverInfo>,
-) {
-    if rect.height() < 4.0 || rect.width() < 4.0 {
-        return;
-    }
-
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x40, 0x42, 0x48));
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(2),
-        Stroke::new(1.0, Color32::from_rgb(0x58, 0x5B, 0x64)),
-        StrokeKind::Inside,
-    );
-
-    let font = FontId::proportional(11.0);
-    let max_w = (rect.width() - 12.0).max(0.0);
-    let label = truncate_text(ui.ctx(), &format!("⬆ {}", node.name), font.clone(), max_w);
-    painter.text(
-        rect.left_center() + Vec2::new(6.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        font,
-        Color32::from_rgba_unmultiplied(255, 255, 255, 230),
-    );
-
-    let id = ui.id().with(("root_header", path.clone()));
-    let resp = ui.interact(rect, id, egui::Sense::click());
-
-    if ui.rect_contains_pointer(rect) {
-        *hover = Some(HoverInfo {
-            name: node.name.clone(),
-            size: node.size,
-            hint: "双击返回上一级目录",
-        });
-    }
-
-    if resp.double_clicked() && matches!(*action, TreeAction::None) {
-        *action = TreeAction::EnterNode(path.clone());
-    }
 }
 
 fn draw_children(
