@@ -56,7 +56,7 @@ impl Node {
     pub fn new_folder_with_meta(
         name: impl Into<String>,
         color: Color32,
-        children: Vec<Node>,
+        mut children: Vec<Node>,
         modified_ft: u64,
         created_ft: u64,
         accessed_ft: u64,
@@ -65,6 +65,11 @@ impl Node {
         is_reserved: bool,
         owner: String,
     ) -> Self {
+        // 排序一次：按 logical_size 降序，文件夹优先
+        children.sort_by(|a, b| {
+            b.logical_size.cmp(&a.logical_size)
+                .then_with(|| b.is_folder().cmp(&a.is_folder()))
+        });
         let logical_size = children.iter().map(|c| c.logical_size).sum();
         let physical_size = children.iter().map(|c| c.physical_size).sum();
         let file_count = children.iter().map(|c| c.file_count).sum::<u64>()
