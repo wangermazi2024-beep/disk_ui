@@ -852,17 +852,31 @@ pub fn scan_drive_via_mft(
     }
 
     // 第二遍：按 parent_record 建邻接表。
-    let mut children_of: HashMap<u64, Vec<u64>> = HashMap::new();
+    // v14: (child_idx, name_override) —— name_override 用于硬链接场景，同一条记录
+    // 在不同父目录下可能用不同的名字挂载；主链接用 None（沿用 entry.name）。
+    let mut children_of: HashMap<u64, Vec<(u64, Option<String>)>> = HashMap::new();
+    let mut hardlink_extra_count = 0u64;
     for (idx, e) in entries.iter().enumerate() {
         if let Some(e) = e {
             if idx as u64 != ROOT_RECORD_INDEX {
-                children_of.entry(e.parent_record).or_default().push(idx as u64);
+                children_of.entry(e.parent_record).or_default().push((idx as u64, None));
+                // v14 关键修正：之前 parse_record 只保留一个 $FILE_NAME，其余硬链接
+                // 位置被丢弃，导致文件在那些目录里彻底消失（哪怕文件本身完好）。
+                // 这里把每一个额外链接也挂到对应的父目录下。
+                for (extra_parent, extra_name) in &e.extra_links {
+                    children_of
+                        .entry(*extra_parent)
+                        .or_default()
+                        .push((idx as u64, Some(extra_name.clone())));
+                    hardlink_extra_count += 1;
+                }
             }
         }
     }
     eprintln!(
-        "[mft_scan] 邻接表构建完成: {} 个父节点",
-        children_of.len()
+        "[mft_scan] 邻接表构建完成: {} 个父节点, 额外硬链接挂载 {} 处",
+        children_of.len(),
+        hardlink_extra_count
     );
 
     let mut file_paths = Vec::new();
@@ -904,7 +918,7 @@ fn build_subtree(
     record_idx: u64,
     display_name: &str,
     entries: &[Option<RawEntry>],
-    children_of: &HashMap<u64, Vec<u64>>,
+    children_of: &HashMap<u64, Vec<(u64, Option<String>)>>,
     depth: usize,
     cur_path: &PathBuf,
     file_paths: &mut Vec<PathBuf>,
@@ -934,15 +948,20 @@ fn build_subtree(
     }
 
     if let Some(kids) = children_of.get(&record_idx) {
-        for &child_idx in kids {
+        for (child_idx, name_override) in kids {
+            let child_idx = *child_idx;
             let Some(entry) = entries.get(child_idx as usize).and_then(|e| e.as_ref()) else {
                 continue;
             };
-            let child_path = cur_path.join(&entry.name);
+            // v14: 硬链接场景下同一条记录可能在多个目录下出现，各自可能有不同的
+            // 显示名字（name_override），主链接沿用 entry.name。
+            let display = name_override.as_deref().unwrap_or(&entry.name);
+            let child_path = cur_path.join(display);
             if entry.is_dir {
+                // 目录理论上不会有多个硬链接（NTFS 禁止），这里保底仍走正常路径。
                 let node = build_subtree(
                     child_idx,
-                    &entry.name,
+                    display,
                     entries,
                     children_of,
                     depth + 1,
@@ -956,7 +975,7 @@ fn build_subtree(
                 file_paths.push(child_path);
                 file_sizes.push(entry.real_size);
                 children_nodes.push(Node::new_file_with_meta(
-                    entry.name.clone(),
+                    display.to_string(),
                     entry.real_size,
                     file_color(),
                     entry.modified_ft,

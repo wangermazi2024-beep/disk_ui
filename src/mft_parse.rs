@@ -57,6 +57,11 @@ pub struct RawEntry {
     pub modified_ft: u64,
     /// 来自 $STANDARD_INFORMATION 的 Flags（FILE_ATTRIBUTE_*）。
     pub attributes: u32,
+    /// **v14 新增**：硬链接场景下一条记录可能有多个 $FILE_NAME，各自指向不同父目录。
+    /// 之前只保留"最优"的一个，其余 (parent, name) 直接丢弃，导致文件在除被选中
+    /// 目录外的**所有其它硬链接位置彻底消失**（DriverStore\FileRepository 重灾区）。
+    /// 这里保留除主链接外的其它链接，扫描阶段把文件同时挂到每个硬链接目录下。
+    pub extra_links: Vec<(u64, String)>,
 }
 
 /// $STANDARD_INFORMATION 内容布局（resident，NTFS 3.0+ 是 72 字节，1.x 是 48 字节）：
@@ -535,9 +540,24 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
             _ => 4,
         }
     };
-    let best = file_names.iter().rev().min_by_key(|(ns, _, _)| ns_priority(*ns)).unwrap();
-    let name = best.1.clone();
-    let parent_record = best.2;
+    // v14: 找到"最优"名字的下标，其余的作为 extra_links 保留（可能是硬链接的
+    // 其它目录位置，也可能是同一目录下 WIN32/DOS 两条重复记录——后者会在扫描阶段
+    // 按 (parent_record, name) 去重，不会产生幽灵条目）。
+    let best_idx = file_names
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (ns, _, _))| ns_priority(*ns))
+        .map(|(i, _)| i)
+        .unwrap();
+    let name = file_names[best_idx].1.clone();
+    let parent_record = file_names[best_idx].2;
+    let extra_links: Vec<(u64, String)> = file_names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != best_idx)
+        .map(|(_, (_, n, p))| (*p, n.clone()))
+        .filter(|(p, n)| *p != parent_record || *n != name) // 去掉和主链接完全相同的重复
+        .collect();
 
     Some(RawEntry {
         parent_record,
@@ -548,6 +568,7 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
         real_size,
         modified_ft,
         attributes,
+        extra_links,
     })
 }
 
