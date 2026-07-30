@@ -163,7 +163,8 @@ pub fn scan_volume(
     );
 
     let root_name = format!("{}:\\", drive_letter);
-    let root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0);
+    let mut size_counted: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0, &mut size_counted);
     eprintln!(
         "[mft_scan] 树构建完成: logical={}, physical={}, files={}, folders={}",
         crate::format::human_size(root_node.logical_size),
@@ -594,7 +595,13 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
 }
 
 /// 第二阶段：从指定 record 递归建树。
-fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) -> Node {
+fn build_tree(
+    ctx: &NtfsContext,
+    record: u64,
+    display_name: &str,
+    depth: usize,
+    size_counted: &mut std::collections::HashSet<u64>,
+) -> Node {
     let is_reserved = record < NTFS_RESERVED_MAX;
     let base = ctx.base_file_records.get(&record);
     let (logical, physical, modified_ft, created_ft, accessed_ft, attributes, reparse_tag) = match base {
@@ -602,6 +609,16 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
         None => (0, 0, 0, 0, 0, FILE_ATTRIBUTE_DIRECTORY, 0),
     };
     let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+
+    // 硬链接处理：文件大小只计入第一个遇到的 base_record
+    //（和 WinDirStat 的 DoHardlinkAdjustment 类似：第一个实例保留大小，后续实例大小=0）
+    let (logical_to_use, physical_to_use) = if is_dir {
+        (logical, physical) // 目录不去重
+    } else if size_counted.insert(record) {
+        (logical, physical) // 第一次遇到这个文件，计入大小
+    } else {
+        (0u64, 0u64) // 硬链接的后续实例，大小=0
+    };
 
     let mut children = Vec::new();
     if let Some(child_names) = ctx.parent_to_children.get(&record) {
@@ -614,13 +631,19 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
             let c_is_dir = c_attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
             let c_is_reserved = cn.base_record < NTFS_RESERVED_MAX;
             if c_is_dir {
-                let child_node = build_tree(ctx, cn.base_record, &cn.name, depth + 1);
+                let child_node = build_tree(ctx, cn.base_record, &cn.name, depth + 1, size_counted);
                 children.push(child_node);
             } else {
+                // 硬链接去重：第一次遇到计入大小，后续大小=0
+                let (cl, cp) = if size_counted.insert(cn.base_record) {
+                    (c_logical, c_physical)
+                } else {
+                    (0u64, 0u64)
+                };
                 children.push(Node::new_file_with_meta(
                     cn.name.clone(),
-                    c_logical,
-                    c_physical,
+                    cl,
+                    cp,
                     file_color(),
                     c_modified,
                     c_created,
@@ -650,8 +673,8 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
     } else {
         Node::new_file_with_meta(
             display_name.to_string(),
-            logical,
-            physical,
+            logical_to_use,
+            physical_to_use,
             file_color(),
             modified_ft,
             created_ft,
