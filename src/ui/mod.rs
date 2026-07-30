@@ -9,6 +9,6 @@ pub enum TreeAction {
     None,
     Select(NodePath),
     ToggleExpand(NodePath),
-    #[allow(dead_code)] // 预留：双击进入文件夹功能尚未接入
+    #[allow(dead_code)]
     EnterNode(NodePath),
 }

@@ -171,7 +171,7 @@ fn scan_dir(
         (attrs, phys)
     };
     #[cfg(not(windows))]
-    let (self_attrs, self_phys): (u32, u64) = (0x10, 0);
+    let (self_attrs, _self_phys): (u32, u64) = (0x10, 0);
 
     let mut children = Vec::new();
     let entries = match std::fs::read_dir(path) {
