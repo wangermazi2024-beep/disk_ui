@@ -535,7 +535,7 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
             _ => 4,
         }
     };
-    let best = file_names.iter().min_by_key(|(ns, _, _)| ns_priority(*ns)).unwrap();
+    let best = file_names.iter().rev().min_by_key(|(ns, _, _)| ns_priority(*ns)).unwrap();
     let name = best.1.clone();
     let parent_record = best.2;
 
