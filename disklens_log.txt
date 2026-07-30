@@ -720,3 +720,19 @@
 [scan] ⚠ 扫描汇总不到系统已用的 60%，可能有丢数据（正常 70%~95%，差值含 $MFT/簇碎片/VSS/USN日志）
 [scan] 扫描总耗时: 5.8s
 [app] 扫描完成，已更新 partitions[0]
+==== DiskLens 启动 (unix_ts=1785417424) ====
+[app] 初始化：枚举磁盘分区...
+[app] 枚举到 4 个分区
+[app] 默认显示 C 盘: 本地磁盘 (C:)
+[app] 用户点击扫描，启动后台线程: root=C:\
+[scan] 启动扫描: root=C:\, disk_info=本地磁盘 (C:)
+[scan] 走 MFT 直读路径: drive=C
+[mft] 簇=4.00 KB 记录=1024
+[mft] 8 个 data run
+[mft] 解析: base=928828 目录=172817 文件=756011 fixup_fail=0 已删=0
+[mft] 树: root.size=12.96 GB dedup=53.56 GB
+[scan] MFT 直读完成: files=37352, folders=11636, size=12.96 GB, 耗时 5.1s
+[scan] 一致性检查（物理去重口径）: 扫描汇总=53.56 GB, 系统已用=101.76 GB, 比例=52.6%
+[scan] ⚠ 扫描汇总不到系统已用的 60%，可能有丢数据（正常 70%~95%，差值含 $MFT/簇碎片/VSS/USN日志）
+[scan] 扫描总耗时: 5.1s
+[app] 扫描完成，已更新 partitions[0]

@@ -37,10 +37,13 @@ pub fn show(
             .column(egui_extras::Column::initial(120.0).resizable(true))  // 修改时间
             .column(egui_extras::Column::initial(50.0).resizable(true))   // 属性
             .column(egui_extras::Column::initial(55.0).resizable(true))   // Reparse
-            .column(egui_extras::Column::initial(40.0).resizable(true));  // 保留
+            .column(egui_extras::Column::initial(40.0).resizable(true))   // 保留
+            .column(egui_extras::Column::initial(120.0).resizable(true))  // 创建时间
+            .column(egui_extras::Column::initial(120.0).resizable(true))  // 访问时间
+            .column(egui_extras::Column::initial(80.0).resizable(true));  // Owner
         builder
             .header(ROW_H, |mut h| {
-                let cols = ["名称", "占比", "%", "Physical", "Logical", "项目", "文件", "文件夹", "修改时间", "属性", "Reparse", "保留"];
+                let cols = ["名称", "占比", "%", "Physical", "Logical", "项目", "文件", "文件夹", "修改时间", "属性", "Reparse", "保留", "创建时间", "访问时间", "Owner"];
                 for c in cols { h.col(|ui| { ui.label(egui::RichText::new(c).strong().size(12.0).color(Color32::WHITE)); }); }
             })
             .body(|mut body| {
@@ -120,6 +123,12 @@ pub fn show(
                         row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let t=if partition.reparse_tag!=0 {format!("0x{:X}",partition.reparse_tag)}else{"—".into()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){part_clicked.set(true);} });
                         // 保留
                         row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let t=if partition.is_reserved {"是"}else{"—"}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){part_clicked.set(true);} });
+                        // 创建时间
+                        row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let s=format_filetime(partition.created_ft); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){part_clicked.set(true);} });
+                        // 访问时间
+                        row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let s=format_filetime(partition.accessed_ft); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){part_clicked.set(true);} });
+                        // Owner
+                        row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let t=if partition.owner.is_empty(){"—".into()}else{partition.owner.clone()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){part_clicked.set(true);} });
                     });
                     if part_clicked.get() { final_action = TreeAction::ToggleExpand(part_path.clone()); }
                     if partition.expanded {
@@ -201,6 +210,12 @@ fn draw_rows(
             row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let t=if child.reparse_tag!=0{format!("0x{:X}",child.reparse_tag)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked.set(true);}});
             // 保留
             row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let t=if child.is_reserved{"是"}else{"—"};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked.set(true);}});
+            // 创建时间
+            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let s=format_filetime(child.created_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked.set(true);}});
+            // 访问时间
+            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let s=format_filetime(child.accessed_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked.set(true);}});
+            // Owner
+            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let t=if child.owner.is_empty(){"—".into()}else{child.owner.clone()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked.set(true);}});
         });
 
         let abs_clone = abs_path.clone();

@@ -46,7 +46,7 @@ pub fn export_tree_csv(root: &Node, root_path: &str, out_path: &Path) -> io::Res
     let base = root_path.to_string();
 
     // 根节点自己也写一行（大小=整个树汇总，方便跟 WizTree CSV 里 "C:\" 那一行对比）。
-    write_row(&mut f, &base, root.size, root.allocated, root.is_folder())?;
+    write_row(&mut f, &base, root.size, root.physical_size, root.is_folder())?;
     walk(root, &base, &mut f, &mut file_count, &mut folder_count)?;
 
     Ok((file_count, folder_count))
@@ -67,7 +67,7 @@ fn walk(
 ) -> io::Result<()> {
     for child in &node.children {
         let child_path = join_path(cur_path, &child.name);
-        write_row(f, &child_path, child.size, child.allocated, child.is_folder())?;
+        write_row(f, &child_path, child.size, child.physical_size, child.is_folder())?;
         if child.is_folder() {
             *folder_count += 1;
             walk(child, &child_path, f, file_count, folder_count)?;

@@ -33,27 +33,37 @@ pub struct Node {
     pub folder_count: u64,
     /// 最后修改时间（FILETIME，1601-01-01 起 100ns）。0=未知。
     pub modified_ft: u64,
+    /// 创建时间（FILETIME）。0=未知。
+    pub created_ft: u64,
+    /// 最后访问时间（FILETIME）。0=未知。
+    pub accessed_ft: u64,
     /// Windows 文件属性位（FILE_ATTRIBUTE_*）。
     pub attributes: u32,
     /// Reparse point tag（0=普通文件，IO_REPARSE_TAG_*=reparse point）。
     pub reparse_tag: u32,
     /// 是否是 NTFS 保留系统文件（record < 16，如 $MFT/$LogFile/$Bitmap）。
     pub is_reserved: bool,
+    /// 所有者（SID 或用户名，可能为空）。
+    pub owner: String,
 }
 
 impl Node {
     pub fn new_folder(name: impl Into<String>, color: Color32, children: Vec<Node>) -> Self {
-        Self::new_folder_with_meta(name, color, children, 0, 0x10, 0, false)
+        Self::new_folder_with_meta(name, color, children, 0, 0, 0, 0x10, 0, false, String::new())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_folder_with_meta(
         name: impl Into<String>,
         color: Color32,
         children: Vec<Node>,
         modified_ft: u64,
+        created_ft: u64,
+        accessed_ft: u64,
         attributes: u32,
         reparse_tag: u32,
         is_reserved: bool,
+        owner: String,
     ) -> Self {
         let logical_size = children.iter().map(|c| c.logical_size).sum();
         let physical_size = children.iter().map(|c| c.physical_size).sum();
@@ -75,14 +85,17 @@ impl Node {
             file_count,
             folder_count,
             modified_ft,
+            created_ft,
+            accessed_ft,
             attributes,
             reparse_tag,
             is_reserved,
+            owner,
         }
     }
 
     pub fn new_file(name: impl Into<String>, logical: u64, color: Color32) -> Self {
-        Self::new_file_with_meta(name, logical, logical, color, 0, 0x80, 0, false)
+        Self::new_file_with_meta(name, logical, logical, color, 0, 0, 0, 0x80, 0, false, String::new())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -92,9 +105,12 @@ impl Node {
         physical_size: u64,
         color: Color32,
         modified_ft: u64,
+        created_ft: u64,
+        accessed_ft: u64,
         attributes: u32,
         reparse_tag: u32,
         is_reserved: bool,
+        owner: String,
     ) -> Self {
         Self {
             name: name.into(),
@@ -108,9 +124,12 @@ impl Node {
             file_count: 0,
             folder_count: 0,
             modified_ft,
+            created_ft,
+            accessed_ft,
             attributes: if attributes == 0 { 0x80 } else { attributes },
             reparse_tag,
             is_reserved,
+            owner,
         }
     }
 

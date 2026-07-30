@@ -3,7 +3,7 @@
 use egui::{Color32, CornerRadius, RichText};
 use crate::format::human_size;
 
-pub enum TopbarAction { None, StartScan }
+pub enum TopbarAction { None, StartScan, ExportCsv }
 
 pub struct TopbarState<'a> {
     pub root_path: &'a mut String,
@@ -12,6 +12,7 @@ pub struct TopbarState<'a> {
     pub scan_error: Option<&'a str>,
     pub used_size: u64,
     pub total_size: u64,
+    pub has_result: bool,
 }
 
 pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
@@ -28,6 +29,9 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                 if ui.add(egui::Button::new(RichText::new("  扫描  ").color(Color32::WHITE))
                     .fill(Color32::from_rgb(0x4C, 0x8B, 0xF5)).corner_radius(CornerRadius::same(6))).clicked() {
                     action = TopbarAction::StartScan;
+                }
+                if state.has_result && ui.button("导出 CSV").clicked() {
+                    action = TopbarAction::ExportCsv;
                 }
                 if state.scanning {
                     ui.add(egui::Spinner::new());

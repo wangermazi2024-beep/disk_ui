@@ -1,6 +1,6 @@
 //! DiskLens 入口（v2 WinDirStat 风格重构）。
 
-pub use disk_ui::{categorize, disk_info, format, model, scan};
+pub use disk_ui::{applog, categorize, disk_info, export, format, model, scan};
 #[cfg(windows)]
 pub use disk_ui::mft_scan;
 
@@ -24,8 +24,9 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    applog::init();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 700.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 750.0]),
         ..Default::default()
     };
     eframe::run_native("DiskLens v2 (WinDirStat 风格)", options, Box::new(|cc| {

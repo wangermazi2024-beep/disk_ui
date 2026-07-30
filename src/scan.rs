@@ -51,9 +51,9 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                 node.name = info.display_name();
                             }
                             eprintln!(
-                                "[scan] MFT 完成: files={}, folders={}, logical={:.2}GB, 耗时 {:.1}s",
+                                "[scan] MFT 完成: files={}, folders={}, logical={}, 耗时 {:.1}s",
                                 node.file_count, node.folder_count,
-                                node.logical_size as f64 / 1e9,
+                                crate::format::human_size(node.logical_size),
                                 start.elapsed().unwrap_or_default().as_secs_f64()
                             );
                             let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
@@ -81,8 +81,8 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                     { node.name = info.display_name(); }
                 }
                 eprintln!(
-                    "[scan] 标准遍历完成: files={}, folders={}, logical={:.2}GB",
-                    node.file_count, node.folder_count, node.logical_size as f64 / 1e9
+                    "[scan] 标准遍历完成: files={}, folders={}, logical={}",
+                    node.file_count, node.folder_count, crate::format::human_size(node.logical_size)
                 );
                 let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
             }
@@ -156,7 +156,7 @@ fn scan_dir(
     let mut children = Vec::new();
     let entries = match std::fs::read_dir(path) {
         Ok(e) => e,
-        Err(_) => return Ok(Node::new_folder_with_meta(name, folder_color(depth), Vec::new(), self_modified, self_attrs, 0, false)),
+        Err(_) => return Ok(Node::new_folder_with_meta(name, folder_color(depth), Vec::new(), self_modified, 0, 0, self_attrs, 0, false, String::new())),
     };
 
     for entry in entries.flatten() {
@@ -181,8 +181,8 @@ fn scan_dir(
                 children.push(child);
             }
         } else {
-            children.push(Node::new_file_with_meta(entry_name, logical, physical, file_color(), modified, attrs, 0, false));
+            children.push(Node::new_file_with_meta(entry_name, logical, physical, file_color(), modified, 0, 0, attrs, 0, false, String::new()));
         }
     }
-    Ok(Node::new_folder_with_meta(name, folder_color(depth), children, self_modified, self_attrs, 0, false))
+    Ok(Node::new_folder_with_meta(name, folder_color(depth), children, self_modified, 0, 0, self_attrs, 0, false, String::new()))
 }

@@ -57,6 +57,7 @@ const NTFS_RESERVED_MAX: u64 = 16;
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
+const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_REPARSE_POINT: u32 = 0xC0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
@@ -87,6 +88,8 @@ pub struct FileRecordBase {
     pub logical_size: u64,
     pub physical_size: u64,
     pub last_modified_ft: u64,
+    pub created_ft: u64,
+    pub accessed_ft: u64,
     pub attributes: u32,
     pub reparse_tag: u32,
 }
@@ -162,9 +165,9 @@ pub fn scan_volume(
     let root_name = format!("{}:\\", drive_letter);
     let root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0);
     eprintln!(
-        "[mft_scan] 树构建完成: logical={:.2}GB, physical={:.2}GB, files={}, folders={}",
-        root_node.logical_size as f64 / 1e9,
-        root_node.physical_size as f64 / 1e9,
+        "[mft_scan] 树构建完成: logical={}, physical={}, files={}, folders={}",
+        crate::format::human_size(root_node.logical_size),
+        crate::format::human_size(root_node.physical_size),
         root_node.file_count,
         root_node.folder_count
     );
@@ -461,8 +464,14 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
             let content = off + value_off;
             // 布局：CreationTime(8) + LastModificationTime(8) + MftChangeTime(8) + AccessTime(8) + Flags(4)
             if content + 0x24 <= rec.len() && value_len >= 0x24 {
+                base_entry.created_ft = u64::from_le_bytes(
+                    rec[content + 0x00..content + 0x08].try_into().unwrap(),
+                );
                 base_entry.last_modified_ft = u64::from_le_bytes(
                     rec[content + 0x08..content + 0x10].try_into().unwrap(),
+                );
+                base_entry.accessed_ft = u64::from_le_bytes(
+                    rec[content + 0x18..content + 0x20].try_into().unwrap(),
                 );
                 base_entry.attributes = u32::from_le_bytes(
                     rec[content + 0x20..content + 0x24].try_into().unwrap(),
@@ -588,9 +597,9 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
 fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) -> Node {
     let is_reserved = record < NTFS_RESERVED_MAX;
     let base = ctx.base_file_records.get(&record);
-    let (logical, physical, modified_ft, attributes, reparse_tag) = match base {
-        Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.attributes, b.reparse_tag),
-        None => (0, 0, 0, FILE_ATTRIBUTE_DIRECTORY, 0),
+    let (logical, physical, modified_ft, created_ft, accessed_ft, attributes, reparse_tag) = match base {
+        Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.created_ft, b.accessed_ft, b.attributes, b.reparse_tag),
+        None => (0, 0, 0, 0, 0, FILE_ATTRIBUTE_DIRECTORY, 0),
     };
     let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
 
@@ -598,9 +607,9 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
     if let Some(child_names) = ctx.parent_to_children.get(&record) {
         for cn in child_names {
             let child_base = ctx.base_file_records.get(&cn.base_record);
-            let (c_logical, c_physical, c_modified, c_attrs, c_reparse) = match child_base {
-                Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.attributes, b.reparse_tag),
-                None => (0, 0, 0, 0, 0),
+            let (c_logical, c_physical, c_modified, c_created, c_accessed, c_attrs, c_reparse) = match child_base {
+                Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.created_ft, b.accessed_ft, b.attributes, b.reparse_tag),
+                None => (0, 0, 0, 0, 0, 0, 0),
             };
             let c_is_dir = c_attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
             let c_is_reserved = cn.base_record < NTFS_RESERVED_MAX;
@@ -614,9 +623,12 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
                     c_physical,
                     file_color(),
                     c_modified,
+                    c_created,
+                    c_accessed,
                     c_attrs,
                     c_reparse,
                     c_is_reserved,
+                    String::new(),
                 ));
             }
         }
@@ -628,9 +640,12 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
             folder_color(depth),
             children,
             modified_ft,
+            created_ft,
+            accessed_ft,
             attributes,
             reparse_tag,
             is_reserved,
+            String::new(),
         )
     } else {
         Node::new_file_with_meta(
@@ -639,9 +654,12 @@ fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) 
             physical,
             file_color(),
             modified_ft,
+            created_ft,
+            accessed_ft,
             attributes,
             reparse_tag,
             is_reserved,
+            String::new(),
         )
     }
 }

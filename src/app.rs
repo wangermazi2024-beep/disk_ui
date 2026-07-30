@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver};
 use egui::{Color32, Vec2};
 use crate::categorize::compute_categories;
 use crate::disk_info::{self, DiskInfo};
+use crate::export;
 use crate::model::{Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
@@ -27,8 +28,11 @@ impl Default for DiskUiApp {
         let all_drives = disk_info::enumerate_drives();
         let (partitions, partition_infos, root_path) =
             if let Some(c) = all_drives.iter().find(|d| d.drive_letter == 'C').cloned() {
-                let placeholder = Node::new_folder_with_meta(c.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0x10, 0, false);
+                let placeholder = Node::new_folder_with_meta(c.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
                 (vec![placeholder], vec![Some(c.clone())], c.root_path())
+            } else if let Some(first) = all_drives.first().cloned() {
+                let placeholder = Node::new_folder_with_meta(first.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
+                (vec![placeholder], vec![Some(first.clone())], first.root_path())
             } else {
                 let demos = vec![Node::new_folder("本地磁盘 (C:)", Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new())];
                 (demos, vec![None], r"C:\".into())
@@ -55,8 +59,13 @@ impl eframe::App for DiskUiApp {
         let topbar_action = topbar::show(ui, TopbarState {
             root_path: &mut self.root_path, scanning: self.scanning, scanned_count: self.scanned_count,
             scan_error: self.scan_error.as_deref(), used_size, total_size,
+            has_result: !self.partitions.is_empty() && self.partitions[0].file_count > 0,
         });
-        if matches!(topbar_action, TopbarAction::StartScan) { self.start_scan(); }
+        match topbar_action {
+            TopbarAction::StartScan => self.start_scan(),
+            TopbarAction::ExportCsv => self.export_csv(),
+            TopbarAction::None => {}
+        }
 
         let p = self.partitions.first();
         sidebar::show(ui, used_size, total_size, total_size.saturating_sub(used_size), &self.categories,
@@ -85,6 +94,30 @@ impl DiskUiApp {
         let (tx, rx) = mpsc::channel();
         scan::spawn_scan(path, tx);
         self.scan_rx = Some(rx); self.scanning = true; self.scanned_count = 0; self.scan_error = None;
+    }
+    fn export_csv(&mut self) {
+        if self.partitions.is_empty() { return; }
+        let root = &self.partitions[0];
+        let root_path = self.partition_infos.first()
+            .and_then(|i| i.as_ref())
+            .map(|i| i.root_path())
+            .unwrap_or_else(|| self.root_path.clone());
+        let out = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("disklens_export.csv")))
+            .unwrap_or_else(|| std::path::PathBuf::from("disklens_export.csv"));
+        match export::export_tree_csv(root, &root_path, &out) {
+            Ok((f, d)) => {
+                crate::applog::log(&format!(
+                    "[app] CSV 导出成功: {} (文件={}, 文件夹={})",
+                    out.display(), f, d
+                ));
+                self.scan_error = Some(format!("CSV 已导出到: {}", out.display()));
+            }
+            Err(e) => {
+                crate::applog::log(&format!("[app] CSV 导出失败: {e}"));
+            }
+        }
     }
     fn poll_scan(&mut self) {
         let Some(rx) = &self.scan_rx else { return };
