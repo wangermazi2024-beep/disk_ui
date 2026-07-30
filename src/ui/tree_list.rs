@@ -69,22 +69,21 @@ pub fn show(
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, false])
-            .column(egui_extras::Column::initial(200.0).at_least(80.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(50.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(40.0).clip(true).resizable(true))
-            .column(egui_extras::Column::initial(80.0).clip(true).resizable(true).at_least(50.0));
+            .column(egui_extras::Column::initial(200.0).at_least(80.0).clip(true).resizable(true))  // 名称
+            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))   // 父占比
+            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))   // 总占比
+            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))   // 逻辑大小
+            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))  // 修改时间
+            .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))   // 物理大小
+            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))  // 创建时间
+            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))  // 访问时间
+            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 项目
+            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 文件
+            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 文件夹
+            .column(egui_extras::Column::initial(50.0).clip(true).resizable(true))   // 属性
+            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 重解析点
+            .column(egui_extras::Column::initial(40.0).clip(true).resizable(true))   // 保留
+            .column(egui_extras::Column::initial(80.0).clip(true).resizable(true).at_least(50.0)); // 所有者
 
         builder = builder.sense(egui::Sense::click());
         builder
