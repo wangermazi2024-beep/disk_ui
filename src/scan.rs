@@ -126,16 +126,16 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                             // 同一份硬链接数据挂在几个目录下就会被计几次，是 Explorer/WizTree
                             // 的标准展示行为，拿它去跟系统已用比会被硬链接场景误报成"异常"。
                             if let Some(info) = &disk_info {
-                                let scanned_gb = dedup_size as f64 / 1e9;
-                                let used_gb = info.used_bytes as f64 / 1e9;
+                                let scanned_str = crate::format::human_size(dedup_size);
+                                let used_str = crate::format::human_size(info.used_bytes);
                                 let ratio = if info.used_bytes > 0 {
                                     dedup_size as f64 / info.used_bytes as f64 * 100.0
                                 } else {
                                     0.0
                                 };
                                 eprintln!(
-                                    "[scan] 一致性检查（物理去重口径）: 扫描汇总={:.2}GB, 系统已用={:.2}GB, 比例={:.1}%",
-                                    scanned_gb, used_gb, ratio
+                                    "[scan] 一致性检查（物理去重口径）: 扫描汇总={}, 系统已用={}, 比例={:.1}%",
+                                    scanned_str, used_str, ratio
                                 );
                                 if ratio < 60.0 {
                                     eprintln!(

@@ -863,9 +863,9 @@ pub fn scan_drive_via_mft(
     );
 
     eprintln!(
-        "[mft_scan] 树构建完成: root.size(树汇总,含硬链接重复计入)={:.2}GB, dedup_size(物理去重)={:.2}GB, files={}, folders={}",
-        root_node.size as f64 / 1e9,
-        dedup_size as f64 / 1e9,
+        "[mft_scan] 树构建完成: root.size(树汇总,含硬链接重复计入)={}, dedup_size(物理去重)={}, files={}, folders={}",
+        crate::format::human_size(root_node.size),
+        crate::format::human_size(dedup_size),
         root_node.file_count,
         root_node.folder_count
     );

@@ -111,11 +111,11 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
 
         if let Some(info) = query_disk_info(drive_letter_up) {
             eprintln!(
-                "[disk_info] 发现分区 {} 总={:.2}GB 已用={:.2}GB 可用={:.2}GB {} \"{}\"",
+                "[disk_info] 发现分区 {} 总={} 已用={} 可用={} {} \"{}\"",
                 drive_str,
-                info.total_bytes as f64 / 1e9,
-                info.used_bytes as f64 / 1e9,
-                info.free_bytes as f64 / 1e9,
+                crate::format::human_size(info.total_bytes),
+                crate::format::human_size(info.used_bytes),
+                crate::format::human_size(info.free_bytes),
                 info.file_system,
                 info.volume_label
             );
