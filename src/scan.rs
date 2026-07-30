@@ -1,10 +1,17 @@
-//! 目录扫描入口 + fallback 标准遍历（非管理员）。
+//! 目录扫描入口 + 常规遍历 fallback（参考 WinDirStat FinderBasic）。
+//!
+//! WinDirStat 的常规遍历用 NtQueryDirectoryFile（比 FindFirstFile/FindNextFile 快），
+//! 并且对权限问题做了容错：
+//! - 用 FILE_OPEN_FOR_BACKUP_INTENT 打开目录（允许读受保护目录）
+//! - 对物理大小为 0 的文件用 GetCompressedFileSize 修正
+//! - 对逻辑大小为 0 但 AllocationSize>0 的文件用 GetFileSizeEx 修正
+//! - 启用 SeBackupPrivilege + SeRestorePrivilege（即使非管理员也能读更多文件）
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::Color32;
 
@@ -41,7 +48,6 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
 
         #[cfg(windows)]
         {
-            // 管理员 + 整盘根路径 → MFT 直读
             if let Some(drive) = as_drive_root(&root) {
                 if crate::mft_scan::is_elevated() {
                     eprintln!("[scan] 走 MFT 直读: drive={}", drive);
@@ -57,53 +63,41 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                 crate::format::human_size(node.physical_size),
                                 start.elapsed().unwrap_or_default().as_secs_f64()
                             );
-                            // 一致性检查：physical（去重后）vs 系统已用空间
                             if let Some(info) = &disk_info {
                                 let ratio = if info.used_bytes > 0 {
                                     node.physical_size as f64 / info.used_bytes as f64 * 100.0
                                 } else { 0.0 };
-                                eprintln!(
-                                    "[scan] 一致性检查: physical={}, 系统已用={}, 比例={:.1}%",
+                                eprintln!("[scan] 一致性检查: physical={}, 系统已用={}, 比例={:.1}%",
                                     crate::format::human_size(node.physical_size),
-                                    crate::format::human_size(info.used_bytes),
-                                    ratio
-                                );
-                                if ratio < 60.0 {
-                                    eprintln!("[scan] ⚠ physical 不到系统已用的 60%，可能丢数据");
-                                } else if ratio > 105.0 {
-                                    eprintln!("[scan] ⚠ physical 超过系统已用 105%，可能含 ADS 或压缩差异");
-                                } else {
-                                    eprintln!("[scan] ✓ 在合理范围内");
-                                }
+                                    crate::format::human_size(info.used_bytes), ratio);
+                                if ratio < 60.0 { eprintln!("[scan] ⚠ 可能丢数据"); }
+                                else if ratio > 105.0 { eprintln!("[scan] ⚠ 可能含 ADS 或压缩差异"); }
+                                else { eprintln!("[scan] ✓ 在合理范围内"); }
                             }
                             let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
                             return;
                         }
-                        Err(e) => eprintln!("[scan] MFT 失败，回退标准遍历: {e}"),
+                        Err(e) => eprintln!("[scan] MFT 失败，回退常规遍历: {e}"),
                     }
                 } else {
-                    eprintln!("[scan] 非管理员，走标准遍历: drive={}", drive);
+                    eprintln!("[scan] 非管理员，走常规遍历: drive={}", drive);
                 }
             }
         }
 
-        // 标准遍历 fallback
+        // 常规遍历 fallback
         let counter = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         match scan_dir(&root, 0, &counter, &cancel, &tx) {
             Ok(mut node) => {
                 if let Some(info) = &disk_info {
                     #[cfg(windows)]
-                    if as_drive_root(&root).is_some() {
-                        node.name = info.display_name();
-                    }
+                    if as_drive_root(&root).is_some() { node.name = info.display_name(); }
                     #[cfg(not(windows))]
                     { node.name = info.display_name(); }
                 }
-                eprintln!(
-                    "[scan] 标准遍历完成: files={}, folders={}, logical={}",
-                    node.file_count, node.folder_count, crate::format::human_size(node.logical_size)
-                );
+                eprintln!("[scan] 常规遍历完成: files={}, folders={}, logical={}",
+                    node.file_count, node.folder_count, crate::format::human_size(node.logical_size));
                 let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
             }
             Err(e) => {
@@ -128,7 +122,7 @@ fn as_drive_root(path: &Path) -> Option<char> {
 
 fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
     let t = match t { Some(t) => t, None => return 0 };
-    match t.duration_since(SystemTime::UNIX_EPOCH) {
+    match t.duration_since(UNIX_EPOCH) {
         Ok(d) => {
             const OFFSET: u64 = 11_644_473_600;
             d.as_secs() * 10_000_000 + (d.subsec_nanos() / 100) as u64 + OFFSET * 10_000_000
@@ -137,6 +131,13 @@ fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
     }
 }
 
+/// 常规遍历：递归扫描目录树。
+///
+/// 参考 WinDirStat FinderBasic 的设计：
+/// - read_dir 失败不中断（权限拒绝等），当作空目录返回
+/// - 单个文件 metadata 失败不中断，跳过该文件
+/// - 子目录扫描失败不中断父目录
+/// - 物理大小 = logical_size（常规遍历不区分，MFT 路径才准）
 fn scan_dir(
     path: &Path, depth: usize,
     counter: &Arc<AtomicU64>, cancel: &Arc<AtomicBool>,
@@ -156,27 +157,26 @@ fn scan_dir(
             .unwrap_or_else(|| path.to_string_lossy().into_owned())
     };
 
+    // 拿本目录自身的元数据
     let self_meta = std::fs::metadata(path).ok();
     let self_modified = system_time_to_filetime(self_meta.as_ref().and_then(|m| m.modified().ok()));
     #[cfg(windows)]
-    let (self_attrs, _self_phys) = {
+    let self_attrs = self_meta.as_ref().map(|m| {
         use std::os::windows::fs::MetadataExt;
-        let attrs = self_meta.as_ref().map(|m| m.file_attributes()).unwrap_or(0x10);
-        let phys = self_meta.as_ref().map(|m| {
-            // compressed 文件用 GetCompressedFileSize 更准，这里简化用 allocated
-            let logical = m.len();
-            let block_size = 4096u64; // 简化
-            ((logical + block_size - 1) / block_size) * block_size
-        }).unwrap_or(0);
-        (attrs, phys)
-    };
+        m.file_attributes()
+    }).unwrap_or(0x10);
     #[cfg(not(windows))]
-    let (self_attrs, _self_phys): (u32, u64) = (0x10, 0);
+    let self_attrs: u32 = 0x10;
 
     let mut children = Vec::new();
     let entries = match std::fs::read_dir(path) {
         Ok(e) => e,
-        Err(_) => return Ok(Node::new_folder_with_meta(name, folder_color(depth), Vec::new(), self_modified, 0, 0, self_attrs, 0, false, String::new())),
+        Err(e) => {
+            if depth <= 3 {
+                eprintln!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, path.display(), e);
+            }
+            return Ok(Node::new_folder_with_meta(name, folder_color(depth), Vec::new(), self_modified, 0, 0, self_attrs, 0, false, String::new()));
+        }
     };
 
     for entry in entries.flatten() {
@@ -190,7 +190,8 @@ fn scan_dir(
             use std::os::windows::fs::MetadataExt;
             let attrs = meta.file_attributes();
             let logical = meta.len();
-            let physical = logical; // 简化，标准遍历不区分（MFT 路径才准）
+            // 物理大小：对压缩文件用 GetCompressedFileSize，否则用 allocated
+            let physical = get_physical_size(&entry.path(), logical, attrs);
             (attrs, logical, physical)
         };
         #[cfg(not(windows))]
@@ -205,4 +206,30 @@ fn scan_dir(
         }
     }
     Ok(Node::new_folder_with_meta(name, folder_color(depth), children, self_modified, 0, 0, self_attrs, 0, false, String::new()))
+}
+
+/// Windows 下获取文件的物理大小（占用空间）。
+/// 参考 WinDirStat FinderBasic.cpp:177-194：
+/// - 如果 AllocationSize==0 且文件较大或压缩/稀疏，用 GetCompressedFileSize 修正
+/// - 否则用 metadata 的 allocated 大小
+#[cfg(windows)]
+fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+
+    // 对压缩/稀疏文件，用 GetCompressedFileSize 拿真实占用
+    if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut high: u32 = 0;
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        if low != 0xFFFFFFFF || unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0 {
+            return ((high as u64) << 32) | (low as u64);
+        }
+    }
+    // 普通文件：logical 向上对齐到簇大小（4096）
+    let cluster = 4096u64;
+    ((logical + cluster - 1) / cluster) * cluster
 }

@@ -1,9 +1,7 @@
-//! 顶部工具栏。
-
 use egui::{Color32, CornerRadius, RichText};
 use crate::format::human_size;
 
-pub enum TopbarAction { None, StartScan, ExportCsv }
+pub enum TopbarAction { None, StartScan, ExportCsv, RestartAsAdmin }
 
 pub struct TopbarState<'a> {
     pub root_path: &'a mut String,
@@ -13,6 +11,8 @@ pub struct TopbarState<'a> {
     pub used_size: u64,
     pub total_size: u64,
     pub has_result: bool,
+    #[cfg(windows)]
+    pub is_admin: bool,
 }
 
 pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
@@ -33,6 +33,16 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                 if state.has_result && ui.button("导出 CSV").clicked() {
                     action = TopbarAction::ExportCsv;
                 }
+
+                // 非管理员时显示"以管理员运行"按钮
+                #[cfg(windows)]
+                if !state.is_admin {
+                    if ui.add(egui::Button::new(RichText::new("⚡ 以管理员运行").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(0xF5, 0xA6, 0x23)).corner_radius(CornerRadius::same(6))).clicked() {
+                        action = TopbarAction::RestartAsAdmin;
+                    }
+                }
+
                 if state.scanning {
                     ui.add(egui::Spinner::new());
                     ui.label(RichText::new(format!("正在扫描… 已发现 {} 项", state.scanned_count)).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));

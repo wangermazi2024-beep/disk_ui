@@ -60,11 +60,17 @@ impl eframe::App for DiskUiApp {
             root_path: &mut self.root_path, scanning: self.scanning, scanned_count: self.scanned_count,
             scan_error: self.scan_error.as_deref(), used_size, total_size,
             has_result: !self.partitions.is_empty() && self.partitions[0].file_count > 0,
+            #[cfg(windows)]
+            is_admin: crate::mft_scan::is_elevated(),
         });
         match topbar_action {
             TopbarAction::StartScan => self.start_scan(),
             TopbarAction::ExportCsv => self.export_csv(),
+            #[cfg(windows)]
+            TopbarAction::RestartAsAdmin => self.restart_as_admin(),
             TopbarAction::None => {}
+            #[cfg(not(windows))]
+            _ => {}
         }
 
         let p = self.partitions.first();
@@ -94,6 +100,34 @@ impl DiskUiApp {
         let (tx, rx) = mpsc::channel();
         scan::spawn_scan(path, tx);
         self.scan_rx = Some(rx); self.scanning = true; self.scanned_count = 0; self.scan_error = None;
+    }
+
+    #[cfg(windows)]
+    fn restart_as_admin(&mut self) {
+        crate::applog::log("[app] 用户请求以管理员身份重启");
+        if let Some(exe) = std::env::current_exe().ok() {
+            let exe_str = exe.to_string_lossy().to_string();
+            let wide: Vec<u16> = exe_str.encode_utf16().chain(std::iter::once(0)).collect();
+            let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+            // ShellExecuteW(hwnd, verb, file, params, dir, show_cmd)
+            let ret = unsafe {
+                windows_sys::Win32::UI::Shell::ShellExecuteW(
+                    std::ptr::null_mut(),
+                    verb.as_ptr(),
+                    wide.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1, // SW_SHOWNORMAL
+                )
+            };
+            if ret as usize > 32 {
+                // 成功启动了管理员实例，退出当前进程
+                std::process::exit(0);
+            } else {
+                crate::applog::log("[app] 管理员重启失败，用户可能取消了 UAC 提示");
+                self.scan_error = Some("管理员重启失败（用户可能取消了 UAC 提示）".into());
+            }
+        }
     }
     fn export_csv(&mut self) {
         if self.partitions.is_empty() { return; }
