@@ -23,7 +23,6 @@ impl DiskInfo {
 
 #[cfg(windows)]
 pub fn enumerate_drives() -> Vec<DiskInfo> {
-    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
     const DRIVE_FIXED: u32 = 3;
     let mut result = Vec::new();

@@ -159,7 +159,7 @@ fn scan_dir(
     let self_meta = std::fs::metadata(path).ok();
     let self_modified = system_time_to_filetime(self_meta.as_ref().and_then(|m| m.modified().ok()));
     #[cfg(windows)]
-    let (self_attrs, self_phys) = {
+    let (self_attrs, _self_phys) = {
         use std::os::windows::fs::MetadataExt;
         let attrs = self_meta.as_ref().map(|m| m.file_attributes()).unwrap_or(0x10);
         let phys = self_meta.as_ref().map(|m| {

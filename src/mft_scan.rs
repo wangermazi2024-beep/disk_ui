@@ -31,7 +31,7 @@ use std::sync::mpsc::Sender;
 
 use egui::Color32;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -57,6 +57,7 @@ const NTFS_RESERVED_MAX: u64 = 16;
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
+#[allow(dead_code)]
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_REPARSE_POINT: u32 = 0xC0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
@@ -65,10 +66,13 @@ const ATTR_END: u32 = 0xFFFF_FFFF;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+#[allow(dead_code)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// IO_REPARSE_TAG_*（部分）
+#[allow(dead_code)]
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
+#[allow(dead_code)]
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
 const IO_REPARSE_TAG_WOF: u32 = 0x80000017;
 
@@ -499,7 +503,7 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
 
     // USA fixup
     if usa_count > 0 {
-        let sector_words = 256usize; // 512/2
+        let _sector_words = 256usize; // 512/2
         if usa_offset + usa_count * 2 <= rec.len() {
             let usn = [rec[usa_offset], rec[usa_offset + 1]];
             for i in 1..usa_count {

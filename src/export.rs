@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::format::{format_attributes, format_filetime};
+use crate::format::{format_attributes, format_filetime_local};
 use crate::model::Node;
 
 fn join_path(parent: &str, name: &str) -> String {
@@ -33,15 +33,15 @@ pub fn export_tree_csv(root: &Node, root_path: &str, out_path: &Path) -> io::Res
 fn write_row(
     f: &mut File, path: &str, node: &Node,
     parent_pct: f64, total_pct: f64,
-    parent_size: u64, disk_logical: u64,
+    _parent_size: u64, _disk_logical: u64,
 ) -> io::Result<()> {
     let kind = if node.is_folder() { "文件夹" } else { "文件" };
     let items = if node.is_folder() { node.file_count + node.folder_count } else { 0 };
     let files = if node.is_folder() { node.file_count } else { 0 };
     let folders = if node.is_folder() { node.folder_count } else { 0 };
-    let modified = if node.modified_ft > 0 { format_filetime(node.modified_ft) } else { String::new() };
-    let created = if node.created_ft > 0 { format_filetime(node.created_ft) } else { String::new() };
-    let accessed = if node.accessed_ft > 0 { format_filetime(node.accessed_ft) } else { String::new() };
+    let modified = if node.modified_ft > 0 { format_filetime_local(node.modified_ft) } else { String::new() };
+    let created = if node.created_ft > 0 { format_filetime_local(node.created_ft) } else { String::new() };
+    let accessed = if node.accessed_ft > 0 { format_filetime_local(node.accessed_ft) } else { String::new() };
     let reparse = if node.reparse_tag != 0 { format!("0x{:X}", node.reparse_tag) } else { String::new() };
     let reserved = if node.is_reserved { "是" } else { "" };
     let owner = &node.owner;
