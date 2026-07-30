@@ -81,14 +81,16 @@ pub fn show(
             .column(egui_extras::Column::initial(55.0).resizable(true))
             .column(egui_extras::Column::initial(55.0).resizable(true))
             .column(egui_extras::Column::initial(50.0).resizable(true))
-            .column(egui_extras::Column::initial(55.0).resizable(true))
-            .column(egui_extras::Column::initial(40.0).resizable(true))
-            .column(egui_extras::Column::remainder().at_least(60.0).clip(true)); // 所有者——remainder 填满剩余，at_least(60) 防止被挤到0
+            .column(egui_extras::Column::initial(55.0).resizable(true))   // 属性
+            .column(egui_extras::Column::initial(55.0).resizable(true))   // 重解析点
+            .column(egui_extras::Column::initial(40.0).resizable(true))   // 保留
+            .column(egui_extras::Column::initial(80.0).resizable(true).at_least(50.0).clip(true)) // 所有者——可拖动，at_least 防止被挤到0
+            .column(egui_extras::Column::remainder()); // 空列——填满剩余空间，无空白
 
         builder = builder.sense(egui::Sense::click());
         builder
             .header(ROW_H, |mut h| {
-                let cols = ["名称", "父占比", "总占比", "逻辑大小", "修改时间", "物理大小", "创建时间", "访问时间", "项目", "文件", "文件夹", "属性", "重解析点", "保留", "所有者"];
+                let cols = ["名称", "父占比", "总占比", "逻辑大小", "修改时间", "物理大小", "创建时间", "访问时间", "项目", "文件", "文件夹", "属性", "重解析点", "保留", "所有者", ""];
                 for c in cols { h.col(|ui| { ui.label(egui::RichText::new(c).strong().size(12.0).color(Color32::WHITE)); }); }
             })
             .body(|mut body| {
@@ -162,6 +164,8 @@ pub fn show(
                             row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let t=if p.is_reserved {"是"}else{"—"}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){clicked_row.set(row_idx);} });
                             // 所有者
                             row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); let t=if p.owner.is_empty(){"—".into()}else{p.owner.clone()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked(){clicked_row.set(row_idx);} });
+                            // 空列（remainder 填充）
+                            row.col(|_ui| {});
                         }
                         RowKind::Child { pi, node, abs_path, indent, depth, parent_logical } => {
                             let child = unsafe { &**node };
@@ -211,6 +215,8 @@ pub fn show(
                             row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let t=if c.is_reserved{"是"}else{"—"};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked_row.set(row_idx);}});
                             // 所有者
                             row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());let t=if c.owner.is_empty(){"—".into()}else{c.owner.clone()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked(){clicked_row.set(row_idx);}});
+                            // 空列（remainder 填充）
+                            row.col(|_ui|{});
                         }
                     }
                 });
