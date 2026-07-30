@@ -83,7 +83,7 @@ pub fn show(
             .column(egui_extras::Column::initial(50.0).resizable(true))
             .column(egui_extras::Column::initial(55.0).resizable(true))
             .column(egui_extras::Column::initial(40.0).resizable(true))
-            .column(egui_extras::Column::remainder().clip(true).at_least(40.0)); // 所有者——remainder 填满剩余，但最小 40px 防止被挤成 0
+            .column(egui_extras::Column::remainder().at_least(60.0).clip(true)); // 所有者——remainder 填满剩余，at_least(60) 防止被挤到0
 
         builder = builder.sense(egui::Sense::click());
         builder
