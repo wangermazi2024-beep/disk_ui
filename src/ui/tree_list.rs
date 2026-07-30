@@ -83,7 +83,7 @@ pub fn show(
             .column(egui_extras::Column::initial(50.0).resizable(true))
             .column(egui_extras::Column::initial(55.0).resizable(true))
             .column(egui_extras::Column::initial(40.0).resizable(true))
-            .column(egui_extras::Column::initial(80.0).resizable(true));
+            .column(egui_extras::Column::remainder().clip(true)); // 所有者——用 remainder 填满剩余宽度，自动无空白
 
         builder = builder.sense(egui::Sense::click());
         builder

@@ -44,12 +44,11 @@ pub fn show(
                 ui.add_space(4.0);
             }
             ui.add_space(10.0); ui.separator(); ui.add_space(8.0);
-            ui.label(RichText::new(format!("剩余空间: {}", human_size(free_size))).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
-            ui.add_space(6.0); ui.separator(); ui.add_space(6.0);
-            ui.label(RichText::new("扫描结果").strong().size(12.0).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
-            ui.label(RichText::new(format!("Logical: {}", human_size(scanned_logical))).size(11.5).color(Color32::from_rgb(0x4C, 0x8B, 0xF5)));
-            ui.label(RichText::new(format!("Physical: {}", human_size(scanned_physical))).size(11.5).color(Color32::from_rgb(0xF5, 0xA6, 0x23)));
+            ui.label(RichText::new("空间统计").strong().size(12.0).color(Color32::from_rgb(0xE0, 0xE0, 0xE0)));
+            ui.label(RichText::new(format!("逻辑大小: {}", human_size(scanned_logical))).size(11.5).color(Color32::from_rgb(0x4C, 0x8B, 0xF5)));
+            ui.label(RichText::new(format!("物理大小: {}", human_size(scanned_physical))).size(11.5).color(Color32::from_rgb(0xF5, 0xA6, 0x23)));
             ui.label(RichText::new(format!("系统已用: {}", human_size(used_size))).size(11.0).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+            ui.label(RichText::new(format!("剩余空间: {}", human_size(free_size))).size(11.0).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
             ui.label(RichText::new(format!("文件: {}  文件夹: {}", scanned_files, scanned_folders)).size(11.0).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
         });
 }
