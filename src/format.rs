@@ -2,6 +2,45 @@
 
 use egui::{Color32, FontId};
 
+/// 把一个 UTC FILETIME 转换成"本地时区"的 FILETIME。
+///
+/// **之前的 bug**：`format_filetime` 直接把 FILETIME（UTC）当成本地时间来拆年月日时分，
+/// 导致显示的修改时间跟 UTC 差了一个时区偏移（比如东八区会显示成比实际早 8 小时）。
+///
+/// 这里调用 Windows API `FileTimeToLocalFileTime`，它会查系统当前的时区设置
+/// （包括夏令时规则），而不是自己写死一个固定偏移量——固定偏移在有夏令时的地区
+/// 会算错，而且用户系统改了时区这段代码也不用跟着改。
+#[cfg(windows)]
+fn filetime_to_local(ft: u64) -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    if ft == 0 {
+        return 0;
+    }
+    let utc = FILETIME {
+        dwLowDateTime: (ft & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ft >> 32) as u32,
+    };
+    let mut local = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let ok = unsafe { FileTimeToLocalFileTime(&utc, &mut local) };
+    if ok == 0 {
+        // 转换失败（极少见），退回 UTC 时间总比崩溃/显示垃圾值强。
+        return ft;
+    }
+    ((local.dwHighDateTime as u64) << 32) | (local.dwLowDateTime as u64)
+}
+
+/// 非 Windows 平台（单元测试/开发机）没有系统时区 API 可调，原样返回（等价于 UTC）。
+/// 这个 crate 的实际运行环境（打包出去的 exe）永远是 Windows，所以这个分支
+/// 只影响本地跑 `cargo test` 时的行为，不影响最终用户看到的时间。
+#[cfg(not(windows))]
+fn filetime_to_local(ft: u64) -> u64 {
+    ft
+}
+
 /// 把字节数格式化成 "12.3 GB" 这种人类可读的字符串。
 pub fn human_size(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
@@ -55,6 +94,14 @@ pub fn format_filetime(ft: u64) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}",
         year, month, day, hour, min
     )
+}
+
+/// 把 Windows FILETIME（UTC）格式化成本地时区的 "YYYY-MM-DD HH:MM"。
+///
+/// UI 显示修改时间应该用这个函数，而不是直接用 `format_filetime`（那个是纯 UTC，
+/// 只在测试里验证换算算法本身对不对用）。
+pub fn format_filetime_local(ft: u64) -> String {
+    format_filetime(filetime_to_local(ft))
 }
 
 /// 把"自 1970-01-01 起的天数"换算成 (year, month, day)。

@@ -16,7 +16,7 @@ use std::cell::Cell;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 
 use crate::disk_info::DiskInfo;
-use crate::format::{format_attributes, format_filetime, human_size, human_size_compact};
+use crate::format::{format_attributes, format_filetime_local, human_size, human_size_compact};
 use crate::model::{Node, NodePath};
 
 use super::TreeAction;
@@ -187,7 +187,7 @@ pub fn show(
                                 let text = info
                                     .map(|i| i.file_system.clone())
                                     .filter(|s| !s.is_empty())
-                                    .unwrap_or_else(|| format_filetime(partition.modified_ft));
+                                    .unwrap_or_else(|| format_filetime_local(partition.modified_ft));
                                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                                     text, egui::FontId::proportional(11.0),
                                     Color32::from_rgb(0xA0, 0xC0, 0xE0));
@@ -361,7 +361,7 @@ fn draw_rows(
             row.col(|ui| {
                 let rect = ui.available_rect_before_wrap();
                 let resp = ui.allocate_rect(rect, Sense::click());
-                let s = format_filetime(child.modified_ft);
+                let s = format_filetime_local(child.modified_ft);
                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                     if s.is_empty() { "—".into() } else { s },
                     egui::FontId::proportional(11.0), Color32::from_rgb(0xC0, 0xC0, 0xC0));

@@ -364,6 +364,80 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
     }
 }
 
+/// 用 mapping pairs（NTFS data runs）手动读取一个 non-resident 属性的完整内容。
+///
+/// non-resident `$ATTRIBUTE_LIST` 没有对应的文件路径可以 `CreateFileW` 打开去查
+/// retrieval pointers（不像 `$MFT` 那样可以按路径打开），只能靠属性头里自带的
+/// mapping pairs 编码直接算出物理簇号，然后从卷设备原始读取。
+///
+/// `vol_handle` 必须是已经用 `GENERIC_READ + FILE_FLAG_NO_BUFFERING` 打开的卷设备句柄。
+/// 返回按 VCN 顺序拼接、并截断到 `data_size` 的完整内容；任何一步失败都返回 `None`
+/// （调用方应该把这个文件计入"大小解析失败"，而不是静默当成 0）。
+fn read_nonresident_attribute(
+    vol_handle: HANDLE,
+    cluster_size: u64,
+    sector_size: u32,
+    mapping_pairs: &[u8],
+    data_size: u64,
+) -> Option<Vec<u8>> {
+    let runs = crate::mft_parse::parse_data_runs(mapping_pairs);
+    if runs.is_empty() || data_size == 0 {
+        return None;
+    }
+    let mut content: Vec<u8> = Vec::with_capacity(data_size as usize);
+    for (cluster_count, lcn_opt) in runs {
+        if content.len() as u64 >= data_size {
+            break;
+        }
+        let run_bytes = cluster_count * cluster_size;
+        match lcn_opt {
+            None => {
+                // sparse run：没有物理簇，视为全 0（$ATTRIBUTE_LIST 一般不会是 sparse，
+                // 但按标准做法兜底处理，避免读越界的物理位置）。
+                content.resize(content.len() + run_bytes as usize, 0);
+            }
+            Some(lcn) if lcn >= 0 => {
+                let phys_offset = (lcn as u64) * cluster_size;
+                let to_read = ((run_bytes as usize + sector_size as usize - 1)
+                    / sector_size as usize)
+                    * sector_size as usize;
+                let mut buf = vec![0u8; to_read];
+                let mut new_pos: i64 = 0;
+                let ok = unsafe {
+                    SetFilePointerEx(vol_handle, phys_offset as i64, &mut new_pos, FILE_BEGIN)
+                };
+                if ok == 0 {
+                    return None;
+                }
+                let mut bytes_returned: u32 = 0;
+                let ok = unsafe {
+                    ReadFile(
+                        vol_handle,
+                        buf.as_mut_ptr(),
+                        to_read as u32,
+                        &mut bytes_returned,
+                        null_mut(),
+                    )
+                };
+                if ok == 0 || (bytes_returned as usize) < run_bytes.min(to_read as u64) as usize {
+                    return None;
+                }
+                buf.truncate(run_bytes as usize);
+                content.extend_from_slice(&buf);
+            }
+            Some(_negative_lcn) => {
+                // LCN 算出来是负数，说明 mapping pairs 解析有问题，放弃这个属性。
+                return None;
+            }
+        }
+    }
+    if (content.len() as u64) < data_size {
+        return None;
+    }
+    content.truncate(data_size as usize);
+    Some(content)
+}
+
 impl VolumeInfo {
     fn bytes_per_cluster(&self) -> u64 {
         self.bytes_per_cluster
@@ -651,19 +725,54 @@ pub fn scan_drive_via_mft(
             // v12: (base_record_number, Vec<(ext_record_number, instance_id)>) 映射
             // instance_id 用来在扩展记录里精确匹配 $DATA 属性（扩展记录里可能有多个 $DATA extent）
             let mut base_to_ext: HashMap<u64, Vec<(u64, u16)>> = HashMap::new();
+            // v13 诊断计数器：$ATTRIBUTE_LIST 是 non-resident 但读取失败的记录数
+            let mut nonresident_alist_missing = 0u64;
+            let mut nonresident_alist_used = 0u64;
+            let mut nonresident_alist_read_failed = 0u64;
             for (base_rec_num, rec_bytes) in &records_needing_size {
-                if let Some(alist_content) = find_attribute_list_content(rec_bytes) {
-                    let alist_entries = parse_attribute_list(alist_content);
-                    for entry in &alist_entries {
-                        // v12: 找 type==0x80($DATA, 未命名) && lowest_vcn==0 的条目
-                        //（lowest_vcn==0 的 extent 才有完整 data_size）
-                        if entry.attr_type == crate::mft_parse::ATTR_DATA && entry.lowest_vcn == 0 {
-                            ext_records_to_read.insert(entry.record_number);
-                            base_to_ext.entry(*base_rec_num).or_default().push((entry.record_number, entry.attribute_id));
+                // v13 关键修正：$ATTRIBUTE_LIST 本身可能是 non-resident 的
+                // （条目太多——常见于严重碎片化的大文件），之前遇到这种情况直接放弃，
+                // 导致这些文件的大小永远解析不出来。现在手动按 mapping pairs 读簇重建内容。
+                let alist_entries: Vec<crate::mft_parse::AttributeListEntry> =
+                    if let Some(alist_content) = find_attribute_list_content(rec_bytes) {
+                        parse_attribute_list(alist_content)
+                    } else if let Some(nr) =
+                        crate::mft_parse::find_attribute_list_nonresident(rec_bytes)
+                    {
+                        nonresident_alist_used += 1;
+                        match read_nonresident_attribute(
+                            h2,
+                            cluster_size,
+                            sector_size as u32,
+                            &nr.mapping_pairs,
+                            nr.data_size,
+                        ) {
+                            Some(content) => parse_attribute_list(&content),
+                            None => {
+                                nonresident_alist_read_failed += 1;
+                                Vec::new()
+                            }
                         }
+                    } else {
+                        nonresident_alist_missing += 1;
+                        Vec::new()
+                    };
+                for entry in &alist_entries {
+                    // v12: 找 type==0x80($DATA, 未命名) && lowest_vcn==0 的条目
+                    //（lowest_vcn==0 的 extent 才有完整 data_size）
+                    if entry.attr_type == crate::mft_parse::ATTR_DATA && entry.lowest_vcn == 0 {
+                        ext_records_to_read.insert(entry.record_number);
+                        base_to_ext
+                            .entry(*base_rec_num)
+                            .or_default()
+                            .push((entry.record_number, entry.attribute_id));
                     }
                 }
             }
+            eprintln!(
+                "[mft_scan] v13: $ATTRIBUTE_LIST 缺失={} (无该属性), non-resident 使用={} (手动读簇重建), non-resident 读取失败={}",
+                nonresident_alist_missing, nonresident_alist_used, nonresident_alist_read_failed
+            );
             eprintln!(
                 "[mft_scan] v12: 需要读 {} 个扩展记录来解析大小",
                 ext_records_to_read.len()

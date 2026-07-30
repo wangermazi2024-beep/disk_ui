@@ -274,6 +274,134 @@ pub fn find_attribute_list_content<'a>(record: &'a [u8]) -> Option<&'a [u8]> {
     None
 }
 
+/// 非 resident `$ATTRIBUTE_LIST` 的原始信息：mapping pairs（data runs 编码）+ 属性真实大小。
+///
+/// **v13 关键修正**：`$ATTRIBUTE_LIST` 本身也可能是 non-resident 的——每条 26 字节，
+/// 一条 MFT 记录只有 1024 字节（刨去记录头等，能放下的条目数约 30~40 条），一旦文件
+/// 碎片非常多（比如严重碎片化的大文件，$DATA 分布在很多个扩展记录里），条目数超过这个
+/// 上限，NTFS 就会把 `$ATTRIBUTE_LIST` 变成 non-resident。
+/// 之前 `find_attribute_list_content` 遇到这种情况直接返回 `None`，
+/// 调用方就放弃了这个文件的大小解析——real_size 永远卡在 0，这是"扫描汇总比系统已用小"
+/// 的主要原因之一（大文件、严重碎片化的文件最容易触发）。
+/// 这里手动解析 mapping pairs，让调用方能自己按簇把内容读出来重建。
+pub struct NonResidentAttrListInfo {
+    /// 属性内容的真实长度（字节），即 data_size。
+    pub data_size: u64,
+    /// mapping pairs（NTFS data runs 的紧凑变长编码），需要 `parse_data_runs` 解码。
+    pub mapping_pairs: Vec<u8>,
+}
+
+/// 在一条 MFT 记录里找 non-resident 的 `$ATTRIBUTE_LIST` 属性，返回其 mapping pairs
+/// 和真实大小。找不到（没有该属性，或该属性是 resident 的）返回 `None`。
+///
+/// non-resident 属性头布局（NTFS 标准，来源 flatcap/linux-ntfs concepts/attribute_header.html）：
+///   +0x00 type                 (4B)
+///   +0x04 length                (4B)
+///   +0x08 non_resident_flag     (1B, 非 0)
+///   +0x09 name_length           (1B)
+///   +0x0A name_offset           (2B)
+///   +0x0C flags                 (2B)
+///   +0x0E attribute_id          (2B)
+///   +0x10 starting_vcn          (8B)
+///   +0x18 last_vcn (highest)    (8B)
+///   +0x20 mapping_pairs_offset  (2B)
+///   +0x22 compression_unit      (2B)
+///   +0x24 padding               (4B)
+///   +0x28 allocated_size        (8B)
+///   +0x30 data_size             (8B)  ← 真实大小
+///   +0x38 initialized_size      (8B)
+pub fn find_attribute_list_nonresident(record: &[u8]) -> Option<NonResidentAttrListInfo> {
+    if record.len() < 48 || &record[0..4] != b"FILE" {
+        return None;
+    }
+    let first_attr_offset = u16::from_le_bytes([record[20], record[21]]) as usize;
+    let mut off = first_attr_offset;
+    while off + 16 <= record.len() {
+        let attr_type = u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+        if attr_type == ATTR_END {
+            break;
+        }
+        let attr_len = u32::from_le_bytes(record[off + 4..off + 8].try_into().unwrap()) as usize;
+        if attr_len == 0 || off + attr_len > record.len() {
+            break;
+        }
+        let non_resident = record[off + 8] != 0;
+        if attr_type == ATTR_ATTRIBUTE_LIST && non_resident {
+            if off + 0x38 > record.len() {
+                off += attr_len;
+                continue;
+            }
+            let mapping_pairs_offset =
+                u16::from_le_bytes(record[off + 0x20..off + 0x22].try_into().unwrap()) as usize;
+            let data_size = u64::from_le_bytes(record[off + 0x30..off + 0x38].try_into().unwrap());
+            let mp_start = off + mapping_pairs_offset;
+            let mp_end = off + attr_len;
+            if mapping_pairs_offset == 0 || mp_start >= mp_end || mp_end > record.len() {
+                off += attr_len;
+                continue;
+            }
+            return Some(NonResidentAttrListInfo {
+                data_size,
+                mapping_pairs: record[mp_start..mp_end].to_vec(),
+            });
+        }
+        off += attr_len;
+    }
+    None
+}
+
+/// 解析 NTFS "Mapping Pairs"（data runs 的紧凑变长编码）。
+///
+/// 返回一串 `(簇数, 绝对LCN)`：LCN 是靠每个 run 里的有符号增量累加出来的绝对簇号；
+/// sparse run（洞，没有物理位置）用 `None` 表示。
+///
+/// 编码格式：每个 run 一个 header 字节，header 低 4 位 = length 字段字节数，
+/// 高 4 位 = offset(LCN 增量) 字段字节数；header == 0x00 表示结束；
+/// offset 字段字节数 == 0 表示 sparse run。offset 字段是补码有符号数，需要符号扩展。
+/// 来源：flatcap/linux-ntfs concepts/data_runs.html，以及 NTFS-3G runlist.c 的实现。
+pub fn parse_data_runs(mapping_pairs: &[u8]) -> Vec<(u64, Option<i64>)> {
+    let mut runs = Vec::new();
+    let mut off = 0usize;
+    let mut lcn: i64 = 0;
+    while off < mapping_pairs.len() {
+        let header = mapping_pairs[off];
+        if header == 0 {
+            break;
+        }
+        let length_size = (header & 0x0F) as usize;
+        let offset_size = ((header >> 4) & 0x0F) as usize;
+        off += 1;
+        if length_size == 0 || off + length_size > mapping_pairs.len() {
+            break;
+        }
+        let mut length_bytes = [0u8; 8];
+        length_bytes[..length_size].copy_from_slice(&mapping_pairs[off..off + length_size]);
+        let cluster_count = u64::from_le_bytes(length_bytes);
+        off += length_size;
+
+        if offset_size == 0 {
+            // sparse run：没有物理簇，读取时应视为全 0。
+            runs.push((cluster_count, None));
+            continue;
+        }
+        if off + offset_size > mapping_pairs.len() {
+            break;
+        }
+        let mut offset_bytes = [0u8; 8];
+        offset_bytes[..offset_size].copy_from_slice(&mapping_pairs[off..off + offset_size]);
+        let mut delta = i64::from_le_bytes(offset_bytes);
+        // 符号扩展：offset 是补码有符号数，若最高有效字节的最高位是 1，代表负数。
+        if offset_size < 8 && (offset_bytes[offset_size - 1] & 0x80) != 0 {
+            let sign_ext_mask = !0i64 << (offset_size * 8);
+            delta |= sign_ext_mask;
+        }
+        off += offset_size;
+        lcn += delta;
+        runs.push((cluster_count, Some(lcn)));
+    }
+    runs
+}
+
 /// 解析单条 MFT FILE 记录，提取我们关心的字段。
 ///
 /// 输入是已经过 `apply_fixup` 的字节切片。返回 `None` 表示这条记录
@@ -732,6 +860,42 @@ mod tests {
         );
         // 但 attributes 应该从 $STANDARD_INFORMATION 拿到（ARCHIVE=0x20）
         assert_eq!(entry.attributes, 0x20, "attributes 应该从 $STANDARD_INFORMATION.Flags(+0x20) 拿");
+    }
+
+    /// v13 测试：mapping pairs 解码，单个 run，length=0x1000 簇，offset(LCN)=+0x1234。
+    #[test]
+    fn test_parse_data_runs_single_positive() {
+        // header: length_size=2, offset_size=2 => 0x22
+        // length = 0x1000 (2 bytes LE: 00 10)；offset = 0x1234 (2 bytes LE: 34 12)
+        let mp = vec![0x22, 0x00, 0x10, 0x34, 0x12, 0x00];
+        let runs = parse_data_runs(&mp);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0], (0x1000, Some(0x1234)));
+    }
+
+    #[test]
+    fn test_parse_data_runs_negative_offset() {
+        // 第一个 run: length_size=1,offset_size=1 -> length=0x10, offset=0x50 (lcn=0x50)
+        // 第二个 run: length=0x20, offset=0xF0 视为 i8 = -16 (lcn = 0x50-16 = 0x40)，
+        // 模拟碎片文件里 LCN 往回跳的常见情况。
+        let mp = vec![
+            0x11, 0x10, 0x50,
+            0x11, 0x20, 0xF0,
+            0x00,
+        ];
+        let runs = parse_data_runs(&mp);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], (0x10, Some(0x50)));
+        assert_eq!(runs[1], (0x20, Some(0x50 - 16)));
+    }
+
+    #[test]
+    fn test_parse_data_runs_sparse() {
+        // offset_size=0 表示 sparse run：length=0x30，没有 offset 字段
+        let mp = vec![0x01, 0x30, 0x00];
+        let runs = parse_data_runs(&mp);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0], (0x30, None));
     }
 
     /// 测试文件名优先级：WIN32 名应该胜过 DOS 8.3 短名。
