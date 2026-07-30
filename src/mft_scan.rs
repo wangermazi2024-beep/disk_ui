@@ -789,7 +789,20 @@ pub fn scan_drive_via_mft(
                 // v14 关键修正：之前 parse_record 只保留一个 $FILE_NAME，其余硬链接
                 // 位置被丢弃，导致文件在那些目录里彻底消失（哪怕文件本身完好）。
                 // 这里把每一个额外链接也挂到对应的父目录下。
+                //
+                // v15 补充：如果额外链接的 parent 和主链接的 parent 完全相同，说明
+                // 这不是"另一个目录位置的硬链接"，而是同一个位置的第二条 $FILE_NAME
+                // ——典型情况是 WIN32 长名字 + DOS 8.3 短名字（比如
+                // "nv_dispig.inf_amd64_..." 和 "NV_DIS~1.INF" 其实是同一个文件夹）。
+                // 资源管理器只会显示长名字那一个入口，短名字不是独立可见条目，所以
+                // 这种同父目录的额外链接要跳过，否则会在树里多出一个和真实文件夹
+                // 同名同父、但内容为空的幽灵条目。
+                // 只有 extra_parent 和主 parent 不同时，才是真正"文件/文件夹在另一个
+                // 目录位置也可见"的情况，才需要挂到那个目录下面。
                 for (extra_parent, extra_name) in &e.extra_links {
+                    if *extra_parent == e.parent_record {
+                        continue;
+                    }
                     children_of
                         .entry(*extra_parent)
                         .or_default()
@@ -808,12 +821,15 @@ pub fn scan_drive_via_mft(
     let mut file_paths = Vec::new();
     let mut file_sizes = Vec::new();
     let root_name = format!("{drive_letter}:\\");
-    // v13：visited 集合用来防御"父目录记录号形成环"这种损坏卷才会出现的情况。
-    // 正常 NTFS 目录不允许有多个硬链接（不然就能人为造出目录环），所以健康的卷不会
-    // 触发这个分支；但我们是直接读原始扇区解析字节，遇到磁盘损坏/位翻转导致
-    // parent_record 指向自己的子孙时，没有防御会导致递归死循环（扫描卡死）
-    // 或者同一批文件被重复计入大小（表现为"总大小"比实际大很多）。
-    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // v15：ancestors 是"当前递归栈（从 root 到当前节点的路径）"上的记录号集合，
+    // 用来防御"子孙链兜一圈又指回自己"这种真正的自引用环（损坏卷才会出现）。
+    // 注意这不是全局去重表——同一条 record 只要不在当前路径的祖先链上，就算在
+    // 树的其它分支里出现过，也会被正常完整展开（比如同一目录同时有 WIN32 长
+    // 名字和 DOS 8.3 短名字两条 $FILE_NAME 指向同一 parent 的情况，或者磁盘
+    // 损坏导致的重复父引用）。v13/v14 版本用的是全局一次性 visited，会把这些
+    // 合法/半合法的重复引用也当成环，导致第二次出现时整棵子树被清空——这是
+    // "环警告 + 文件/文件夹消失"的真正原因，已在 v15 修正。
+    let mut ancestors: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let root_node = build_subtree(
         ROOT_RECORD_INDEX,
         &root_name,
@@ -823,7 +839,7 @@ pub fn scan_drive_via_mft(
         &PathBuf::from(format!("{drive_letter}:\\")),
         &mut file_paths,
         &mut file_sizes,
-        &mut visited,
+        &mut ancestors,
     );
 
     eprintln!(
@@ -849,14 +865,24 @@ fn build_subtree(
     cur_path: &PathBuf,
     file_paths: &mut Vec<PathBuf>,
     file_sizes: &mut Vec<u64>,
-    visited: &mut std::collections::HashSet<u64>,
+    ancestors: &mut std::collections::HashSet<u64>,
 ) -> Node {
-    // v13：正常 NTFS 目录不可能有硬链接，所以健康卷上不会出现父目录环；
-    // 这里只是给"直接读原始扇区"这种玩法在磁盘损坏时兜底，避免递归死循环
-    // 或者把同一批文件/文件夹重复计入大小。
-    if !visited.insert(record_idx) {
+    // v15 关键修正：之前用的是"全局一次性" visited（record 只要出现过一次就
+    // 永久拉黑），这会把"同一目录被两条 $FILE_NAME 指向"（比如 WIN32 长名字 +
+    // DOS 8.3 短名字，常见于 DriverStore 那种批量生成短名字的目录树；或者
+    // record 在树的两个不相干分支里各被引用一次）也误判成"环"，导致第二次
+    // 出现时整棵已经建好、真实存在内容的子树被直接扔掉换成空文件夹——这才是
+    // "环警告 + 文件/文件夹凭空消失"的真正原因，不是磁盘真的坏了。
+    //
+    // 正确的环判定只能看"当前递归栈上的祖先链"：只有 record 是它自己的祖先
+    // （子孙链兜了一圈又指回自己）才是真正的自引用环，必须防死循环；record
+    // 在树的其它分支里被再次引用是完全正常的情况（哪怕是磁盘损坏产生的重复
+    // 父引用），应该照常完整展开，不能被当成环丢弃内容。
+    // ancestors 在进入本层时插入、退出前移除，只代表"从 root 到当前节点"这一条
+    // 路径上的记录号集合，不是全树累计。
+    if !ancestors.insert(record_idx) {
         eprintln!(
-            "[mft_scan] 警告：记录号 {} 在目录树里形成了环（磁盘可能有损坏），跳过避免死循环/重复计数",
+            "[mft_scan] 警告：记录号 {} 在当前递归路径上形成了真正的自引用环（磁盘可能有损坏，子孙链指回了自己），跳过其子项避免死循环",
             record_idx
         );
         return Node::new_folder_with_meta(display_name, folder_color(depth), Vec::new(), 0, 0x10);
@@ -894,7 +920,7 @@ fn build_subtree(
                     &child_path,
                     file_paths,
                     file_sizes,
-                    visited,
+                    ancestors,
                 );
                 children_nodes.push(node);
             } else {
@@ -910,6 +936,9 @@ fn build_subtree(
             }
         }
     }
+    // 退栈：离开当前节点前必须把自己从祖先链里移除，这样同一条 record 在
+    // 树的其它分支（不同祖先路径）里再次出现时，不会被误判成环。
+    ancestors.remove(&record_idx);
     Node::new_folder_with_meta(
         display_name,
         folder_color(depth),
