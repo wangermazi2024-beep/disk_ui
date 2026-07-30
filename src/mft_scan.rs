@@ -385,7 +385,16 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
 /// `vol_handle` 必须是已经用 `GENERIC_READ + FILE_FLAG_NO_BUFFERING` 打开的卷设备句柄。
 /// 返回按 VCN 顺序拼接、并截断到 `data_size` 的完整内容；任何一步失败都返回 `None`
 /// （调用方应该把这个文件计入"大小解析失败"，而不是静默当成 0）。
-/// v15: 为处理非驻留 $ATTRIBUTE_LIST 恢复调用。
+/// v17：重新启用。`mft` 库（0.7.0）解析 non-resident 属性时，不管属性类型是什么，
+/// 一律返回 `MftAttributeContent::DataRun(..)`，并不会识别出"这其实是一个
+/// non-resident 的 $ATTRIBUTE_LIST"（库源码 `from_stream_non_resident` 里没有按
+/// `header.type_code` 再分支）。碎片非常多的大文件（比如要修的那种几 GB 的虚拟机
+/// rootfs 镜像）在 extent/条目数超过一条 MFT 记录能装下的上限时，$ATTRIBUTE_LIST
+/// 就会变成 non-resident，导致库彻底"看不见"这个属性列表，我们就拿不到扩展记录里
+/// 的 $DATA 大小，文件大小最终会被 `.unwrap_or(0)` 成 0。
+/// 这个函数用于在那种情况下，凭 `mft_parse::find_attribute_list_nonresident`
+/// 解出来的 mapping pairs 手动读盘重建属性内容，再交给 `parse_attribute_list` 解析
+/// 出真正的条目。
 fn read_nonresident_attribute(
     vol_handle: HANDLE,
     cluster_size: u64,
@@ -576,7 +585,9 @@ pub fn scan_drive_via_mft(
             (mft_buffer.len() / record_size) as u64,
         ));
     }
-    unsafe { CloseHandle(vol_handle); }
+    // v17：vol_handle 先不关——下面解析属性时，如果碰到 non-resident 的
+    // $ATTRIBUTE_LIST（`mft` 库解析不了，见 read_nonresident_attribute 的注释），
+    // 需要用这个卷句柄按 mapping pairs 手动读盘重建内容。等整个解析循环结束后再关。
     eprintln!(
         "[mft_scan] MFT 缓冲区读取完成: {} 字节 (~{} 条记录)",
         mft_buffer.len(),
@@ -608,6 +619,10 @@ pub fn scan_drive_via_mft(
     let mut not_in_use = 0u64;
     let mut not_base = 0u64;
     let mut no_file_name = 0u64;
+    // v17：non-resident $ATTRIBUTE_LIST 兜底统计（碎片极多的大文件才会触发）。
+    let mut nonresident_alist_seen = 0u64;
+    let mut nonresident_alist_recovered = 0u64;
+    let mut nonresident_alist_read_failed = 0u64;
 
     for entry_result in parser.iter_entries() {
         let entry = match entry_result {
@@ -669,6 +684,35 @@ pub fn scan_drive_via_mft(
                         fname.name.clone(),
                     ));
                 }
+                // v17：non-resident 的 $ATTRIBUTE_LIST。`mft` 库对所有 non-resident
+                // 属性统一返回 DataRun，不会走到上面 AttrX20 那个分支（库不认这是个
+                // 属性列表），所以要在这里单独兜底：自己按 mapping pairs 读盘重建。
+                mft::attribute::MftAttributeContent::DataRun(_)
+                    if attr.header.type_code == mft::attribute::MftAttributeType::AttributeList =>
+                {
+                    nonresident_alist_seen += 1;
+                    if let Some(info) = crate::mft_parse::find_attribute_list_nonresident(&entry.data) {
+                        match read_nonresident_attribute(
+                            vol_handle,
+                            cluster_size,
+                            sector_size as u32,
+                            &info.mapping_pairs,
+                            info.data_size,
+                        ) {
+                            Some(content) => {
+                                nonresident_alist_recovered += 1;
+                                for e in crate::mft_parse::parse_attribute_list(&content) {
+                                    if e.attr_type == crate::mft_parse::ATTR_DATA {
+                                        attr_list.push((e.record_number, e.attribute_id));
+                                    }
+                                }
+                            }
+                            None => nonresident_alist_read_failed += 1,
+                        }
+                    } else {
+                        nonresident_alist_read_failed += 1;
+                    }
+                }
                 mft::attribute::MftAttributeContent::AttrX20(alist) => {
                     // $ATTRIBUTE_LIST：只关心指向别的记录的 $DATA(0x80) 条目。
                     // 注意：库里 `reserved` 字段的文档注释写的是"The attribute's id"
@@ -680,30 +724,7 @@ pub fn scan_drive_via_mft(
                         }
                     }
                 }
-                _ => {
-                    // v15: 非驻留 $ATTRIBUTE_LIST（DataRun 变体，库不解析内容）
-                    // 从 entry 原始字节中提取 mapping pairs，手动读簇后解析条目。
-                    if attr.header.type_code == mft::attribute::MftAttributeType::AttributeList {
-                        if let mft::attribute::header::ResidentialHeader::NonResident(nrh) = &attr.header.residential_header
-                        {
-                            let start = attr.header.start_offset as usize;
-                            let datarun_off = nrh.datarun_offset as usize;
-                            let end = start + attr.header.record_length as usize;
-                            if start + datarun_off < end && end <= entry.data.len() {
-                                let mp = &entry.data[start + datarun_off..end];
-                                if let Some(bytes) =
-                                    read_nonresident_attribute(vol_handle, cluster_size, sector_size as u32, mp, nrh.file_size)
-                                {
-                                    for e in crate::mft_parse::parse_attribute_list(&bytes) {
-                                        if e.attr_type == 0x80 {
-                                            attr_list.push((e.record_number, e.attribute_id));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                _ => {}
             }
         }
 
@@ -748,6 +769,12 @@ pub fn scan_drive_via_mft(
         "[mft_scan] 解析完成（mft 库）: 有效base={}, 目录={}, 文件={}, 无法解析={}, 已删除={}, 扩展记录={}, 无$FILE_NAME={}",
         valid_count, dir_count, file_count, fixup_failed, not_in_use, not_base, no_file_name
     );
+    eprintln!(
+        "[mft_scan] non-resident $ATTRIBUTE_LIST 兜底: 遇到 {}, 读盘重建成功 {}, 失败 {}",
+        nonresident_alist_seen, nonresident_alist_recovered, nonresident_alist_read_failed
+    );
+    // 兜底读盘用完了，vol_handle 到这里才真正没用了。
+    unsafe { CloseHandle(vol_handle); }
 
     // 用 $ATTRIBUTE_LIST 把扩展记录里的 $DATA 大小接到 base record 上——
     // 现在直接查内存里的 by_record 表就行，不用再手动读盘、手动 fixup 了。
