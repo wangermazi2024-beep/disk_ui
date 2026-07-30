@@ -29,7 +29,6 @@ pub fn show(
     ui: &mut egui::Ui,
     partitions: &[Node],
     partition_infos: &[Option<DiskInfo>],
-    dedup_sizes: &[u64],
     selected: &Option<NodePath>,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
@@ -64,10 +63,8 @@ pub fn show(
 
                     for (pi, partition) in partitions.iter().enumerate() {
                         let info = partition_infos.get(pi).and_then(|i| i.as_ref());
-                        // 一致性比例要用"物理去重后的大小"，不能用 partition.size
-                        // （树汇总，硬链接场景下会比物理占用大）。没有 dedup_size
-                        // 时（比如标准遍历回退路径极端情况）退化成 partition.size。
-                        let dedup_size = dedup_sizes.get(pi).copied().unwrap_or(partition.size);
+                        // 一致性和"扫描"展示都用 partition.size（树汇总，含硬链接近似系统已用）
+                        let dedup_size = partition.size;
                         let part_path = vec![pi];
                         let part_selected = selected.as_deref() == Some(&[pi]);
                         let total = info.map(|i| i.total_bytes).unwrap_or(partition.size.max(1));

@@ -24,9 +24,8 @@ pub struct DiskUiApp {
     partition_infos: Vec<Option<DiskInfo>>,
 
     /// 与 `partitions` 一一对应的"按物理记录去重后的大小"（详见
-    /// `scan::ScanMessage::Done` 的文档注释）。用于"扫描汇总 vs 系统已用"的
-    /// 一致性展示——不能直接用 `partitions[i].size`，那是树汇总，硬链接场景下
-    /// 会比物理占用大，拿去跟系统已用比会被误判成"异常"。
+    /// `scan::ScanMessage::Done` 的文档注释）。目前仅在日志的一致性检查中使用。
+    #[allow(dead_code)]
     dedup_sizes: Vec<u64>,
 
     /// 系统里枚举到的所有分区。当前 UI 只展示 `partitions` 里的（默认只有 C），
@@ -267,7 +266,7 @@ impl DiskUiApp {
             )
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                tree_list::show(ui, &self.partitions, &self.partition_infos, &self.dedup_sizes, &self.selected)
+                tree_list::show(ui, &self.partitions, &self.partition_infos, &self.selected)
             })
             .inner
     }

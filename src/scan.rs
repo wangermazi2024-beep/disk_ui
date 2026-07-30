@@ -114,10 +114,10 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                             }
                             let mft_elapsed = mft_start.elapsed().unwrap_or_default();
                             eprintln!(
-                                "[scan] MFT 直读完成: files={}, folders={}, size={:.2}GB, 耗时 {:.1}s",
+                                "[scan] MFT 直读完成: files={}, folders={}, size={}, 耗时 {:.1}s",
                                 root_node.file_count,
                                 root_node.folder_count,
-                                root_node.size as f64 / 1e9,
+                                crate::format::human_size(root_node.size),
                                 mft_elapsed.as_secs_f64()
                             );
                             let dedup_size = result.dedup_size;
@@ -188,10 +188,10 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                     }
                 }
                 eprintln!(
-                    "[scan] 标准遍历完成: files={}, folders={}, size={:.2}GB",
+                    "[scan] 标准遍历完成: files={}, folders={}, size={}",
                     node.file_count,
                     node.folder_count,
-                    node.size as f64 / 1e9
+                    crate::format::human_size(node.size)
                 );
                 let dedup_size_fallback = node.size;
                 // 标准目录遍历（非 MFT 直读的回退路径）没有 MFT record 号可以
