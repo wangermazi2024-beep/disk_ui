@@ -868,6 +868,12 @@ pub fn scan_drive_via_mft(
     let mut file_paths = Vec::new();
     let mut file_sizes = Vec::new();
     let root_name = format!("{drive_letter}:\\");
+    // v13：visited 集合用来防御"父目录记录号形成环"这种损坏卷才会出现的情况。
+    // 正常 NTFS 目录不允许有多个硬链接（不然就能人为造出目录环），所以健康的卷不会
+    // 触发这个分支；但我们是直接读原始扇区解析字节，遇到磁盘损坏/位翻转导致
+    // parent_record 指向自己的子孙时，没有防御会导致递归死循环（扫描卡死）
+    // 或者同一批文件被重复计入大小（表现为"总大小"比实际大很多）。
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let root_node = build_subtree(
         ROOT_RECORD_INDEX,
         &root_name,
@@ -877,6 +883,7 @@ pub fn scan_drive_via_mft(
         &PathBuf::from(format!("{drive_letter}:\\")),
         &mut file_paths,
         &mut file_sizes,
+        &mut visited,
     );
 
     eprintln!(
@@ -902,7 +909,18 @@ fn build_subtree(
     cur_path: &PathBuf,
     file_paths: &mut Vec<PathBuf>,
     file_sizes: &mut Vec<u64>,
+    visited: &mut std::collections::HashSet<u64>,
 ) -> Node {
+    // v13：正常 NTFS 目录不可能有硬链接，所以健康卷上不会出现父目录环；
+    // 这里只是给"直接读原始扇区"这种玩法在磁盘损坏时兜底，避免递归死循环
+    // 或者把同一批文件/文件夹重复计入大小。
+    if !visited.insert(record_idx) {
+        eprintln!(
+            "[mft_scan] 警告：记录号 {} 在目录树里形成了环（磁盘可能有损坏），跳过避免死循环/重复计数",
+            record_idx
+        );
+        return Node::new_folder_with_meta(display_name, folder_color(depth), Vec::new(), 0, 0x10);
+    }
     let mut children_nodes = Vec::new();
     let mut self_modified: u64 = 0;
     let mut self_attrs: u32 = 0x10;
@@ -931,6 +949,7 @@ fn build_subtree(
                     &child_path,
                     file_paths,
                     file_sizes,
+                    visited,
                 );
                 children_nodes.push(node);
             } else {
