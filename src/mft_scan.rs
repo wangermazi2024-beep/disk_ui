@@ -385,10 +385,7 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
 /// `vol_handle` 必须是已经用 `GENERIC_READ + FILE_FLAG_NO_BUFFERING` 打开的卷设备句柄。
 /// 返回按 VCN 顺序拼接、并截断到 `data_size` 的完整内容；任何一步失败都返回 `None`
 /// （调用方应该把这个文件计入"大小解析失败"，而不是静默当成 0）。
-/// v14: 这个函数不再被调用——扩展记录现在直接从 `mft` 库解析出的
-/// 内存表（`by_record`）里查，不需要再手动读盘重建 non-resident 属性内容。
-/// 保留函数体只是为了方便你对照/回滚，可以安全删除。
-#[allow(dead_code)]
+/// v15: 为处理非驻留 $ATTRIBUTE_LIST 恢复调用。
 fn read_nonresident_attribute(
     vol_handle: HANDLE,
     cluster_size: u64,
@@ -683,7 +680,30 @@ pub fn scan_drive_via_mft(
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    // v15: 非驻留 $ATTRIBUTE_LIST（DataRun 变体，库不解析内容）
+                    // 从 entry 原始字节中提取 mapping pairs，手动读簇后解析条目。
+                    if attr.header.type_code == mft::attribute::MftAttributeType::AttributeList {
+                        if let mft::attribute::header::ResidentialHeader::NonResident(nrh) = &attr.header.residential_header
+                        {
+                            let start = attr.header.start_offset as usize;
+                            let datarun_off = nrh.datarun_offset as usize;
+                            let end = start + attr.header.record_length as usize;
+                            if start + datarun_off < end && end <= entry.data.len() {
+                                let mp = &entry.data[start + datarun_off..end];
+                                if let Some(bytes) =
+                                    read_nonresident_attribute(vol_handle, cluster_size, sector_size as u32, mp, nrh.file_size)
+                                {
+                                    for e in crate::mft_parse::parse_attribute_list(&bytes) {
+                                        if e.attr_type == 0x80 {
+                                            attr_list.push((e.record_number, e.attribute_id));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
