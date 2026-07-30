@@ -30,29 +30,32 @@ fn join_path(parent: &str, name: &str) -> String {
 /// 导出整棵树到 `out_path`。`root_path` 是这棵树对应的盘符根路径（比如 `"C:\\"`），
 /// 用来拼出每一行的完整路径——`Node` 本身只存相对的子节点名字，不存完整路径。
 ///
+/// CSV 格式：`"路径",大小,分配,类型`，其中"分配"是物理分配大小（allocated_length），
+/// 跟在 WizTree 导出的 file_size,allocated 两列格式一致。
+///
 /// 返回 `(导出的文件数, 导出的文件夹数)`，跟 UI 上显示的"总扫描数"对一下账，
 /// 确认导出没有中途漏行。
 pub fn export_tree_csv(root: &Node, root_path: &str, out_path: &Path) -> io::Result<(u64, u64)> {
     let mut f = File::create(out_path)?;
     // UTF-8 BOM，跟 WizTree 导出的编码一致，Excel 打开中文路径不会乱码。
     f.write_all(&[0xEF, 0xBB, 0xBF])?;
-    writeln!(f, "路径,大小,类型")?;
+    writeln!(f, "路径,大小,分配,类型")?;
 
     let mut file_count = 0u64;
     let mut folder_count = 0u64;
     let base = root_path.to_string();
 
     // 根节点自己也写一行（大小=整个树汇总，方便跟 WizTree CSV 里 "C:\" 那一行对比）。
-    write_row(&mut f, &base, root.size, root.is_folder())?;
+    write_row(&mut f, &base, root.size, root.allocated, root.is_folder())?;
     walk(root, &base, &mut f, &mut file_count, &mut folder_count)?;
 
     Ok((file_count, folder_count))
 }
 
-fn write_row(f: &mut File, path: &str, size: u64, is_folder: bool) -> io::Result<()> {
+fn write_row(f: &mut File, path: &str, size: u64, allocated: u64, is_folder: bool) -> io::Result<()> {
     let path_str = path.replace('"', "\"\"");
     let kind = if is_folder { "D" } else { "F" };
-    writeln!(f, "\"{path_str}\",{size},{kind}")
+    writeln!(f, "\"{path_str}\",{size},{allocated},{kind}")
 }
 
 fn walk(
@@ -64,7 +67,7 @@ fn walk(
 ) -> io::Result<()> {
     for child in &node.children {
         let child_path = join_path(cur_path, &child.name);
-        write_row(f, &child_path, child.size, child.is_folder())?;
+        write_row(f, &child_path, child.size, child.allocated, child.is_folder())?;
         if child.is_folder() {
             *folder_count += 1;
             walk(child, &child_path, f, file_count, folder_count)?;

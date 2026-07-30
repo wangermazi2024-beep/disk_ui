@@ -609,6 +609,11 @@ pub fn scan_drive_via_mft(
         attributes: u32,
         unnamed_data_size: Option<u64>, // 本条记录里未命名 $DATA 的大小（若有）
         attr_list: Vec<(u64, u16)>,     // $ATTRIBUTE_LIST：(扩展记录号, attribute_id)，仅 $DATA 类型
+        /// v18: $ATTRIBUTE_LIST 中类型为 $FILE_NAME (0x30) 的条目。
+        /// 当基记录的 $FILE_NAME 太多放不下时（多硬链接场景），多余
+        /// 的 $FILE_NAME 会被移到扩展记录里。这里记录扩展记录号，
+        /// 后续从扩展记录里把 $FILE_NAME 读回来合并到基记录的 file_names。
+        fn_attr_list: Vec<u64>,
     }
     let mut by_record: HashMap<u64, ParsedRec> = HashMap::new();
 
@@ -651,6 +656,7 @@ pub fn scan_drive_via_mft(
         let mut attributes = 0u32;
         let mut unnamed_data_size: Option<u64> = None;
         let mut attr_list: Vec<(u64, u16)> = Vec::new();
+        let mut fn_attr_list: Vec<u64> = Vec::new();
 
         for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
             // 未命名 $DATA 的大小在属性头里（resident 用 data_size，non-resident 用
@@ -702,10 +708,12 @@ pub fn scan_drive_via_mft(
                             Some(content) => {
                                 nonresident_alist_recovered += 1;
                                 for e in crate::mft_parse::parse_attribute_list(&content) {
-                                    if e.attr_type == crate::mft_parse::ATTR_DATA {
-                                        attr_list.push((e.record_number, e.attribute_id));
+                                        if e.attr_type == crate::mft_parse::ATTR_DATA {
+                                            attr_list.push((e.record_number, e.attribute_id));
+                                        } else if e.attr_type == crate::mft_parse::ATTR_FILE_NAME {
+                                            fn_attr_list.push(e.record_number);
+                                        }
                                     }
-                                }
                             }
                             None => nonresident_alist_read_failed += 1,
                         }
@@ -721,6 +729,8 @@ pub fn scan_drive_via_mft(
                     for e in &alist.entries {
                         if e.attribute_type == 0x80 {
                             attr_list.push((e.segment_reference.entry as u64, e.reserved));
+                        } else if e.attribute_type == 0x30 {
+                            fn_attr_list.push(e.segment_reference.entry as u64);
                         }
                     }
                 }
@@ -762,6 +772,7 @@ pub fn scan_drive_via_mft(
             attributes,
             unnamed_data_size,
             attr_list,
+            fn_attr_list,
         });
     }
 
@@ -810,6 +821,54 @@ pub fn scan_drive_via_mft(
         resolved_count, resolve_failed
     );
 
+    // v18: extension record 中的 $FILE_NAME 硬链接合并。
+    // 当基记录的 $FILE_NAME 属性太多放不下时，NTFS 会把多余的
+    // $FILE_NAME 移到扩展记录里，同时在 $ATTRIBUTE_LIST 中添加
+    // 一条 type=0x30 的条目指向扩展记录。这里循着 fn_attr_list
+    // 把扩展记录里的 $FILE_NAME 合并回基记录。
+    let mut alist_fn_merged = 0u64;
+    // 先收集所有要合并的 (base_rec_num, [(ext_num, ext_fns)...])
+    // 避免在迭代 by_record 的同时修改它。
+    let merge_queue: Vec<(u64, Vec<(u64, Vec<(u64, String)>)>)> = {
+        by_record
+            .iter()
+            .filter(|(_, r)| r.is_base_record && !r.fn_attr_list.is_empty())
+            .map(|(rec_num, rec)| {
+                let fn_exts: Vec<(u64, Vec<(u64, String)>)> = rec
+                    .fn_attr_list
+                    .iter()
+                    .filter_map(|ext_num| {
+                        by_record.get(ext_num).and_then(|ext| {
+                            if ext.file_names.is_empty() {
+                                None
+                            } else {
+                                Some((*ext_num, ext.file_names.clone()))
+                            }
+                        })
+                    })
+                    .collect();
+                (*rec_num, fn_exts)
+            })
+            .collect()
+    };
+    for (rec_num, fn_exts) in &merge_queue {
+        if let Some(base_rec) = by_record.get_mut(rec_num) {
+            for (_ext_num, ext_fns) in fn_exts {
+                for (ep, en) in ext_fns {
+                    if !base_rec.file_names.iter().any(|(bp, bn)| bp == ep && bn == en) {
+                        base_rec.file_names.push((*ep, en.clone()));
+                        alist_fn_merged += 1;
+                    }
+                }
+            }
+        }
+    }
+    if alist_fn_merged > 0 {
+        crate::dlog!(
+            "[mft_scan] ATTRIBUTE_LIST 硬链接合并: {alist_fn_merged} 处"
+        );
+    }
+
     // 把 by_record 转换成原来下游代码认识的 entries: Vec<Option<RawEntry>>，
     // 这样后面的邻接表 / build_subtree（含 v14 硬链接修复）完全不用改。
     let max_record = by_record.keys().copied().max().unwrap_or(0);
@@ -831,6 +890,7 @@ pub fn scan_drive_via_mft(
             in_use: rec.in_use,
             is_base_record: rec.is_base_record,
             real_size,
+            allocated_size: real_size, // 等加上 allocated_length 捕获再区分
             modified_ft: rec.modified_ft,
             attributes: rec.attributes,
             extra_links,
@@ -1002,6 +1062,7 @@ fn build_subtree(
                 children_nodes.push(Node::new_file_with_meta(
                     display.to_string(),
                     entry.real_size,
+                    entry.real_size, // 暂时 file_size == allocated，等加上 allocated_length 再区分
                     file_color(),
                     entry.modified_ft,
                     entry.attributes,

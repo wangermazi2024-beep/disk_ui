@@ -347,6 +347,7 @@ fn scan_dir(
             children.push(Node::new_file_with_meta(
                 entry_name,
                 meta.len(),
+                meta.len(), // jwalk 只有逻辑大小，allocated 沿用
                 file_color(),
                 modified_ft,
                 attrs,
@@ -374,7 +375,7 @@ fn scan_dir(
 /// 演示数据：C 盘 + D 盘两个分区，各自是独立的根节点。
 pub fn demo_partitions() -> Vec<Node> {
     let leaf_with_meta = |name: &str, size: u64, ft: u64, attr: u32| {
-        Node::new_file_with_meta(name, size, file_color(), ft, attr)
+        Node::new_file_with_meta(name, size, size, file_color(), ft, attr)
     };
 
     const DEMO_FT: u64 = 13_349_788_200_000_000_000;

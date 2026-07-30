@@ -16,6 +16,10 @@ pub type NodePath = Vec<usize>;
 pub struct Node {
     pub name: String,
     pub size: u64,
+    /// 物理分配大小（allocated_length），cluster 对齐的磁盘占用。
+    /// 与 `size`（逻辑文件大小）不同：普通文件 ≈ size 向上取整到簇边界，
+    /// 稀疏文件可能远小于 size。
+    pub allocated: u64,
     pub kind: NodeKind,
     pub color: Color32,
     pub children: Vec<Node>,
@@ -41,6 +45,7 @@ impl Node {
     /// 修改时间取子节点里最大的；属性默认为 DIRECTORY。
     pub fn new_folder(name: impl Into<String>, color: Color32, children: Vec<Node>) -> Self {
         let size = children.iter().map(|c| c.size).sum();
+        let allocated = children.iter().map(|c| c.allocated).sum();
         let file_count = children.iter().map(|c| c.file_count).sum::<u64>()
             + children.iter().filter(|c| c.is_file()).count() as u64;
         let folder_count = children.iter().map(|c| c.folder_count).sum::<u64>()
@@ -49,6 +54,7 @@ impl Node {
         Self {
             name: name.into(),
             size,
+            allocated,
             kind: NodeKind::Folder,
             color,
             children,
@@ -77,12 +83,13 @@ impl Node {
     }
 
     pub fn new_file(name: impl Into<String>, size: u64, color: Color32) -> Self {
-        Self::new_file_with_meta(name, size, color, 0, 0x80)
+        Self::new_file_with_meta(name, size, size, color, 0, 0x80)
     }
 
     pub fn new_file_with_meta(
         name: impl Into<String>,
         size: u64,
+        allocated: u64,
         color: Color32,
         modified_ft: u64,
         attributes: u32,
@@ -90,6 +97,7 @@ impl Node {
         Self {
             name: name.into(),
             size,
+            allocated,
             kind: NodeKind::File,
             color,
             children: Vec::new(),

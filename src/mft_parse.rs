@@ -53,6 +53,9 @@ pub struct RawEntry {
     pub in_use: bool,
     pub is_base_record: bool,
     pub real_size: u64,
+    /// 物理分配大小（allocated_length），与 real_size（逻辑大小）不同。
+    /// 普通文件 ≈ real_size 向上取整，稀疏文件可能远小于 real_size。
+    pub allocated_size: u64,
     /// 来自 $STANDARD_INFORMATION 的 LastModificationTime（FILETIME）。
     pub modified_ft: u64,
     /// 来自 $STANDARD_INFORMATION 的 Flags（FILE_ATTRIBUTE_*）。
@@ -575,6 +578,7 @@ pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
         in_use,
         is_base_record,
         real_size,
+        allocated_size: real_size, // mft_parse 自解析无 allocated_length 信息，沿用 file_size
         modified_ft,
         attributes,
         extra_links,
