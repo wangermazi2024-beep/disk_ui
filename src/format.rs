@@ -2,43 +2,59 @@
 
 use egui::{Color32, FontId};
 
-/// 把一个 UTC FILETIME 转换成"本地时区"的 FILETIME。
+/// 把一个 UTC FILETIME 转换成"本地时区"的日历时间 (year, month, day, hour, minute)。
 ///
-/// **之前的 bug**：`format_filetime` 直接把 FILETIME（UTC）当成本地时间来拆年月日时分，
-/// 导致显示的修改时间跟 UTC 差了一个时区偏移（比如东八区会显示成比实际早 8 小时）。
+/// **之前的 bug**：直接把 FILETIME（UTC）当成本地时间拆年月日时分，显示的修改时间跟
+/// UTC 差了一个时区偏移（比如东八区会显示成比实际早 8 小时）。
 ///
-/// 这里调用 Windows API `FileTimeToLocalFileTime`，它会查系统当前的时区设置
-/// （包括夏令时规则），而不是自己写死一个固定偏移量——固定偏移在有夏令时的地区
-/// 会算错，而且用户系统改了时区这段代码也不用跟着改。
+/// **为什么不用 `FileTimeToLocalFileTime`**：微软文档明确写了——NTFS 时间戳存的是 UTC，
+/// 而 `FileTimeToLocalFileTime` 只按"当前"的夏令时状态换算，不是按"文件时间戳那个日期"
+/// 该用的夏令时状态换算。如果查看时和文件时间戳所在的季节夏令时状态不一样（比如冬天
+/// 查一个夏天改过的文件），会多算/少算 1 小时。微软文档原话："To account for daylight
+/// saving time when converting a file time to a local time, use the following sequence
+/// of functions instead of using FileTimeToLocalFileTime: FileTimeToSystemTime +
+/// SystemTimeToTzSpecificLocalTime"。
+///
+/// 这里用的是它的加强版 `SystemTimeToTzSpecificLocalTimeEx`（Windows 7 起支持），
+/// 用 `DYNAMIC_TIME_ZONE_INFORMATION` 代替旧版的 `TIME_ZONE_INFORMATION`，能正确处理
+/// 跨年份的夏令时规则变化（比如美国 2007 年改过夏令时起止日期），传 `NULL` 就是用系统
+/// 当前生效的时区设置查表转换——不用手动调 `GetTimeZoneInformation` 自己算偏移量，
+/// 系统改时区/夏令时规则更新后这里自动跟着对。
 #[cfg(windows)]
-fn filetime_to_local(ft: u64) -> u64 {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+fn filetime_to_local_ymdhm(ft: u64) -> Option<(i64, u32, u32, u64, u64)> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx};
     if ft == 0 {
-        return 0;
+        return None;
     }
-    let utc = FILETIME {
+    let utc_ft = FILETIME {
         dwLowDateTime: (ft & 0xFFFF_FFFF) as u32,
         dwHighDateTime: (ft >> 32) as u32,
     };
-    let mut local = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let ok = unsafe { FileTimeToLocalFileTime(&utc, &mut local) };
-    if ok == 0 {
-        // 转换失败（极少见），退回 UTC 时间总比崩溃/显示垃圾值强。
-        return ft;
+    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    if unsafe { FileTimeToSystemTime(&utc_ft, &mut utc_st) } == 0 {
+        return None;
     }
-    ((local.dwHighDateTime as u64) << 32) | (local.dwLowDateTime as u64)
+    let mut local_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // 第一个参数传 null：用系统当前生效的（动态）时区设置。
+    if unsafe { SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &utc_st, &mut local_st) } == 0
+    {
+        return None;
+    }
+    Some((
+        local_st.wYear as i64,
+        local_st.wMonth as u32,
+        local_st.wDay as u32,
+        local_st.wHour as u64,
+        local_st.wMinute as u64,
+    ))
 }
 
-/// 非 Windows 平台（单元测试/开发机）没有系统时区 API 可调，原样返回（等价于 UTC）。
-/// 这个 crate 的实际运行环境（打包出去的 exe）永远是 Windows，所以这个分支
-/// 只影响本地跑 `cargo test` 时的行为，不影响最终用户看到的时间。
+/// 非 Windows 平台（单元测试/开发机）没有系统时区 API 可调。这个 crate 实际运行环境
+/// （打包出去的 exe）永远是 Windows，这个分支只影响本地跑 `cargo test` 的行为。
 #[cfg(not(windows))]
-fn filetime_to_local(ft: u64) -> u64 {
-    ft
+fn filetime_to_local_ymdhm(_ft: u64) -> Option<(i64, u32, u32, u64, u64)> {
+    None
 }
 
 /// 把字节数格式化成 "12.3 GB" 这种人类可读的字符串。
@@ -100,8 +116,16 @@ pub fn format_filetime(ft: u64) -> String {
 ///
 /// UI 显示修改时间应该用这个函数，而不是直接用 `format_filetime`（那个是纯 UTC，
 /// 只在测试里验证换算算法本身对不对用）。
+///
+/// 走 Windows 时区 API 失败时（极少见，比如系统时区数据库损坏），退回纯 UTC 换算，
+/// 好过显示空白或崩溃——只是这种情况下时间会跟 UTC 差一个时区，属于降级而不是常态。
 pub fn format_filetime_local(ft: u64) -> String {
-    format_filetime(filetime_to_local(ft))
+    match filetime_to_local_ymdhm(ft) {
+        Some((year, month, day, hour, min)) => {
+            format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, min)
+        }
+        None => format_filetime(ft),
+    }
 }
 
 /// 把"自 1970-01-01 起的天数"换算成 (year, month, day)。
