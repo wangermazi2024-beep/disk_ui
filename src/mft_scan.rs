@@ -164,7 +164,7 @@ pub fn scan_volume(
 
     let root_name = format!("{}:\\", drive_letter);
     let mut size_counted: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0, &mut size_counted);
+    let mut root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0, &mut size_counted);
     eprintln!(
         "[mft_scan] 树构建完成: logical={}, physical={}, files={}, folders={}",
         crate::format::human_size(root_node.logical_size),
@@ -172,7 +172,93 @@ pub fn scan_volume(
         root_node.file_count,
         root_node.folder_count
     );
+
+    // 填充根级子项的 Owner（和 WinDirStat 一样用 GetNamedSecurityInfo）
+    let root_path = format!("{}:\\", drive_letter);
+    populate_owners(&mut root_node, &root_path);
+    eprintln!("[mft_scan] Owner 填充完成");
+
     Ok(root_node)
+}
+
+/// 递归填充 Owner（用 GetNamedSecurityInfo + LookupAccountSid）。
+/// 只填充可见的（已展开的）节点的直接子项，避免全量遍历太慢。
+fn populate_owners(node: &mut Node, path: &str) {
+    for child in &mut node.children {
+        let child_path = if path.ends_with('\\') {
+            format!("{}{}", path, child.name)
+        } else {
+            format!("{}\\{}", path, child.name)
+        };
+        child.owner = get_owner(&child_path);
+        // 只递归已展开的文件夹
+        if child.is_folder() && child.expanded {
+            populate_owners(child, &child_path);
+        }
+    }
+}
+
+/// 用 Win32 API 获取文件所有者名称（和 WinDirStat 的 GetOwner 一致）。
+fn get_owner(path: &str) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::{
+        LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut sid: PSID = std::ptr::null_mut();
+    let ok = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut sid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if ok != 0 {
+        return String::new();
+    }
+
+    let mut name_buf = [0u16; 260];
+    let mut name_len: u32 = 260;
+    let mut domain_buf = [0u16; 260];
+    let mut domain_len: u32 = 260;
+    let mut sid_type: SID_NAME_USE = 0;
+    let ok = unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name_buf.as_mut_ptr(),
+            &mut name_len,
+            domain_buf.as_mut_ptr(),
+            &mut domain_len,
+            &mut sid_type,
+        )
+    };
+    let result = if ok != 0 && name_len > 0 {
+        let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+        if domain_len > 0 {
+            let domain = String::from_utf16_lossy(&domain_buf[..domain_len as usize]);
+            format!("{}\\{}", domain, name)
+        } else {
+            name
+        }
+    } else {
+        String::new()
+    };
+
+    unsafe {
+        if !sd.is_null() {
+            LocalFree(sd as *mut _);
+        }
+    }
+    result
 }
 
 /// 第一阶段：读 MFT，填充两个哈希表。
