@@ -51,11 +51,31 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                 node.name = info.display_name();
                             }
                             eprintln!(
-                                "[scan] MFT 完成: files={}, folders={}, logical={}, 耗时 {:.1}s",
+                                "[scan] MFT 完成: files={}, folders={}, logical={}, physical={}, 耗时 {:.1}s",
                                 node.file_count, node.folder_count,
                                 crate::format::human_size(node.logical_size),
+                                crate::format::human_size(node.physical_size),
                                 start.elapsed().unwrap_or_default().as_secs_f64()
                             );
+                            // 一致性检查：physical（去重后）vs 系统已用空间
+                            if let Some(info) = &disk_info {
+                                let ratio = if info.used_bytes > 0 {
+                                    node.physical_size as f64 / info.used_bytes as f64 * 100.0
+                                } else { 0.0 };
+                                eprintln!(
+                                    "[scan] 一致性检查: physical={}, 系统已用={}, 比例={:.1}%",
+                                    crate::format::human_size(node.physical_size),
+                                    crate::format::human_size(info.used_bytes),
+                                    ratio
+                                );
+                                if ratio < 60.0 {
+                                    eprintln!("[scan] ⚠ physical 不到系统已用的 60%，可能丢数据");
+                                } else if ratio > 105.0 {
+                                    eprintln!("[scan] ⚠ physical 超过系统已用 105%，可能含 ADS 或压缩差异");
+                                } else {
+                                    eprintln!("[scan] ✓ 在合理范围内");
+                                }
+                            }
                             let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
                             return;
                         }

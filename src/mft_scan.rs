@@ -610,14 +610,14 @@ fn build_tree(
     };
     let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
 
-    // 硬链接处理：文件大小只计入第一个遇到的 base_record
-    //（和 WinDirStat 的 DoHardlinkAdjustment 类似：第一个实例保留大小，后续实例大小=0）
-    let (logical_to_use, physical_to_use) = if is_dir {
-        (logical, physical) // 目录不去重
+    // 硬链接处理：只有 Physical Size 去重，Logical Size 不去重
+    //（和 WinDirStat 一致：GetSizePhysical() 对硬链接返回 0，GetSizeLogical() 总是返回完整值）
+    let physical_to_use = if is_dir {
+        physical // 目录不去重
     } else if size_counted.insert(record) {
-        (logical, physical) // 第一次遇到这个文件，计入大小
+        physical // 第一次遇到这个文件，physical 计入
     } else {
-        (0u64, 0u64) // 硬链接的后续实例，大小=0
+        0u64 // 硬链接的后续实例，physical=0（logical 仍然计入）
     };
 
     let mut children = Vec::new();
@@ -634,16 +634,16 @@ fn build_tree(
                 let child_node = build_tree(ctx, cn.base_record, &cn.name, depth + 1, size_counted);
                 children.push(child_node);
             } else {
-                // 硬链接去重：第一次遇到计入大小，后续大小=0
-                let (cl, cp) = if size_counted.insert(cn.base_record) {
-                    (c_logical, c_physical)
+                // 硬链接去重：只有 physical 去重，logical 不去重
+                let cp = if size_counted.insert(cn.base_record) {
+                    c_physical
                 } else {
-                    (0u64, 0u64)
+                    0u64
                 };
                 children.push(Node::new_file_with_meta(
                     cn.name.clone(),
-                    cl,
-                    cp,
+                    c_logical,  // logical 总是完整值
+                    cp,         // physical 只第一次计入
                     file_color(),
                     c_modified,
                     c_created,
@@ -673,8 +673,8 @@ fn build_tree(
     } else {
         Node::new_file_with_meta(
             display_name.to_string(),
-            logical_to_use,
-            physical_to_use,
+            logical,         // logical 总是完整值
+            physical_to_use, // physical 只第一次计入
             file_color(),
             modified_ft,
             created_ft,
