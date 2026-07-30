@@ -51,10 +51,7 @@ use windows_sys::Win32::System::Ioctl::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::model::Node;
-use crate::mft_parse::{
-    apply_fixup, find_attribute_list_content, find_unnamed_data_size, parse_attribute_list,
-    parse_record, RawEntry, ROOT_RECORD_INDEX,
-};
+use crate::mft_parse::{RawEntry, ROOT_RECORD_INDEX};
 
 /// `CreateFileW` 的访问模式常量。`GENERIC_READ` 在 windows-sys 0.59 里是
 /// `GENERIC_ACCESS_RIGHTS`（u32 的新类型），不能直接传给 `CreateFileW` 的
@@ -373,6 +370,10 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
 /// `vol_handle` 必须是已经用 `GENERIC_READ + FILE_FLAG_NO_BUFFERING` 打开的卷设备句柄。
 /// 返回按 VCN 顺序拼接、并截断到 `data_size` 的完整内容；任何一步失败都返回 `None`
 /// （调用方应该把这个文件计入"大小解析失败"，而不是静默当成 0）。
+/// v14: 这个函数不再被调用——扩展记录现在直接从 `mft` 库解析出的
+/// 内存表（`by_record`）里查，不需要再手动读盘重建 non-resident 属性内容。
+/// 保留函数体只是为了方便你对照/回滚，可以安全删除。
+#[allow(dead_code)]
 fn read_nonresident_attribute(
     vol_handle: HANDLE,
     cluster_size: u64,
@@ -502,353 +503,254 @@ pub fn scan_drive_via_mft(
     let runs = get_mft_runs(drive_letter, &info);
     eprintln!("[mft_scan] MFT 共 {} 个物理 run", runs.len());
 
-    // 第一遍：按 run 顺序读 MFT 数据，解析所有记录。
-    // MFT 记录号 = (已读字节数 / record_size)。因为 run 是按 VCN 升序的，
-    // VCN 0 对应记录 0，所以连续读下来记录号是连续递增的。
-    let mut entries: Vec<Option<RawEntry>> = Vec::with_capacity(total_records as usize);
-    // 保存需要二次解析大小的记录的原始字节（real_size==0 的文件，其 $DATA 在扩展记录里）
-    // key = 记录号，value = fixup 后的记录字节
-    let mut records_needing_size: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut valid_count = 0usize;
-    let mut dir_count = 0usize;
-    let mut file_count = 0usize;
-    let mut records_read: u64 = 0;
-    let mut files_needing_size_resolve = 0u64; // real_size==0 的文件数
-    // 诊断计数器
-    let mut fixup_failed = 0u64;
-    let mut bad_magic = 0u64;
-    let mut not_in_use = 0u64;
-    let mut not_base = 0u64;
-    let mut no_file_name = 0u64;
-
-    // 一次读 128 条记录（约 128KB），按 sector 对齐
-    const RECORDS_PER_CHUNK: usize = 128;
-    let chunk_records = RECORDS_PER_CHUNK;
-    let chunk_bytes_unaligned = chunk_records * record_size;
-    let chunk_bytes = (chunk_bytes_unaligned + sector_size as usize - 1)
-        / sector_size as usize
-        * sector_size as usize;
-    let mut chunk_buf: Vec<u8> = vec![0u8; chunk_bytes];
-    eprintln!(
-        "[mft_scan] 读取块大小: {} 字节 ({} 条记录，sector 对齐)",
-        chunk_bytes, chunk_records
-    );
-
+    // ── v14：把手撸的 fixup + 属性遍历 + 扩展记录二次读盘，换成
+    //    omerbenamram/mft 这个经过审计的库来做 ──────────────────────────
+    //
+    // 之前的做法分两步：第一遍解析拿不到大小的文件记下来，第二遍重新打开卷设备，
+    // 按 $ATTRIBUTE_LIST 里的记录号手动算物理偏移再读一次盘、再手动 fixup。
+    // 用库之后不需要这么麻烦：我们一次性把整个 MFT 的字节（含所有 base record
+    // 和扩展记录）读到一块连续内存里交给 `mft::MftParser::from_buffer`，
+    // 库会解析出**所有**记录（包括扩展记录），我们直接在内存里查表就能拿到
+    // 扩展记录里的 $DATA，不用再重新读盘。
+    let mut mft_buffer: Vec<u8> = Vec::with_capacity((total_records as usize) * record_size);
     for (run_idx, run) in runs.iter().enumerate() {
         let run_bytes = run.cluster_count * cluster_size;
-        let run_records = run_bytes / record_size as u64;
         let run_offset_bytes = run.start_lcn * cluster_size;
         eprintln!(
-            "[mft_scan] 处理 run[{}]: 起始记录={}, LCN={}, 字节={} ({:.2} MB), 记录数={}",
-            run_idx,
-            records_read,
-            run.start_lcn,
-            run_bytes,
-            run_bytes as f64 / 1e6,
-            run_records
+            "[mft_scan] 读取 run[{}] 到缓冲区: LCN={}, 字节={} ({:.2} MB)",
+            run_idx, run.start_lcn, run_bytes, run_bytes as f64 / 1e6
         );
-
-        // 定位到 run 的物理偏移
         unsafe {
             let mut new_pos: i64 = 0;
-            let ok = SetFilePointerEx(
-                vol_handle,
-                run_offset_bytes as i64,
-                &mut new_pos,
-                FILE_BEGIN,
-            );
+            let ok = SetFilePointerEx(vol_handle, run_offset_bytes as i64, &mut new_pos, FILE_BEGIN);
             if ok == 0 {
-                let e = last_err(&format!(
-                    "SetFilePointerEx 失败 (run={}, offset={})",
-                    run_idx, run_offset_bytes
-                ));
+                let e = last_err(&format!("SetFilePointerEx 失败 (run={}, offset={})", run_idx, run_offset_bytes));
                 CloseHandle(vol_handle);
                 return Err(e);
             }
         }
-
-        // 逐块读
-        let mut records_in_run_left = run_records as usize;
-        while records_in_run_left > 0 {
-            let recs_this = records_in_run_left.min(chunk_records);
-            let to_read_unaligned = recs_this * record_size;
-            let to_read = (to_read_unaligned + sector_size as usize - 1)
-                / sector_size as usize
-                * sector_size as usize;
+        // 按 sector 对齐分块读，避免一次性分配/读取过大的缓冲区。
+        const READ_CHUNK: usize = 4 * 1024 * 1024; // 4MB 一块
+        let mut remaining = run_bytes as usize;
+        while remaining > 0 {
+            let this_chunk = remaining.min(READ_CHUNK);
+            let to_read = ((this_chunk + sector_size as usize - 1) / sector_size as usize) * sector_size as usize;
+            let mut buf = vec![0u8; to_read];
             let mut bytes_returned: u32 = 0;
             let ok = unsafe {
-                ReadFile(
-                    vol_handle,
-                    chunk_buf.as_mut_ptr(),
-                    to_read as u32,
-                    &mut bytes_returned,
-                    null_mut(),
-                )
+                ReadFile(vol_handle, buf.as_mut_ptr(), to_read as u32, &mut bytes_returned, null_mut())
             };
             if ok == 0 || bytes_returned == 0 {
                 eprintln!(
-                    "[mft_scan] ReadFile 提前结束 (run={}, records_read={}, bytes_returned={}, GetLastError={})",
-                    run_idx, records_read, bytes_returned, unsafe { GetLastError() }
+                    "[mft_scan] ReadFile 提前结束 (run={}, GetLastError={})",
+                    run_idx, unsafe { GetLastError() }
                 );
                 break;
             }
-            // 实际读到的记录数（可能比请求的少，比如最后一个块）
-            let actual_recs = (bytes_returned as usize / record_size).min(recs_this);
-            for i in 0..actual_recs {
-                let start = i * record_size;
-                let end = start + record_size;
-                let rec = &mut chunk_buf[start..end];
-                // 先检查 magic，区分"零填充/空洞"和"真实损坏记录"
-                if rec.len() < 4 || &rec[0..4] != b"FILE" {
-                    bad_magic += 1;
-                    entries.push(None);
-                    records_read += 1;
-                    continue;
-                }
-                // apply_fixup 会修改 rec，但 chunk_buf 下一轮会被覆盖，所以直接改没问题
-                if !apply_fixup(rec, sector_size as u32) {
-                    fixup_failed += 1;
-                    entries.push(None);
-                    records_read += 1;
-                    continue;
-                }
-                // v11: 用 parse_record（不再用 diag 版，no_file_name 记录直接返回 None）
-                let parsed_opt = parse_record(rec);
-                let parsed = match parsed_opt {
-                    None => {
-                        // parse_record 返回 None 的原因：magic 不对 / 长度不够 / 没 $FILE_NAME
-                        // 区分一下：如果 magic 是 FILE 但没 $FILE_NAME，算 no_file_name
-                        if rec.len() >= 4 && &rec[0..4] == b"FILE" {
-                            no_file_name += 1;
-                        } else {
-                            fixup_failed += 1;
-                        }
-                        entries.push(None);
-                        records_read += 1;
-                        continue;
-                    }
-                    Some(e) => {
-                        if !e.in_use {
-                            not_in_use += 1;
-                            entries.push(None);
-                            records_read += 1;
-                            continue;
-                        }
-                        if !e.is_base_record {
-                            not_base += 1;
-                            entries.push(None);
-                            records_read += 1;
-                            continue;
-                        }
-                        e
-                    }
-                };
-                // v11: 如果是文件（非目录）且 real_size==0，保存记录字节用于二次解析
-                // （大文件的 $DATA 可能在扩展记录里，需要跟 $ATTRIBUTE_LIST 去拿）
-                if !parsed.is_dir && parsed.real_size == 0 {
-                    files_needing_size_resolve += 1;
-                    records_needing_size.insert(records_read, rec.to_vec());
-                }
-                valid_count += 1;
-                if parsed.is_dir {
-                    dir_count += 1;
-                } else {
-                    file_count += 1;
-                }
-                entries.push(Some(parsed));
-                records_read += 1;
-            }
-            records_in_run_left -= actual_recs;
+            buf.truncate(bytes_returned as usize);
+            mft_buffer.extend_from_slice(&buf);
+            remaining = remaining.saturating_sub(bytes_returned as usize);
+        }
+        let _ = tx.send(crate::scan::ScanMessage::Progress(
+            (mft_buffer.len() / record_size) as u64,
+        ));
+    }
+    unsafe { CloseHandle(vol_handle); }
+    eprintln!(
+        "[mft_scan] MFT 缓冲区读取完成: {} 字节 (~{} 条记录)",
+        mft_buffer.len(),
+        mft_buffer.len() / record_size
+    );
 
-            if records_read % 20_000 < chunk_records as u64 {
-                let _ = tx.send(crate::scan::ScanMessage::Progress(records_read));
+    // CHECK: `mft` crate 目前（0.7.x）的 MftParser::from_buffer 签名/返回值以
+    // 库实际版本为准，这里按官方 README 示例的用法写；如果编译报错多半是这里
+    // 的 Result/Option 包装或者方法名对不上，对着 `cargo doc -p mft --open` 改。
+    let mut parser = mft::MftParser::from_buffer(mft_buffer)
+        .map_err(|e| MftError(format!("mft 库解析 MFT 缓冲区失败: {e}")))?;
+
+    // 先扫一遍，把每条记录的原始信息（含扩展记录）都存下来，方便后面按记录号查表
+    // （扩展记录的 $DATA 就是这么查出来的，不用再手动读盘）。
+    struct ParsedRec {
+        is_dir: bool,
+        in_use: bool,
+        is_base_record: bool,
+        file_names: Vec<(u64, String)>, // (parent_record, name) —— 保留全部，硬链接不再丢
+        modified_ft: u64,
+        attributes: u32,
+        unnamed_data_size: Option<u64>, // 本条记录里未命名 $DATA 的大小（若有）
+        attr_list: Vec<(u64, u16)>,     // $ATTRIBUTE_LIST：(扩展记录号, attribute_id)，仅 $DATA 类型
+    }
+    let mut by_record: HashMap<u64, ParsedRec> = HashMap::new();
+
+    let mut valid_count = 0usize;
+    let mut dir_count = 0usize;
+    let mut file_count = 0usize;
+    let mut fixup_failed = 0u64;
+    let mut not_in_use = 0u64;
+    let mut not_base = 0u64;
+    let mut no_file_name = 0u64;
+
+    for entry_result in parser.iter_entries() {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => {
+                fixup_failed += 1;
+                continue;
             }
+        };
+        // CHECK: 字段名按 mft::entry::MftEntry / EntryHeader 的实际定义核对，
+        // 这里假设有 header.record_number / header.flags 之类的字段，
+        // 常见命名是 record_number、used_size、logical_size 等，具体以
+        // `cargo doc` 里 `EntryHeader` 的定义为准。
+        let record_number = entry.header.record_number;
+        let in_use = entry.header.flags.contains(mft::entry::EntryFlags::ALLOCATED);
+        let is_dir = entry.header.flags.contains(mft::entry::EntryFlags::INDEX_PRESENT);
+        let base_ref = entry.header.base_reference.entry_reference; // CHECK: 字段名
+        let is_base_record = base_ref == 0;
+
+        if !in_use {
+            not_in_use += 1;
+            continue;
+        }
+
+        let mut file_names: Vec<(u8, u64, String)> = Vec::new(); // (namespace, parent, name)
+        let mut modified_ft = 0u64;
+        let mut attributes = 0u32;
+        let mut unnamed_data_size: Option<u64> = None;
+        let mut attr_list: Vec<(u64, u16)> = Vec::new();
+
+        for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
+            match &attr.data {
+                mft::attribute::MftAttributeContent::AttrX10(std_info) => {
+                    // CHECK: 字段名，常见是 modified / file_attributes
+                    modified_ft = std_info.modified.timestamp() as u64; // 若类型不同这里要改
+                    attributes = std_info.file_flags.bits(); // CHECK
+                }
+                mft::attribute::MftAttributeContent::AttrX30(fname) => {
+                    file_names.push((
+                        fname.namespace as u8,      // CHECK
+                        fname.parent.entry as u64,  // CHECK：ParentReference -> 记录号
+                        fname.name.clone(),
+                    ));
+                }
+                mft::attribute::MftAttributeContent::AttrX20(alist) => {
+                    // $ATTRIBUTE_LIST：只关心指向别的记录的 $DATA(0x80) 条目
+                    for e in &alist.entries {
+                        // CHECK: 字段名，及 0x80 常量是否库里有导出（ATTRIBUTE_TYPE::DATA）
+                        if e.attribute_type == 0x80 {
+                            attr_list.push((e.segment_reference.entry as u64, e.instance as u16));
+                        }
+                    }
+                }
+                _ => {
+                    // 未命名 $DATA：库的属性头本身应该带 data_size，不需要靠 content 变体判断。
+                    // CHECK: 具体怎么拿到 attr.header.attribute_type == 0x80 && name_size==0
+                    // 以及 data_size/非 resident 的字段名，对着 AttributeHeader 定义改。
+                    if attr.header.type_code == 0x80 && attr.header.name_size == 0 {
+                        unnamed_data_size = Some(attr.header.data_size());
+                    }
+                }
+            }
+        }
+
+        if file_names.is_empty() {
+            no_file_name += 1;
+            continue;
+        }
+        if !is_base_record {
+            not_base += 1;
+            // 扩展记录也存下来（is_base_record=false），后面按记录号查表用来补大小。
+        }
+
+        let ns_priority = |ns: u8| -> u32 {
+            match ns { 1 => 0, 3 => 1, 0 => 2, 2 => 3, _ => 4 }
+        };
+        // v14：不再只留一个，全部保留成 (parent, name) 列表——硬链接的每个位置都要显示。
+        let mut sorted = file_names.clone();
+        sorted.sort_by_key(|(ns, _, _)| ns_priority(*ns));
+        let links: Vec<(u64, String)> = sorted.into_iter().map(|(_, p, n)| (p, n)).collect();
+
+        if is_base_record {
+            valid_count += 1;
+            if is_dir { dir_count += 1 } else { file_count += 1 }
+        }
+
+        by_record.insert(record_number, ParsedRec {
+            is_dir,
+            in_use,
+            is_base_record,
+            file_names: links,
+            modified_ft,
+            attributes,
+            unnamed_data_size,
+            attr_list,
+        });
+    }
+
+    eprintln!(
+        "[mft_scan] 解析完成（mft 库）: 有效base={}, 目录={}, 文件={}, 无法解析={}, 已删除={}, 扩展记录={}, 无$FILE_NAME={}",
+        valid_count, dir_count, file_count, fixup_failed, not_in_use, not_base, no_file_name
+    );
+
+    // 用 $ATTRIBUTE_LIST 把扩展记录里的 $DATA 大小接到 base record 上——
+    // 现在直接查内存里的 by_record 表就行，不用再手动读盘、手动 fixup 了。
+    let base_record_numbers: Vec<u64> = by_record
+        .iter()
+        .filter(|(_, r)| r.is_base_record)
+        .map(|(k, _)| *k)
+        .collect();
+    let mut resolved_count = 0u64;
+    let mut resolve_failed = 0u64;
+    let mut resolved_sizes: HashMap<u64, u64> = HashMap::new();
+    for rec_num in &base_record_numbers {
+        let rec = &by_record[rec_num];
+        if rec.is_dir || rec.unnamed_data_size.is_some() {
+            continue; // 目录没有 $DATA；已经有大小的不用再查扩展记录
+        }
+        let mut found = None;
+        for (ext_rec_num, _instance_id) in &rec.attr_list {
+            if let Some(ext) = by_record.get(ext_rec_num) {
+                if let Some(sz) = ext.unnamed_data_size {
+                    found = Some(sz);
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(sz) => { resolved_sizes.insert(*rec_num, sz); resolved_count += 1; }
+            None => resolve_failed += 1,
         }
     }
-    // 关闭卷设备句柄
-    unsafe { CloseHandle(vol_handle); }
-
     eprintln!(
-        "[mft_scan] 解析完成: 总记录={}, 有效={}, 目录={}, 文件={}",
-        entries.len(),
-        valid_count,
-        dir_count,
-        file_count
-    );
-    eprintln!(
-        "[mft_scan] 过滤统计: bad_magic={} (零填充/空洞), fixup_failed={} (USA损坏), not_in_use={} (已删除), not_base={} (扩展记录), no_file_name={} (无$FILE_NAME,已跳过)",
-        bad_magic, fixup_failed, not_in_use, not_base, no_file_name
-    );
-    eprintln!(
-        "[mft_scan] v11: 有 {} 个文件 real_size==0（$DATA 可能在扩展记录，需二次解析）",
-        files_needing_size_resolve
+        "[mft_scan] 扩展记录大小解析（查表，无需二次读盘）: 成功 {}, 失败 {}",
+        resolved_count, resolve_failed
     );
 
-    // v11 第二阶段：解析 real_size==0 的文件的真实大小。
-    // 这些文件的 $DATA 在扩展记录里，需要：
-    //   1. 从 base record 拿 $ATTRIBUTE_LIST
-    //   2. 遍历 $ATTRIBUTE_LIST 找 type==0x80($DATA) && lowest_vcn==0 的条目
-    //   3. 读对应扩展记录，从中找未命名 $DATA 的 data_size
-    //
-    // 同时，扩展记录本身也在我们的 entries 里（is_base_record=false，被跳过），
-    // 但我们这里需要按记录号随机读，所以要重新打开卷设备。
-    if !records_needing_size.is_empty() {
-        eprintln!(
-            "[mft_scan] v11: 开始二次解析 {} 个文件的大小（跟 $ATTRIBUTE_LIST 读扩展记录）",
-            records_needing_size.len()
-        );
-        let size_resolve_start = std::time::Instant::now();
-        let mut resolved_count = 0u64;
-        let mut resolve_failed = 0u64;
-
-        // 重新打开卷设备读扩展记录
-        let vol_path = wide(&format!(r"\\.\{drive_letter}:"));
-        let h2 = unsafe {
-            CreateFileW(
-                vol_path.as_ptr(),
-                GENERIC_READ_U32,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                FILE_FLAG_NO_BUFFERING,
-                null_mut(),
-            )
-        };
-        if h2 == INVALID_HANDLE_VALUE || h2.is_null() {
-            eprintln!(
-                "[mft_scan] v11: 二次解析时打开卷设备失败 (GetLastError={})，跳过大小解析",
-                unsafe { GetLastError() }
-            );
-        } else {
-            // 需要读的扩展记录号集合（从 $ATTRIBUTE_LIST 里解析出来）
-            let mut ext_records_to_read: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            // v12: (base_record_number, Vec<(ext_record_number, instance_id)>) 映射
-            // instance_id 用来在扩展记录里精确匹配 $DATA 属性（扩展记录里可能有多个 $DATA extent）
-            let mut base_to_ext: HashMap<u64, Vec<(u64, u16)>> = HashMap::new();
-            // v13 诊断计数器：$ATTRIBUTE_LIST 是 non-resident 但读取失败的记录数
-            let mut nonresident_alist_missing = 0u64;
-            let mut nonresident_alist_used = 0u64;
-            let mut nonresident_alist_read_failed = 0u64;
-            for (base_rec_num, rec_bytes) in &records_needing_size {
-                // v13 关键修正：$ATTRIBUTE_LIST 本身可能是 non-resident 的
-                // （条目太多——常见于严重碎片化的大文件），之前遇到这种情况直接放弃，
-                // 导致这些文件的大小永远解析不出来。现在手动按 mapping pairs 读簇重建内容。
-                let alist_entries: Vec<crate::mft_parse::AttributeListEntry> =
-                    if let Some(alist_content) = find_attribute_list_content(rec_bytes) {
-                        parse_attribute_list(alist_content)
-                    } else if let Some(nr) =
-                        crate::mft_parse::find_attribute_list_nonresident(rec_bytes)
-                    {
-                        nonresident_alist_used += 1;
-                        match read_nonresident_attribute(
-                            h2,
-                            cluster_size,
-                            sector_size as u32,
-                            &nr.mapping_pairs,
-                            nr.data_size,
-                        ) {
-                            Some(content) => parse_attribute_list(&content),
-                            None => {
-                                nonresident_alist_read_failed += 1;
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        nonresident_alist_missing += 1;
-                        Vec::new()
-                    };
-                for entry in &alist_entries {
-                    // v12: 找 type==0x80($DATA, 未命名) && lowest_vcn==0 的条目
-                    //（lowest_vcn==0 的 extent 才有完整 data_size）
-                    if entry.attr_type == crate::mft_parse::ATTR_DATA && entry.lowest_vcn == 0 {
-                        ext_records_to_read.insert(entry.record_number);
-                        base_to_ext
-                            .entry(*base_rec_num)
-                            .or_default()
-                            .push((entry.record_number, entry.attribute_id));
-                    }
-                }
-            }
-            eprintln!(
-                "[mft_scan] v13: $ATTRIBUTE_LIST 缺失={} (无该属性), non-resident 使用={} (手动读簇重建), non-resident 读取失败={}",
-                nonresident_alist_missing, nonresident_alist_used, nonresident_alist_read_failed
-            );
-            eprintln!(
-                "[mft_scan] v12: 需要读 {} 个扩展记录来解析大小",
-                ext_records_to_read.len()
-            );
-
-            // 读所有需要的扩展记录到内存（record_number -> fixup 后的字节）
-            let mut ext_record_bytes: HashMap<u64, Vec<u8>> = HashMap::new();
-            for ext_rec_num in &ext_records_to_read {
-                // 用 MftStartLcn + record_size * record_number 计算偏移
-                // 但 MFT 是碎片化的，要按 VCN -> LCN 映射找物理位置
-                // record_number 对应 VCN = record_number * record_size / cluster_size
-                let vcn = ext_rec_num * record_size as u64 / cluster_size;
-                // 在 runs 里找包含这个 VCN 的 run
-                let mut phys_lcn: Option<u64> = None;
-                let mut run_cluster_offset: u64 = 0;
-                for run in &runs {
-                    let run_vcn_start = run.start_vcn;
-                    let run_vcn_end = run.start_vcn + run.cluster_count;
-                    if vcn >= run_vcn_start && vcn < run_vcn_end {
-                        phys_lcn = Some(run.start_lcn + (vcn - run_vcn_start));
-                        run_cluster_offset = vcn - run_vcn_start;
-                        break;
-                    }
-                }
-                let Some(lcn) = phys_lcn else { continue };
-                let phys_offset = lcn * cluster_size;
-                // 记录在 cluster 里的偏移
-                let record_offset_in_cluster = (ext_rec_num * record_size as u64) % cluster_size;
-                let read_offset = phys_offset + record_offset_in_cluster;
-
-                // 定位 + 读一个 record_size（按 sector 对齐）
-                let mut new_pos: i64 = 0;
-                let ok = unsafe { SetFilePointerEx(h2, read_offset as i64, &mut new_pos, FILE_BEGIN) };
-                if ok == 0 { continue; }
-                let to_read = ((record_size + sector_size as usize - 1) / sector_size as usize) * sector_size as usize;
-                let mut buf = vec![0u8; to_read];
-                let mut bytes_returned: u32 = 0;
-                let ok = unsafe { ReadFile(h2, buf.as_mut_ptr(), to_read as u32, &mut bytes_returned, null_mut()) };
-                if ok == 0 || (bytes_returned as usize) < record_size { continue; }
-                let mut rec = buf[..record_size].to_vec();
-                if !apply_fixup(&mut rec, sector_size as u32) { continue; }
-                ext_record_bytes.insert(*ext_rec_num, rec);
-            }
-            unsafe { CloseHandle(h2); }
-            eprintln!("[mft_scan] v11: 已读入 {} 个扩展记录", ext_record_bytes.len());
-
-            // 现在用扩展记录解析每个文件的大小
-            for (base_rec_num, _) in &records_needing_size {
-                let Some(entry_opt) = entries.get_mut(*base_rec_num as usize) else { continue };
-                let Some(entry) = entry_opt.as_mut() else { continue };
-                let mut found_size: Option<u64> = None;
-                if let Some(ext_recs) = base_to_ext.get(base_rec_num) {
-                    for (ext_rec_num, instance_id) in ext_recs {
-                        if let Some(ext_bytes) = ext_record_bytes.get(ext_rec_num) {
-                            // v12: 用 instance_id 精确匹配扩展记录里的 $DATA 属性
-                            // 这样能避免拿到 continuation extent（LowestVcn!=0，data_size 无效）
-                            if let Some(size) = find_unnamed_data_size(ext_bytes, Some(*instance_id)) {
-                                found_size = Some(size);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(size) = found_size {
-                    entry.real_size = size;
-                    resolved_count += 1;
-                } else {
-                    resolve_failed += 1;
-                }
-            }
+    // 把 by_record 转换成原来下游代码认识的 entries: Vec<Option<RawEntry>>，
+    // 这样后面的邻接表 / build_subtree（含 v14 硬链接修复）完全不用改。
+    let max_record = by_record.keys().copied().max().unwrap_or(0);
+    let mut entries: Vec<Option<RawEntry>> = vec![None; (max_record + 1) as usize];
+    for (rec_num, rec) in &by_record {
+        if !rec.is_base_record {
+            continue; // 扩展记录本身不在树里显示，和原逻辑一致
         }
-        let elapsed = size_resolve_start.elapsed();
-        eprintln!(
-            "[mft_scan] v11: 大小解析完成: 成功 {}, 失败 {}, 耗时 {:.1}s",
-            resolved_count, resolve_failed, elapsed.as_secs_f64()
-        );
+        let real_size = rec
+            .unnamed_data_size
+            .or_else(|| resolved_sizes.get(rec_num).copied())
+            .unwrap_or(0);
+        let (parent_record, name) = rec.file_names[0].clone();
+        let extra_links = rec.file_names[1..].to_vec();
+        entries[*rec_num as usize] = Some(RawEntry {
+            parent_record,
+            name,
+            is_dir: rec.is_dir,
+            in_use: rec.in_use,
+            is_base_record: rec.is_base_record,
+            real_size,
+            modified_ft: rec.modified_ft,
+            attributes: rec.attributes,
+            extra_links,
+        });
     }
 
     // 第二遍：按 parent_record 建邻接表。

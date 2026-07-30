@@ -16,6 +16,11 @@ egui = "0.35"
 egui_extras = { version = "0.35", optional = true }
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
 rand = "0.8"
+# v14: 换用 omerbenamram/mft（crates.io 主流、被多篇取证/工具评测文章
+# 引用为可信解析器，纯 safe rust）来做 MFT 记录级解析，替代我们自己手撸的
+# fixup + 属性遍历逻辑，减少"重新发明轮子"带来的边角案例 bug（比如硬链接、
+# $ATTRIBUTE_LIST 合并这些容易出错的地方）。
+mft = "0.7"
 
 # 仅 Windows 平台需要：直接读取 NTFS $MFT 的底层 API 绑定。
 # （FSCTL_GET_NTFS_VOLUME_DATA / CreateFileW / DeviceIoControl / 权限检测等）
