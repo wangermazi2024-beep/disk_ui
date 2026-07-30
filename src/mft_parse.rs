@@ -407,6 +407,14 @@ pub fn parse_data_runs(mapping_pairs: &[u8]) -> Vec<(u64, Option<i64>)> {
     runs
 }
 
+/// **v16：已废弃，不再参与主扫描流程。** 主扫描路径（`mft_scan::scan_drive_via_mft`）
+/// 现在 100% 用 `omerbenamram/mft` 这个库来做单条记录级别的解析（fixup、属性遍历、
+/// resident/non-resident 判断都是库做的），不再自己手撸字节解析。这个函数只保留
+/// 下来当回滚/对照参考，当前没有任何调用点（`mft_scan.rs` 只还在用本文件里的
+/// `RawEntry` 数据结构定义和 `parse_data_runs`——后者不是"记录解析算法"，是给
+/// Windows 卷设备直读定位 `$MFT` 自身簇碎片用的底层工具，这一步库不管，因为库的
+/// 输入就假设你已经拿到了完整的 MFT 字节缓冲区）。
+///
 /// 解析单条 MFT FILE 记录，提取我们关心的字段。
 ///
 /// 输入是已经过 `apply_fixup` 的字节切片。返回 `None` 表示这条记录
@@ -420,6 +428,7 @@ pub fn parse_data_runs(mapping_pairs: &[u8]) -> Vec<(u64, Option<i64>)> {
 ///   跟 $ATTRIBUTE_LIST 去扩展记录拿真实大小。
 /// - 不再用 $FILE_NAME.RealSize（它是 stale 的，只在改名时更新，不可靠）。
 /// - `$STANDARD_INFORMATION` 的 Flags 改成 +0x20（之前错误地用 +0x30）。
+#[allow(dead_code)]
 pub fn parse_record(record: &[u8]) -> Option<RawEntry> {
     if record.len() < 48 || &record[0..4] != b"FILE" {
         return None;

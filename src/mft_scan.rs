@@ -483,6 +483,15 @@ pub struct MftScanResult {
     pub root: Node,
     pub file_paths: Vec<PathBuf>,
     pub file_sizes: Vec<u64>,
+    /// 按 **base MFT record** 去重后的物理大小总和（每份数据只算一次，不管
+    /// 它有几个硬链接名字/挂在几个目录下）。这是跟"系统报告的已用空间"做
+    /// 一致性比较时应该用的数字。
+    ///
+    /// 注意 `root.size`（树的汇总大小）跟这个数字**不是一回事、也不应该相等**：
+    /// `root.size` 是"资源管理器逐目录浏览时看到的大小之和"——同一份硬链接数据
+    /// 如果挂在 3 个目录下，会在 3 个目录里各计一次，这是 Explorer/WizTree 的标准
+    /// 行为，不是 bug；`dedup_size` 才是"这份数据在磁盘上实际占了多少物理空间"。
+    pub dedup_size: u64,
 }
 
 /// 核心入口：对给定盘符做一次完整的 MFT 直读扫描。
@@ -777,6 +786,17 @@ pub fn scan_drive_via_mft(
         });
     }
 
+    // 按 base record 去重的物理大小：entries 本来就是 "一个 base record 一个
+    // RawEntry"（extra_links 只是额外挂载点，不会产生额外的 RawEntry），所以
+    // 这里直接对 entries 求和天然就是去重后的结果——不管一份数据被硬链接到
+    // 几个目录下，这里只统计一次，用来跟系统报告的"已用空间"做一致性比较。
+    let dedup_size: u64 = entries
+        .iter()
+        .flatten()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.real_size)
+        .sum();
+
     // 第二遍：按 parent_record 建邻接表。
     // v14: (child_idx, name_override) —— name_override 用于硬链接场景，同一条记录
     // 在不同父目录下可能用不同的名字挂载；主链接用 None（沿用 entry.name）。
@@ -843,8 +863,9 @@ pub fn scan_drive_via_mft(
     );
 
     eprintln!(
-        "[mft_scan] 树构建完成: root.size={:.2}GB, files={}, folders={}",
+        "[mft_scan] 树构建完成: root.size(树汇总,含硬链接重复计入)={:.2}GB, dedup_size(物理去重)={:.2}GB, files={}, folders={}",
         root_node.size as f64 / 1e9,
+        dedup_size as f64 / 1e9,
         root_node.file_count,
         root_node.folder_count
     );
@@ -853,6 +874,7 @@ pub fn scan_drive_via_mft(
         root: root_node,
         file_paths,
         file_sizes,
+        dedup_size,
     })
 }
 
