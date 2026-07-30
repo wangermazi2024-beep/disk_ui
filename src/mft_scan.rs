@@ -607,13 +607,17 @@ pub fn scan_drive_via_mft(
         file_names: Vec<(u64, String)>, // (parent_record, name) —— 保留全部，硬链接不再丢
         modified_ft: u64,
         attributes: u32,
-        unnamed_data_size: Option<u64>, // 本条记录里未命名 $DATA 的大小（若有）
+        unnamed_data_size: Option<u64>, // 本条记录里未命名 $DATA 的逻辑大小（file_size，若有）
+        unnamed_data_allocated: Option<u64>, // 本条记录里未命名 $DATA 的分配大小（allocated_length）
         attr_list: Vec<(u64, u16)>,     // $ATTRIBUTE_LIST：(扩展记录号, attribute_id)，仅 $DATA 类型
-        /// v18: $ATTRIBUTE_LIST 中类型为 $FILE_NAME (0x30) 的条目。
-        /// 当基记录的 $FILE_NAME 太多放不下时（多硬链接场景），多余
+        /// v18: $ATTRIBUTE_LIST 中类型为 $FILE_NAME (0x30) 的条目。当基记录的 $FILE_NAME 太多放不下时（多硬链接场景），多余
+        /// v18: $ATTRIBUTE_LIST 中类型为 $FILE_NAME (0x30) 的条目。当基记录的 $FILE_NAME 太多放不下时（多硬链接场景），多余
         /// 的 $FILE_NAME 会被移到扩展记录里。这里记录扩展记录号，
         /// 后续从扩展记录里把 $FILE_NAME 读回来合并到基记录的 file_names。
         fn_attr_list: Vec<u64>,
+        /// v18: 从 $FILE_NAME.cached physical_size 提取的分配大小兜底值。
+        /// 当 $DATA 完全拿不到时（极端稀疏/碎片化文件），至少用这个数。
+        fn_allocated_fallback: u64,
     }
     let mut by_record: HashMap<u64, ParsedRec> = HashMap::new();
 
@@ -655,6 +659,8 @@ pub fn scan_drive_via_mft(
         let mut modified_ft = 0u64;
         let mut attributes = 0u32;
         let mut unnamed_data_size: Option<u64> = None;
+        let mut unnamed_data_allocated: Option<u64> = None;
+        let mut fn_allocated_fallback: u64 = 0;
         let mut attr_list: Vec<(u64, u16)> = Vec::new();
         let mut fn_attr_list: Vec<u64> = Vec::new();
 
@@ -668,9 +674,13 @@ pub fn scan_drive_via_mft(
             {
                 use mft::attribute::header::ResidentialHeader;
                 unnamed_data_size = match &attr.header.residential_header {
-                    ResidentialHeader::Resident(rh) => Some(rh.data_size as u64),
+                    ResidentialHeader::Resident(rh) => {
+                        unnamed_data_allocated = Some(rh.data_size as u64);
+                        Some(rh.data_size as u64)
+                    },
                     ResidentialHeader::NonResident(nrh) => {
                         if nrh.vnc_first == 0 {
+                            unnamed_data_allocated = Some(nrh.allocated_length);
                             Some(nrh.file_size)
                         } else {
                             None
@@ -689,6 +699,13 @@ pub fn scan_drive_via_mft(
                         fname.parent.entry as u64,
                         fname.name.clone(),
                     ));
+                    // v18: 从 $FILE_NAME 拿 cached 的 physical_size 作为
+                    // $DATA allocated 的兜底——fragmented/sparse 文件可能
+                    // 根本找不到 $DATA，但 $FILE_NAME 的 cached 值至少不为 0。
+                    // 选最大的，因为多个 $FILE_NAME 可能给不同值，取最大最安全。
+                    if fname.physical_size > fn_allocated_fallback {
+                        fn_allocated_fallback = fname.physical_size;
+                    }
                 }
                 // v17：non-resident 的 $ATTRIBUTE_LIST。`mft` 库对所有 non-resident
                 // 属性统一返回 DataRun，不会走到上面 AttrX20 那个分支（库不认这是个
@@ -771,8 +788,10 @@ pub fn scan_drive_via_mft(
             modified_ft,
             attributes,
             unnamed_data_size,
+            unnamed_data_allocated,
             attr_list,
             fn_attr_list,
+            fn_allocated_fallback,
         });
     }
 
@@ -881,6 +900,21 @@ pub fn scan_drive_via_mft(
             .unnamed_data_size
             .or_else(|| resolved_sizes.get(rec_num).copied())
             .unwrap_or(0);
+        // v18: allocated_size 从 $DATA 取（优先 non-resident 的 allocated_length）；
+        // $DATA 取不到时依次：已解析到的 file_size > $FILE_NAME cached physical_size
+        let allocated_size = rec
+            .unnamed_data_allocated
+            .or_else(|| {
+                if real_size > 0 { Some(real_size) } else { None }
+            })
+            .unwrap_or(rec.fn_allocated_fallback);
+        // v18: real_size 也为 0 时（$DATA 完全拿不到），用 $FILE_NAME cached
+        // physical_size 兜底。至少不会出现"有文件名但大小=0"的情况。
+        let real_size = if real_size == 0 && allocated_size > 0 {
+            allocated_size
+        } else {
+            real_size
+        };
         let (parent_record, name) = rec.file_names[0].clone();
         let extra_links = rec.file_names[1..].to_vec();
         entries[*rec_num as usize] = Some(RawEntry {
@@ -890,7 +924,7 @@ pub fn scan_drive_via_mft(
             in_use: rec.in_use,
             is_base_record: rec.is_base_record,
             real_size,
-            allocated_size: real_size, // 等加上 allocated_length 捕获再区分
+            allocated_size,
             modified_ft: rec.modified_ft,
             attributes: rec.attributes,
             extra_links,
