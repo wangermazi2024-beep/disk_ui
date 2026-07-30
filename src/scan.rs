@@ -23,8 +23,14 @@ use crate::model::Node;
 
 pub enum ScanMessage {
     Progress(u64),
-    /// 扫描完成：节点树 + 该分区对应的 DiskInfo。
-    Done(Box<Node>, Option<DiskInfo>),
+    /// 扫描完成：节点树 + 该分区对应的 DiskInfo + 按物理记录去重后的大小。
+    ///
+    /// `dedup_size` 是"扫描汇总 vs 系统已用空间"一致性判断应该用的数字——
+    /// 树里的 `Node::size` 故意允许硬链接在每个出现的目录下都计一次（匹配
+    /// Explorer 逐目录浏览的展示方式），拿它去跟系统已用比会被硬链接场景
+    /// 误判成"数据异常"，所以两个数字分开传，UI 层展示各自该展示的东西：
+    /// 树/treemap 用 `Node::size`，"一致性"这个统计数字用 `dedup_size`。
+    Done(Box<Node>, Option<DiskInfo>, u64),
     Error(String),
 }
 
@@ -145,7 +151,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                     );
                                 }
                             }
-                            let _ = tx.send(ScanMessage::Done(Box::new(root_node), disk_info));
+                            let _ = tx.send(ScanMessage::Done(Box::new(root_node), disk_info, dedup_size));
                             let total = scan_start.elapsed().unwrap_or_default();
                             eprintln!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
                             return;
@@ -187,7 +193,14 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                     node.folder_count,
                     node.size as f64 / 1e9
                 );
-                let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
+                let dedup_size_fallback = node.size;
+                // 标准目录遍历（非 MFT 直读的回退路径）没有 MFT record 号可以
+                // 拿来去重，没法像 MFT 路径那样精确区分"同一份数据的多个硬链接
+                // 位置"，这里退化成直接用 node.size 本身（即不做去重）。这个
+                // 路径本来就只在拿不到管理员权限/非 NTFS 卷时才会走到，硬链接
+                // 密集的场景（DriverStore 那种）基本只出现在系统盘、走的是 MFT
+                // 直读路径，所以这里的近似不影响实际使用场景。
+                let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info, dedup_size_fallback));
             }
             Err(e) => {
                 eprintln!("[scan] 标准遍历失败: {e}");

@@ -92,7 +92,7 @@ fn main() {
                     last_progress = n;
                 }
             }
-            ScanMessage::Done(_, _) => break,
+            ScanMessage::Done(_, _, _) => break,
             ScanMessage::Error(e) => {
                 eprintln!("[verify] MFT 扫描错误: {}", e);
                 break;
@@ -131,7 +131,7 @@ fn main() {
                     eprintln!("[verify] 标准遍历进度: 已发现 {} 项", n);
                 }
             }
-            Ok(ScanMessage::Done(node, _)) => break *node,
+            Ok(ScanMessage::Done(node, _, _)) => break *node,
             Ok(ScanMessage::Error(e)) => {
                 eprintln!("[verify] 标准遍历失败: {}", e);
                 std::process::exit(1);
@@ -206,7 +206,7 @@ fn run_standard_only(root_path: &str, drive_letter: char, total: u64, used: u64)
                     eprintln!("[verify] 标准遍历进度: 已发现 {} 项", n);
                 }
             }
-            Ok(ScanMessage::Done(node, _)) => break *node,
+            Ok(ScanMessage::Done(node, _, _)) => break *node,
             Ok(ScanMessage::Error(e)) => {
                 eprintln!("[verify] 标准遍历失败: {}", e);
                 std::process::exit(1);

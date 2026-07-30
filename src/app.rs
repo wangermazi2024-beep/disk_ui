@@ -23,6 +23,12 @@ pub struct DiskUiApp {
     /// `None` 表示没查到（非 Windows、子目录扫描、或 API 失败）。
     partition_infos: Vec<Option<DiskInfo>>,
 
+    /// 与 `partitions` 一一对应的"按物理记录去重后的大小"（详见
+    /// `scan::ScanMessage::Done` 的文档注释）。用于"扫描汇总 vs 系统已用"的
+    /// 一致性展示——不能直接用 `partitions[i].size`，那是树汇总，硬链接场景下
+    /// 会比物理占用大，拿去跟系统已用比会被误判成"异常"。
+    dedup_sizes: Vec<u64>,
+
     /// 系统里枚举到的所有分区。当前 UI 只展示 `partitions` 里的（默认只有 C），
     /// 以后做多盘选择时把这个列表显示给用户即可。
     #[allow(dead_code)]
@@ -85,10 +91,12 @@ impl Default for DiskUiApp {
             };
 
         let categories = compute_categories_multi(&partitions);
+        let dedup_sizes = partitions.iter().map(|p| p.size).collect();
         Self {
             root_path,
             partitions,
             partition_infos,
+            dedup_sizes,
             all_drives,
             selected: None,
             categories,
@@ -169,7 +177,7 @@ impl eframe::App for DiskUiApp {
                 .and_then(|i| i.as_ref())
                 .map(|i| i.file_system.as_str())
                 .unwrap_or(""),
-            self.partitions.first().map(|p| p.size).unwrap_or(0),
+            self.dedup_sizes.first().copied().unwrap_or(0),
             self.partitions.first().map(|p| p.file_count).unwrap_or(0),
             self.partitions.first().map(|p| p.folder_count).unwrap_or(0),
         );
@@ -214,13 +222,19 @@ impl DiskUiApp {
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 ScanMessage::Progress(n) => self.scanned_count = n,
-                ScanMessage::Done(node, disk_info) => {
+                ScanMessage::Done(node, disk_info, dedup_size) => {
                     if self.partitions.is_empty() {
                         self.partitions.push(*node);
                         self.partition_infos.push(disk_info);
+                        self.dedup_sizes.push(dedup_size);
                     } else {
                         self.partitions[0] = *node;
                         self.partition_infos[0] = disk_info;
+                        if self.dedup_sizes.is_empty() {
+                            self.dedup_sizes.push(dedup_size);
+                        } else {
+                            self.dedup_sizes[0] = dedup_size;
+                        }
                     }
                     self.categories = compute_categories_multi(&self.partitions);
                     self.selected = None;
@@ -253,7 +267,7 @@ impl DiskUiApp {
             )
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                tree_list::show(ui, &self.partitions, &self.partition_infos, &self.selected)
+                tree_list::show(ui, &self.partitions, &self.partition_infos, &self.dedup_sizes, &self.selected)
             })
             .inner
     }

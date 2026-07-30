@@ -57,7 +57,8 @@ fn filetime_to_local_ymdhm(_ft: u64) -> Option<(i64, u32, u32, u64, u64)> {
     None
 }
 
-/// 把字节数格式化成 "12.3 GB" 这种人类可读的字符串。
+/// 把字节数格式化成 "12.34 GB" 这种人类可读的字符串（固定 2 位小数，
+/// 跟 Windows 属性对话框的显示精度对齐）。
 pub fn human_size(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
@@ -66,10 +67,11 @@ pub fn human_size(bytes: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    format!("{:.1} {}", v, units[u])
+    format!("{:.2} {}", v, units[u])
 }
 
-/// 紧凑版本：不带小数，"12GB" / "345MB"，用于磁盘行多行显示，避免换行。
+/// 紧凑版本："12.34G" / "345.00M"，用于磁盘行/树列表等空间紧张的地方，
+/// 同样固定 2 位小数（跟 `human_size` 精度一致，只是不带空格、单位缩成一个字母）。
 pub fn human_size_compact(bytes: u64) -> String {
     let units = ["B", "K", "M", "G", "T"];
     let mut v = bytes as f64;
@@ -81,7 +83,7 @@ pub fn human_size_compact(bytes: u64) -> String {
     if u == 0 {
         format!("{}{}", v as u64, units[u])
     } else {
-        format!("{:.0}{}", v, units[u])
+        format!("{:.2}{}", v, units[u])
     }
 }
 
@@ -204,26 +206,26 @@ mod tests {
 
     #[test]
     fn test_human_size_bytes() {
-        assert_eq!(human_size(0), "0.0 B");
-        assert_eq!(human_size(1), "1.0 B");
-        assert_eq!(human_size(1023), "1023.0 B");
+        assert_eq!(human_size(0), "0.00 B");
+        assert_eq!(human_size(1), "1.00 B");
+        assert_eq!(human_size(1023), "1023.00 B");
     }
 
     #[test]
     fn test_human_size_kb_mb_gb() {
-        assert_eq!(human_size(1024), "1.0 KB");
-        assert_eq!(human_size(1024 * 1024), "1.0 MB");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
-        assert_eq!(human_size(1024_u64.pow(4)), "1.0 TB");
+        assert_eq!(human_size(1024), "1.00 KB");
+        assert_eq!(human_size(1024 * 1024), "1.00 MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(human_size(1024_u64.pow(4)), "1.00 TB");
     }
 
     #[test]
     fn test_human_size_compact() {
         assert_eq!(human_size_compact(0), "0B");
-        assert_eq!(human_size_compact(1024), "1K");
-        assert_eq!(human_size_compact(1024 * 1024), "1M");
-        assert_eq!(human_size_compact(1024 * 1024 * 1024), "1G");
-        assert_eq!(human_size_compact(1024_u64.pow(4)), "1T");
+        assert_eq!(human_size_compact(1024), "1.00K");
+        assert_eq!(human_size_compact(1024 * 1024), "1.00M");
+        assert_eq!(human_size_compact(1024 * 1024 * 1024), "1.00G");
+        assert_eq!(human_size_compact(1024_u64.pow(4)), "1.00T");
     }
 
     #[test]

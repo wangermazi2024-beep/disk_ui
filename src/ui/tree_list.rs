@@ -29,6 +29,7 @@ pub fn show(
     ui: &mut egui::Ui,
     partitions: &[Node],
     partition_infos: &[Option<DiskInfo>],
+    dedup_sizes: &[u64],
     selected: &Option<NodePath>,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
@@ -63,6 +64,10 @@ pub fn show(
 
                     for (pi, partition) in partitions.iter().enumerate() {
                         let info = partition_infos.get(pi).and_then(|i| i.as_ref());
+                        // 一致性比例要用"物理去重后的大小"，不能用 partition.size
+                        // （树汇总，硬链接场景下会比物理占用大）。没有 dedup_size
+                        // 时（比如标准遍历回退路径极端情况）退化成 partition.size。
+                        let dedup_size = dedup_sizes.get(pi).copied().unwrap_or(partition.size);
                         let part_path = vec![pi];
                         let part_selected = selected.as_deref() == Some(&[pi]);
                         let total = info.map(|i| i.total_bytes).unwrap_or(partition.size.max(1));
@@ -111,10 +116,10 @@ pub fn show(
                                 let x_label = rect.min.x + 2.0;
                                 let x_value = rect.max.x - 4.0;
 
-                                // 计算一致性比例 = 扫描汇总 / 系统已用
+                                // 计算一致性比例 = 扫描汇总（物理去重）/ 系统已用
                                 let (ratio_str, ratio_color) = if let Some(i) = info {
                                     if i.used_bytes > 0 {
-                                        let r = partition.size as f64 / i.used_bytes as f64 * 100.0;
+                                        let r = dedup_size as f64 / i.used_bytes as f64 * 100.0;
                                         let color = if r < 60.0 {
                                             Color32::from_rgb(0xE0, 0x55, 0x5B) // 红：可能丢数据
                                         } else if r > 105.0 {
@@ -122,7 +127,7 @@ pub fn show(
                                         } else {
                                             Color32::from_rgb(0x34, 0xC7, 0x59) // 绿：正常
                                         };
-                                        (format!("{:.0}%", r), color)
+                                        (format!("{:.2}%", r), color)
                                     } else {
                                         ("—".into(), Color32::from_rgb(0xA0, 0xA0, 0xA0))
                                     }
@@ -135,7 +140,9 @@ pub fn show(
                                         (Color32::from_rgb(0xE0, 0xE0, 0xE0), "总大小", human_size_compact(i.total_bytes)),
                                         (Color32::from_rgb(0xF5, 0xA6, 0x23), "已分配", human_size_compact(i.used_bytes)),
                                         (Color32::from_rgb(0x34, 0xC7, 0x59), "未分配", human_size_compact(i.free_bytes)),
-                                        (Color32::from_rgb(0x4C, 0x8B, 0xF5), "扫描",   human_size_compact(partition.size)),
+                                        // 这里展示的是"物理去重"口径，跟下面的"一致性"是同一套数字，
+                                        // 不会出现"扫描汇总数字对不上一致性百分比"这种自相矛盾。
+                                        (Color32::from_rgb(0x4C, 0x8B, 0xF5), "扫描",   human_size_compact(dedup_size)),
                                         (ratio_color,                      "一致性", ratio_str),
                                     ]
                                 } else {

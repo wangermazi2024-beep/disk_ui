@@ -95,7 +95,7 @@ pub fn show(
             } else {
                 Color32::from_rgb(0x34, 0xC7, 0x59)
             };
-            ui.label(RichText::new(format!("一致性: {:.0}%", ratio)).size(11.5).color(ratio_color));
+            ui.label(RichText::new(format!("一致性: {:.2}%", ratio)).size(11.5).color(ratio_color));
             ui.label(RichText::new(format!("文件: {}  文件夹: {}", scanned_files, scanned_folders)).size(11.0).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
         });
 }
