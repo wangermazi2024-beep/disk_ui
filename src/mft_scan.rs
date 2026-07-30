@@ -694,17 +694,24 @@ pub fn scan_drive_via_mft(
                     attributes = std_info.file_flags.bits();
                 }
                 mft::attribute::MftAttributeContent::AttrX30(fname) => {
-                    file_names.push((
-                        fname.namespace.clone() as u8, // FileNamespace 是 #[repr(u8)]，可以直接转
-                        fname.parent.entry as u64,
-                        fname.name.clone(),
-                    ));
-                    // v18: 从 $FILE_NAME 拿 cached 的 physical_size 作为
-                    // $DATA allocated 的兜底——fragmented/sparse 文件可能
-                    // 根本找不到 $DATA，但 $FILE_NAME 的 cached 值至少不为 0。
-                    // 选最大的，因为多个 $FILE_NAME 可能给不同值，取最大最安全。
-                    if fname.physical_size > fn_allocated_fallback {
-                        fn_allocated_fallback = fname.physical_size;
+                    // v18: 跳过 DOS 8.3 短名（WinDirStat 同样只跳过短名）。只处理
+                    // WIN32 / WIN32_AND_DOS / POSIX 命名空间。短名不参与树构建。
+                    let ns = fname.namespace.clone() as u8;
+                    if ns == 2 {
+                        // DOS 短名：跳过，不加入 file_names。
+                        // 但仍需捕获 physical_size 作为兜底。
+                        if fname.physical_size > fn_allocated_fallback {
+                            fn_allocated_fallback = fname.physical_size;
+                        }
+                    } else {
+                        file_names.push((
+                            ns,
+                            fname.parent.entry as u64,
+                            fname.name.clone(),
+                        ));
+                        if fname.physical_size > fn_allocated_fallback {
+                            fn_allocated_fallback = fname.physical_size;
+                        }
                     }
                 }
                 // v17：non-resident 的 $ATTRIBUTE_LIST。`mft` 库对所有 non-resident
@@ -955,19 +962,10 @@ pub fn scan_drive_via_mft(
                 // 位置被丢弃，导致文件在那些目录里彻底消失（哪怕文件本身完好）。
                 // 这里把每一个额外链接也挂到对应的父目录下。
                 //
-                // v15 补充：如果额外链接的 parent 和主链接的 parent 完全相同，说明
-                // 这不是"另一个目录位置的硬链接"，而是同一个位置的第二条 $FILE_NAME
-                // ——典型情况是 WIN32 长名字 + DOS 8.3 短名字（比如
-                // "nv_dispig.inf_amd64_..." 和 "NV_DIS~1.INF" 其实是同一个文件夹）。
-                // 资源管理器只会显示长名字那一个入口，短名字不是独立可见条目，所以
-                // 这种同父目录的额外链接要跳过，否则会在树里多出一个和真实文件夹
-                // 同名同父、但内容为空的幽灵条目。
-                // 只有 extra_parent 和主 parent 不同时，才是真正"文件/文件夹在另一个
-                // 目录位置也可见"的情况，才需要挂到那个目录下面。
+                // v18: 不再用 parent 去重过滤——DOS 8.3 短名已经在 $FILE_NAME 解析时
+                // 被跳过（见 AttrX30 分支的 ns==2 检测），所以所有剩下的
+                // extra_links 都是真正有效的硬链接位置，直接全挂到对应父目录。
                 for (extra_parent, extra_name) in &e.extra_links {
-                    if *extra_parent == e.parent_record {
-                        continue;
-                    }
                     children_of
                         .entry(*extra_parent)
                         .or_default()
