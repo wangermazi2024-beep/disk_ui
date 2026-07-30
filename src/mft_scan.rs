@@ -93,6 +93,21 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// `mft` 库把 $STANDARD_INFORMATION 里的 FILETIME 转成了 `jiff::Timestamp`（见它的
+/// `windows_filetime_to_timestamp`），但我们项目下游（`format.rs::format_filetime_local`）
+/// 是按原始 Windows FILETIME（1601-01-01 起 100ns 单位）来格式化的，所以这里转回去。
+/// 只做到秒级精度（原逻辑本来也只用来显示到分钟），足够用。
+fn jiff_timestamp_to_windows_filetime(ts: jiff::Timestamp) -> u64 {
+    const WINDOWS_TO_UNIX_EPOCH_SECS: i64 = 11_644_473_600;
+    let unix_secs = ts.as_second();
+    let windows_secs = unix_secs + WINDOWS_TO_UNIX_EPOCH_SECS;
+    if windows_secs <= 0 {
+        0
+    } else {
+        (windows_secs as u64).saturating_mul(10_000_000)
+    }
+}
+
 /// 判断某个盘符是否为 NTFS，且当前权限下可以直接读卷设备。
 ///
 /// **注意**：这个检查只验证"管理员身份 + 卷是 NTFS + 能打开卷设备"。
@@ -562,9 +577,7 @@ pub fn scan_drive_via_mft(
         mft_buffer.len() / record_size
     );
 
-    // CHECK: `mft` crate 目前（0.7.x）的 MftParser::from_buffer 签名/返回值以
-    // 库实际版本为准，这里按官方 README 示例的用法写；如果编译报错多半是这里
-    // 的 Result/Option 包装或者方法名对不上，对着 `cargo doc -p mft --open` 改。
+    // MftParser::from_buffer / iter_entries 的用法已经对着 0.7.0 的实际源码核对过。
     let mut parser = mft::MftParser::from_buffer(mft_buffer)
         .map_err(|e| MftError(format!("mft 库解析 MFT 缓冲区失败: {e}")))?;
 
@@ -598,14 +611,13 @@ pub fn scan_drive_via_mft(
                 continue;
             }
         };
-        // CHECK: 字段名按 mft::entry::MftEntry / EntryHeader 的实际定义核对，
-        // 这里假设有 header.record_number / header.flags 之类的字段，
-        // 常见命名是 record_number、used_size、logical_size 等，具体以
-        // `cargo doc` 里 `EntryHeader` 的定义为准。
+        // 下面这些字段名已经对着 omerbenamram/mft 的实际源码（entry.rs / header.rs /
+        // attribute/x10.rs / x30.rs / x20.rs）核对过，不再是猜测。
         let record_number = entry.header.record_number;
-        let in_use = entry.header.flags.contains(mft::entry::EntryFlags::ALLOCATED);
-        let is_dir = entry.header.flags.contains(mft::entry::EntryFlags::INDEX_PRESENT);
-        let base_ref = entry.header.base_reference.entry_reference; // CHECK: 字段名
+        // 库自带了这两个便利方法，直接用，不用自己翻 flags 位。
+        let in_use = entry.is_allocated();
+        let is_dir = entry.is_dir();
+        let base_ref = entry.header.base_reference.entry; // MftReference{ entry, sequence }
         let is_base_record = base_ref == 0;
 
         if !in_use {
@@ -620,46 +632,58 @@ pub fn scan_drive_via_mft(
         let mut attr_list: Vec<(u64, u16)> = Vec::new();
 
         for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
+            // 未命名 $DATA 的大小在属性头里（resident 用 data_size，non-resident 用
+            // file_size，且只有 vnc_first==0 的 extent 才有效），跟内容变体（Resident $DATA
+            // 走 AttrX80，non-resident $DATA 其实走的是 DataRun 变体）无关，所以先在这里统一处理，
+            // 不用在下面的 match 分支里再判断一次。
+            if attr.header.type_code == mft::attribute::MftAttributeType::DATA
+                && attr.header.name_size == 0
+            {
+                use mft::attribute::header::ResidentialHeader;
+                unnamed_data_size = match &attr.header.residential_header {
+                    ResidentialHeader::Resident(rh) => Some(rh.data_size as u64),
+                    ResidentialHeader::NonResident(nrh) => {
+                        if nrh.vnc_first == 0 { Some(nrh.file_size) } else { None }
+                    }
+                };
+            }
             match &attr.data {
                 mft::attribute::MftAttributeContent::AttrX10(std_info) => {
-                    // CHECK: 字段名，常见是 modified / file_attributes
-                    modified_ft = std_info.modified.timestamp() as u64; // 若类型不同这里要改
-                    attributes = std_info.file_flags.bits(); // CHECK
+                    modified_ft = jiff_timestamp_to_windows_filetime(std_info.modified);
+                    attributes = std_info.file_flags.bits();
                 }
                 mft::attribute::MftAttributeContent::AttrX30(fname) => {
                     file_names.push((
-                        fname.namespace as u8,      // CHECK
-                        fname.parent.entry as u64,  // CHECK：ParentReference -> 记录号
-                        fname.name.clone(),
+                        fname.namespace as u8, // FileNamespace 是 #[repr(u8)]，可以直接转
+                        fname.parent.entry as u64,
+                        fname.name.to_utf8_string(),
                     ));
                 }
                 mft::attribute::MftAttributeContent::AttrX20(alist) => {
-                    // $ATTRIBUTE_LIST：只关心指向别的记录的 $DATA(0x80) 条目
+                    // $ATTRIBUTE_LIST：只关心指向别的记录的 $DATA(0x80) 条目。
+                    // 注意：库里 `reserved` 字段的文档注释写的是"The attribute's id"
+                    // （这是 NTFS 规范里这个字段的真实含义，字段名 reserved 只是历史遗留），
+                    // 这就是我们之前叫 instance_id/attribute_id 的东西。
                     for e in &alist.entries {
-                        // CHECK: 字段名，及 0x80 常量是否库里有导出（ATTRIBUTE_TYPE::DATA）
                         if e.attribute_type == 0x80 {
-                            attr_list.push((e.segment_reference.entry as u64, e.instance as u16));
+                            attr_list.push((e.segment_reference.entry as u64, e.reserved));
                         }
                     }
                 }
-                _ => {
-                    // 未命名 $DATA：库的属性头本身应该带 data_size，不需要靠 content 变体判断。
-                    // CHECK: 具体怎么拿到 attr.header.attribute_type == 0x80 && name_size==0
-                    // 以及 data_size/非 resident 的字段名，对着 AttributeHeader 定义改。
-                    if attr.header.type_code == 0x80 && attr.header.name_size == 0 {
-                        unnamed_data_size = Some(attr.header.data_size());
-                    }
-                }
+                _ => {}
             }
         }
 
-        if file_names.is_empty() {
+        // 关键修正：扩展记录（is_base_record=false）通常没有 $FILE_NAME，
+        // 但它们必须留在 by_record 表里——不然下面 base record 按 $ATTRIBUTE_LIST
+        // 查扩展记录大小的时候会查不到，等于白做了 v14 这次改造。
+        // 只有 base record 才需要有 $FILE_NAME，没有的话才真的算"无法显示"要跳过。
+        if is_base_record && file_names.is_empty() {
             no_file_name += 1;
             continue;
         }
         if !is_base_record {
             not_base += 1;
-            // 扩展记录也存下来（is_base_record=false），后面按记录号查表用来补大小。
         }
 
         let ns_priority = |ns: u8| -> u32 {
