@@ -642,7 +642,8 @@ pub fn scan_drive_via_mft(
 
         for attr in entry.iter_attributes().filter_map(|a| a.ok()) {
             // 未命名 $DATA 的大小在属性头里（resident 用 data_size，non-resident 用
-            // file_size，且只有 vnc_first==0 的 extent 才有效），跟内容变体（Resident $DATA
+            // allocated_length — 这是簇对齐后的物理占用大小，和 WizTree/Explorer
+            // "已用空间"的口径一致，只有 vnc_first==0 的 extent 才有效）
             // 走 AttrX80，non-resident $DATA 其实走的是 DataRun 变体）无关，所以先在这里统一处理，
             // 不用在下面的 match 分支里再判断一次。
             if attr.header.type_code == mft::attribute::MftAttributeType::DATA
@@ -652,7 +653,11 @@ pub fn scan_drive_via_mft(
                 unnamed_data_size = match &attr.header.residential_header {
                     ResidentialHeader::Resident(rh) => Some(rh.data_size as u64),
                     ResidentialHeader::NonResident(nrh) => {
-                        if nrh.vnc_first == 0 { Some(nrh.file_size) } else { None }
+                        if nrh.vnc_first == 0 {
+                            Some(nrh.allocated_length)
+                        } else {
+                            None
+                        }
                     }
                 };
             }
