@@ -656,7 +656,7 @@ pub fn scan_drive_via_mft(
                     file_names.push((
                         fname.namespace as u8, // FileNamespace 是 #[repr(u8)]，可以直接转
                         fname.parent.entry as u64,
-                        fname.name.to_utf8_string(),
+                        fname.name.clone(),
                     ));
                 }
                 mft::attribute::MftAttributeContent::AttrX20(alist) => {
