@@ -1,431 +1,137 @@
-//! WinDirStat 风格 MFT 扫描引擎：自解析二进制，base record 折叠，两表法建树。
+//! WinDirStat 风格的 NTFS MFT 直读扫描（v2 完全重构）。
 //!
-//! 算法来源：WinDirStat (FinderNtfs.cpp)
-//! 核心差异（对比旧 mft crate 方案）：
-//! 1. 直接读卷设备 + FSCTL 定位 MFT → 自解析，无外部库依赖
-//! 2. Base record 折叠：扩展记录通过 base_ref 自动归入基记录，无 ATTRIBUTE_LIST 遍历
-//! 3. 两表法：HashMap<FRN, FileRecordBase> + HashMap<ParentFRN, Vec<(FRN, Name)>>
-//! 4. PhysicalSize 来自 $DATA 的 AllocatedLength，LogicalSize 来自 FileSize
-//! 5. DOS 短名在 $FILE_NAME 解析时直接跳过
+//! ## 算法（参考 github.com/windirstat/windirstat FinderNtfs.cpp）
+//!
+//! **核心设计：两阶段 + 哈希表聚合**
+//!
+//! 1. **第一阶段（load_volume）**：读整张 MFT，对每条记录解析属性，
+//!    把属性聚合到 **base record** 的哈希表条目里（扩展记录的属性自动写到 base record）。
+//!    - `base_file_records: HashMap<record_number, FileRecordBase>` — 每个文件的属性
+//!    - `parent_to_children: HashMap<parent_record_number, Vec<(name, base_record)>>` — 父→子映射
+//!
+//! 2. **第二阶段（build_tree）**：从根目录（record 5）递归，用 `parent_to_children` 找子项，
+//!    用 `base_file_records` 拿属性，构建 Node 树。
+//!
+//! **关键**：不需要解析 `$ATTRIBUTE_LIST`！因为扩展记录的 `$DATA` 属性在第一阶段
+//! 就已经聚合到 base record 的 `FileRecordBase` 里了。
+//!
+//! ## MFT 物理读取
+//! - 打开卷设备 `\\.\C:`（`FILE_READ_DATA | FILE_READ_ATTRIBUTES`，`FILE_FLAG_NO_BUFFERING`）
+//! - `FSCTL_GET_NTFS_VOLUME_DATA` 拿卷信息
+//! - 打开 `\\.\C:\$MFT::$DATA`（`FILE_READ_ATTRIBUTES`）+ `FSCTL_GET_RETRIEVAL_POINTERS` 拿 MFT 簇映射
+//! - 按 run 顺序读 MFT
+//!
+//! **不需要 SeBackupPrivilege**，只要管理员身份。
+
+#![cfg(windows)]
 
 use std::collections::HashMap;
-use std::mem::zeroed;
-use std::path::PathBuf;
+use std::ptr::null_mut;
 use std::sync::mpsc::Sender;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+
+use egui::Color32;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, SetFilePointerEx, FILE_BEGIN,
+    CreateFileW, GetDiskFreeSpaceExW, ReadFile, SetFilePointerEx, FILE_BEGIN,
+    FILE_FLAG_NO_BUFFERING, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    FILE_FLAG_NO_BUFFERING, FILE_READ_DATA, FILE_READ_ATTRIBUTES,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS,
+    FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER,
     RETRIEVAL_POINTERS_BUFFER, STARTING_VCN_INPUT_BUFFER,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use egui::Color32;
-use crate::format::human_size;
-use crate::model::{Node, NodeKind};
-use crate::scan::ScanMessage;
+use crate::model::Node;
 
-pub fn mft_scan_available(_drive: char) -> bool { true }
+/// NTFS 根目录的 MFT 记录号固定是 5。
+const NTFS_ROOT_RECORD: u64 = 5;
+/// record < 16 是 NTFS 保留系统文件（$MFT/$LogFile/$Bitmap 等）。
+const NTFS_RESERVED_MAX: u64 = 16;
 
-/// 获取磁盘已用/空闲空间（向下兼容 verify_mft）
-pub fn get_disk_space(drive_letter: char) -> Result<(u64, u64), String> {
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let path: Vec<u16> = format!(r"{}:\", drive_letter).encode_utf16().chain([0]).collect();
-    let mut free = 0u64;
-    let mut total = 0u64;
-    let ok = unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
-    if ok == 0 { return Err("GetDiskFreeSpaceExW 失败".into()); }
-    Ok((total, total - free))
-}
-
-/// 是否以管理员权限运行（向下兼容 verify_mft）
-pub fn is_elevated() -> bool {
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY};
-    use windows_sys::Win32::Foundation::HANDLE;
-    let mut token: HANDLE = std::ptr::null_mut();
-    let ok = unsafe {
-        windows_sys::Win32::System::Threading::OpenProcessToken(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            TOKEN_QUERY, &mut token)
-    };
-    if ok == 0 { return false; }
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    let mut ret_len = 0u32;
-    unsafe {
-        GetTokenInformation(token, windows_sys::Win32::Security::TokenElevation,
-            &mut elevation as *mut _ as *mut std::ffi::c_void,
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut ret_len);
-        CloseHandle(token);
-    }
-    elevation.TokenIsElevated != 0
-}
-
-const ATTR_SI: u32 = 0x10;
-const ATTR_FN: u32 = 0x30;
+/// 属性类型码
+const ATTR_STANDARD_INFORMATION: u32 = 0x10;
+const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
-const ATTR_RP: u32 = 0xC0;
+const ATTR_REPARSE_POINT: u32 = 0xC0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
-const ROOT_FRN: u64 = 5;
-const FILE_SIG: u32 = 0x454C4946;
 
-// ── 裸 MFT 文件头 (packed, 同 WinDirStat FinderNtfs.cpp) ──
-#[repr(C, packed)]
-struct FILE_RECORD {
-    signature: u32,
-    usa_offset: u16,
-    usa_count: u16,
-    _lsn: [u8; 8],
-    _seq: u16,
-    _link_cnt: u16,
-    first_attr_off: u16,
-    flags: u16,
-    _free: [u8; 8],
-    base_ref: u64,
-    _next_attr: u16,
-    _high: u16,
-    _low: u32,
+/// FILE_ATTRIBUTE_* 常量
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// IO_REPARSE_TAG_*（部分）
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
+const IO_REPARSE_TAG_WOF: u32 = 0x80000017;
+
+pub struct MftError(pub String);
+impl std::fmt::Debug for MftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{:?}", self.0) }
 }
-
-#[repr(C, packed)]
-struct ATTR_HDR {
-    type_code: u32,
-    rec_len: u32,
-    form_code: u8,     // 0=resident, 1=non-resident
-    name_len: u8,
-    name_off: u16,
-    flags: u16,
-    instance: u16,
-}
-
-#[repr(C, packed)]
-struct NR_BODY {
-    lowest_vcn: i64,
-    highest_vcn: i64,
-    datarun_off: u16,
-    comp_size: u16,
-    _pad: [u8; 4],
-    allocated_len: u64,
-    file_size: u64,
-    valid_data: u64,
-    _total_alloc: u64,
-}
-
-#[repr(C, packed)]
-struct RES_BODY {
-    val_len: u32,
-    val_off: u16,
-    _pad: [u8; 2],
-}
-
-struct FN_BODY {
-    // We handle this via byte offsets for portability
-}
-
-/// WinDirStat 风格的 MFT 记录聚合数据
-#[derive(Default, Clone)]
-struct FileRecordBase {
-    logical_size: u64,
-    physical_size: u64,
-    modified_ft: u64,    // FILETIME (100ns since 1601)
-    attributes: u32,
-    has_data: bool,
-}
-
-/// 扫描结果
-pub struct MftScanResult {
-    pub root: Node,
-    pub dedup_size: u64,
-    pub file_count: u64,
-    pub folder_count: u64,
-    pub file_paths: Vec<PathBuf>,
-    pub file_sizes: Vec<u64>,
-}
-
-// ── 工具函数 ──────────────────────────────────────────
-fn apply_fixup(data: &mut [u8], record_size: usize) -> bool {
-    if data.len() < 8 { return false; }
-    let uo = u16::from_le_bytes([data[4], data[5]]) as usize;
-    let uc = u16::from_le_bytes([data[6], data[7]]) as usize;
-    if uc == 0 || uo + uc * 2 > data.len() { return false; }
-    let usn = [data[uo], data[uo + 1]];
-    let words_per_sector = 512 / 2;
-    let ws = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u16, record_size / 2) };
-    for i in 1..uc {
-        let se = i * words_per_sector - 1;
-        if ws[se] == u16::from_le_bytes(usn) {
-            let fv = u16::from_le_bytes([data[uo + i * 2], data[uo + i * 2 + 1]]);
-            ws[se] = fv;
-        } else { return false; }
+impl std::fmt::Display for MftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
-    true
 }
 
-/// WinDirStat: NTFS_VOLUME_DATA_BUFFER (48 bytes)
-#[repr(C)]
-struct VOL_INFO {
-    _serial: i64,
-    _sectors: i64,
-    _total_clusters: i64,
-    _free_clusters: i64,
-    _reserved: i64,
-    _sec_size: u32,
-    clus_size: u32,
-    rec_size: u32,
-    _clus_per_rec: u32,
-    _mft_valid: i64,
-    mft_lcn: i64,          // MftStartLcn — MFT 起始簇号
-    _mft2_lcn: i64,
-    _mft_zone_start: i64,
-    _mft_zone_end: i64,
+/// 一个文件的聚合属性（来自 base record + 所有扩展记录）。
+#[derive(Clone, Debug, Default)]
+pub struct FileRecordBase {
+    pub logical_size: u64,
+    pub physical_size: u64,
+    pub last_modified_ft: u64,
+    pub attributes: u32,
+    pub reparse_tag: u32,
 }
 
-/// 打开卷 → 读 MFT → 自解析 → 建两表 → 建树
-pub fn scan_drive_via_mft(drive_letter: char, _tx: &Sender<ScanMessage>) -> Result<MftScanResult, String> {
-    let vol_ws: Vec<u16> = format!(r"\\.\{}:", drive_letter).encode_utf16().chain([0]).collect();
+/// 一条 $FILE_NAME 属性解析结果（一个文件可能有多个 $FILE_NAME：长名+短名+硬链接）。
+#[derive(Clone, Debug)]
+pub struct FileRecordName {
+    pub name: String,
+    pub base_record: u64,
+}
 
-    let vol = unsafe { CreateFileW(vol_ws.as_ptr(), FILE_READ_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null_mut(), OPEN_EXISTING,
-        FILE_FLAG_NO_BUFFERING, std::ptr::null_mut()) };
-    if vol == INVALID_HANDLE_VALUE {
-        return Err("打开卷失败（需管理员权限）".into());
-    }
+/// NTFS 上下文：两个哈希表 + 卷信息。
+pub struct NtfsContext {
+    pub base_file_records: HashMap<u64, FileRecordBase>,
+    pub parent_to_children: HashMap<u64, Vec<FileRecordName>>,
+    pub bytes_per_cluster: u32,
+    pub bytes_per_record: u32,
+}
 
-    // 卷信息
-    let mut vi: VOL_INFO = unsafe { zeroed() };
-    let mut br = 0u32;
-    if unsafe { DeviceIoControl(vol, FSCTL_GET_NTFS_VOLUME_DATA, std::ptr::null(), 0,
-        &mut vi as *mut _ as *mut _, std::mem::size_of::<VOL_INFO>() as u32, &mut br, std::ptr::null_mut()) } == 0
-    {
-        unsafe { CloseHandle(vol); }
-        return Err("FSCTL_GET_NTFS_VOLUME_DATA 失败".into());
-    }
-    let cls = vi.clus_size as u64;
-    let rec_sz = vi.rec_size as usize;
-    crate::dlog!("[mft] 簇={} 记录={}", human_size(cls), rec_sz);
-
-    // 获取 $MFT data runs via FSCTL_GET_RETRIEVAL_POINTERS
-    // WinDirStat: $MFT::$DATA 流语法 + FILE_FLAG_OPEN_REPARSE_POINT
-    let mft_ws: Vec<u16> = format!(r"{}:\$MFT::$DATA", drive_letter).encode_utf16().chain([0]).collect();
-    let mut runs: Vec<(u64, i64, u64)> = Vec::new();
-    {
-        let fh = unsafe { CreateFileW(mft_ws.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null_mut(), OPEN_EXISTING,
-            0x00200000 | 0x10000000, // FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_NO_BUFFERING
-            std::ptr::null_mut()) };
-        if fh != INVALID_HANDLE_VALUE {
-            let mut sv = 0i64;
-            loop {
-                let inp = STARTING_VCN_INPUT_BUFFER { StartingVcn: sv };
-                let mut buf = vec![0u8; std::mem::size_of::<RETRIEVAL_POINTERS_BUFFER>() + 4096];
-                let mut br2 = 0u32;
-                let ok = unsafe { DeviceIoControl(fh, FSCTL_GET_RETRIEVAL_POINTERS,
-                    &inp as *const _ as *const _, std::mem::size_of::<STARTING_VCN_INPUT_BUFFER>() as u32,
-                    buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut br2, std::ptr::null_mut()) };
-                if ok == 0 {
-                    let err = unsafe { GetLastError() };
-                    if err != 234 { break; } // ERROR_MORE_DATA means need bigger buffer
-                }
-                let rp = unsafe { &*(buf.as_ptr() as *const RETRIEVAL_POINTERS_BUFFER) };
-                let ec = rp.ExtentCount as usize;
-                let ext_ptr: *const _ = &rp.Extents[0];
-                let exts = unsafe { std::slice::from_raw_parts(ext_ptr, ec) };
-                let mut vcn = rp.StartingVcn;
-                for ext in exts {
-                    let nv = ext.NextVcn;
-                    runs.push((vcn as u64, ext.Lcn, (nv - vcn) as u64));
-                    vcn = nv;
-                }
-                if ok != 0 { break; }
-                sv = vcn;
-            }
-            unsafe { CloseHandle(fh); }
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
         }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
     }
-    // 如果 FSCTL 失败（权限不足等），退回到单 run 假设：MFT 从 mft_lcn 开始连续
-    if runs.is_empty() {
-        crate::dlog!("[mft] FSCTL 失败，退回到单 run 假设 (MFT LCN={})", vi.mft_lcn);
-        let cluster_count = vi._mft_valid as u64 / cls;
-        runs.push((0, vi.mft_lcn, cluster_count));
-    }
-    crate::dlog!("[mft] {} 个 data run", runs.len());
+}
 
-    // ── WinDirStat 两表 ──
-    let mut bases: HashMap<u64, FileRecordBase> = HashMap::new();
-    let mut ptree: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
-    bases.insert(ROOT_FRN, FileRecordBase::default());
-
-    let mut fc = 0u64; let mut dc = 0u64; let mut fixup_fail = 0u64; let mut not_used = 0u64;
-
-    // 4MB aligned buffer for overlapped I/O
-    let bufsz: usize = 4 * 1024 * 1024;
-    let layout = std::alloc::Layout::from_size_align(bufsz, 4096).unwrap();
-    let raw_buf = unsafe { std::alloc::alloc_zeroed(layout) };
-    if raw_buf.is_null() { unsafe { CloseHandle(vol); } return Err("分配缓冲区失败".into()); }
-
-    for (run_vcn, run_lcn, run_cls) in &runs {
-        let mut bytes_to_read = run_cls * cls;
-        let mut file_off = (*run_lcn as u64 * cls) as i64;
-        // WinDirStat: mftRunOffset = VCN * clusterSize (固定值，用于算记录号)
-        let mft_run_offset = run_vcn * cls;
-        let mut bytes_read_from_run = 0u64; // WinDirStat: 跨 chunk 累加
-
-        while bytes_to_read > 0 {
-            let chunk = bytes_to_read.min(bufsz as u64);
-            unsafe { SetFilePointerEx(vol, file_off, std::ptr::null_mut(), FILE_BEGIN); }
-            let mut rd = 0u32;
-            let ok = unsafe { ReadFile(vol, raw_buf as *mut _, chunk as u32, &mut rd, std::ptr::null_mut()) };
-            if ok == 0 {
-                crate::dlog!("[mft] 读盘错误: {}", unsafe { GetLastError() });
-                break;
-            }
-            let bytes_read = rd as u64;
-
-            // WinDirStat: offset 逐记录递增，currentRecord = (mftRunOffset + bytesReadFromRun + offset) / rec_sz
-            let mut offset = 0usize;
-            while offset + rec_sz <= bytes_read as usize {
-                let p = unsafe { &mut *(raw_buf.add(offset) as *mut FILE_RECORD) };
-                if p.signature == FILE_SIG
-                    && apply_fixup(unsafe { std::slice::from_raw_parts_mut(raw_buf.add(offset), rec_sz) }, rec_sz)
-                    && (p.flags & 1) != 0
-                {
-                    let current_record = (mft_run_offset + bytes_read_from_run + offset as u64) / rec_sz as u64;
-                    let bref = p.base_ref & 0xFFFF_FFFF_FFFF;
-                    let bi = if bref > 0 { bref } else { current_record };
-                    let base_base = bref == 0;
-
-                    if base_base && (p.flags & 2) != 0 { dc += 1; } else if base_base { fc += 1; }
-
-                    let b = bases.entry(bi).or_default();
-
-                    let fao = p.first_attr_off as usize;
-                    if fao < rec_sz {
-                        let rd_bytes = unsafe { std::slice::from_raw_parts(raw_buf.add(offset), rec_sz) };
-                        let mut ao = fao;
-                        while ao + 16 <= rec_sz {
-                            let at = u32::from_le_bytes(rd_bytes[ao..ao + 4].try_into().unwrap_or([0xFF; 4]));
-                            if at == ATTR_END { break; }
-                            let al = u32::from_le_bytes(rd_bytes[ao + 4..ao + 8].try_into().unwrap_or([0; 4])) as usize;
-                            if al == 0 || ao + al > rec_sz { break; }
-                            let nr = rd_bytes[ao + 8] & 1;
-                            let nl = rd_bytes[ao + 9];
-
-                            match at {
-                                ATTR_SI if nr == 0 => {
-                                    let vo = u16::from_le_bytes(rd_bytes[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
-                                    let sp = ao + vo;
-                                    if sp + 36 <= ao + al {
-                                        let mt = i64::from_le_bytes(rd_bytes[sp + 8..sp + 16].try_into().unwrap_or([0; 8]));
-                                        let attrs = u32::from_le_bytes(rd_bytes[sp + 32..sp + 36].try_into().unwrap_or([0; 4]));
-                                        b.modified_ft = mt as u64;
-                                        b.attributes = if (p.flags & 2) != 0 { attrs | FILE_ATTRIBUTE_DIRECTORY } else { attrs };
-                                        if b.attributes == 0 { b.attributes = FILE_ATTRIBUTE_NORMAL; }
-                                    }
-                                }
-                                ATTR_FN if nr == 0 && nl == 0 => {
-                                    let vo = u16::from_le_bytes(rd_bytes[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
-                                    let fp = ao + vo;
-                                    if fp + 66 <= ao + al {
-                                        let fd = &rd_bytes[fp..];
-                                        let pr = u64::from_le_bytes(fd[0..8].try_into().unwrap_or([0; 8])) & 0xFFFF_FFFF_FFFF;
-                                        let ns = fd[65];
-                                        let nlb = fd[64];
-                                        // WinDirStat: 跳过短名（Flags==0x02 即 DOS namespace）和 . / ..
-                                        if ns == 2 { break; }
-                                        if nlb == 1 && fd[66] == b'.' { break; }
-                                        if nlb == 2 && fd[66] == b'.' && fd[68] == b'.' { break; }
-
-                                        let name_utf16 = unsafe { std::slice::from_raw_parts(fd.as_ptr().add(66) as *const u16, nlb as usize) };
-                                        let name = String::from_utf16_lossy(name_utf16);
-                                        // WinDirStat: 每个 $FILE_NAME 生成一条 (baseRecord, name) 到父目录
-                                        ptree.entry(pr).or_default().push((bi, name));
-                                    }
-                                }
-                                ATTR_DATA if nl == 0 => {
-                                    if nr != 0 {
-                                        if rec_sz < ao + 0x38 { break; }
-                                        let lvcn = i64::from_le_bytes(rd_bytes[ao + 0x10..ao + 0x18].try_into().unwrap_or([0xFF; 8]));
-                                        // WinDirStat: 只有 lowest_vcn==0 的 extent 才有完整大小
-                                        if lvcn != 0 { break; }
-                                        let fs = u64::from_le_bytes(rd_bytes[ao + 0x30..ao + 0x38].try_into().unwrap_or([0; 8]));
-                                        let al = u64::from_le_bytes(rd_bytes[ao + 0x28..ao + 0x30].try_into().unwrap_or([0; 8]));
-                                        let compressed = (u16::from_le_bytes(rd_bytes[ao + 0x0C..ao + 0x0E].try_into().unwrap_or([0; 2])) & 1) != 0;
-                                        let sparse = (u16::from_le_bytes(rd_bytes[ao + 0x0C..ao + 0x0E].try_into().unwrap_or([0; 2])) & 0x8000) != 0;
-                                        b.logical_size = fs;
-                                        // WinDirStat: 压缩/稀疏用 Compressed(+0x40)，否则用 AllocatedLength(+0x28)
-                                        let phys = if compressed || sparse {
-                                            if ao + 0x48 <= rec_sz {
-                                                u64::from_le_bytes(rd_bytes[ao + 0x40..ao + 0x48].try_into().unwrap_or([0; 8]))
-                                            } else { al }
-                                        } else { al };
-                                        if phys > 0 { // WinDirStat: 只有 >0 才赋值
-                                            b.physical_size = phys;
-                                        }
-                                        b.has_data = true;
-                                    } else {
-                                        let vl = u32::from_le_bytes(rd_bytes[ao + 0x10..ao + 0x14].try_into().unwrap_or([0; 4])) as u64;
-                                        b.logical_size = vl;
-                                        b.physical_size = (vl + 7) & !7;
-                                        b.has_data = true;
-                                    }
-                                }
-                                ATTR_RP if nr == 0 && nl == 0 => {
-                                    let vo = u16::from_le_bytes(rd_bytes[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
-                                    if vo + 4 <= al {
-                                        let _tag = u32::from_le_bytes(rd_bytes[ao + vo..ao + vo + 4].try_into().unwrap_or([0; 4]));
-                                    }
-                                }
-                                _ => {}
-                            }
-                            ao += al;
-                        }
-                    }
-                }
-                offset += rec_sz;
-            }
-
-            bytes_read_from_run += bytes_read;
-            file_off += bytes_read as i64;
-            bytes_to_read -= bytes_read;
-        }
-    }
-
-    unsafe { std::alloc::dealloc(raw_buf, layout); }
-    unsafe { CloseHandle(vol); }
-
-    crate::dlog!("[mft] 解析: base={} 目录={} 文件={} fixup_fail={} 已删={}",
-        bases.len(), dc, fc, fixup_fail, not_used);
-
-    // ── 建树（从 FRN 5 开始递归遍历 ptree） ──
-    let root_name = format!(r"{}:\", drive_letter);
-    let root_node = build_subtree(ROOT_FRN, &root_name, &bases, &ptree, 0, &mut HashMap::new());
-
-    // dedup = 去重后的物理大小（每份数据只计一次）
-    let dedup_size: u64 = bases.values()
-        .filter(|r| (r.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && r.has_data)
-        .map(|r| r.physical_size)
-        .sum();
-
-    crate::dlog!("[mft] 树: root.size={} dedup={}",
-        human_size(root_node.size), human_size(dedup_size));
-
-    Ok(MftScanResult {
-        root: root_node,
-        dedup_size,
-        file_count: fc,
-        folder_count: dc,
-        file_paths: Vec::new(),
-        file_sizes: Vec::new(),
-    })
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn folder_color(depth: usize) -> Color32 {
-    const P: [Color32; 6] = [
+    const PAL: [Color32; 6] = [
         Color32::from_rgb(0x4C, 0x8B, 0xF5),
         Color32::from_rgb(0x34, 0xC7, 0x59),
         Color32::from_rgb(0xF5, 0xA6, 0x23),
@@ -433,56 +139,520 @@ fn folder_color(depth: usize) -> Color32 {
         Color32::from_rgb(0x9C, 0x6A, 0xDE),
         Color32::from_rgb(0x2E, 0xC4, 0xB6),
     ];
-    P[depth % P.len()]
+    PAL[depth % PAL.len()]
 }
-fn file_color() -> Color32 { Color32::from_rgb(0x6C, 0x75, 0x7D) }
 
-/// 从 ptree 构建递归 Node 树（WinDirStat 风格）
-fn build_subtree(
-    frn: u64, name: &str, bases: &HashMap<u64, FileRecordBase>,
-    ptree: &HashMap<u64, Vec<(u64, String)>>, depth: usize,
-    visited: &mut HashMap<u64, bool>,
-) -> Node {
-    if visited.contains_key(&frn) {
-        return Node::new_folder(name, folder_color(depth), Vec::new());
+fn file_color() -> Color32 {
+    Color32::from_rgb(0x6C, 0x75, 0x7D)
+}
+
+/// 主入口：扫描一个 NTFS 卷，返回建好的目录树。
+pub fn scan_volume(
+    drive_letter: char,
+    tx: &Sender<crate::scan::ScanMessage>,
+) -> Result<Node, MftError> {
+    eprintln!("[mft_scan] 开始扫描 drive={}", drive_letter);
+    let ctx = load_volume(drive_letter, tx)?;
+    eprintln!(
+        "[mft_scan] MFT 加载完成: {} 个文件记录, {} 个父目录",
+        ctx.base_file_records.len(),
+        ctx.parent_to_children.len()
+    );
+
+    let root_name = format!("{}:\\", drive_letter);
+    let root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0);
+    eprintln!(
+        "[mft_scan] 树构建完成: logical={:.2}GB, physical={:.2}GB, files={}, folders={}",
+        root_node.logical_size as f64 / 1e9,
+        root_node.physical_size as f64 / 1e9,
+        root_node.file_count,
+        root_node.folder_count
+    );
+    Ok(root_node)
+}
+
+/// 第一阶段：读 MFT，填充两个哈希表。
+fn load_volume(
+    drive_letter: char,
+    tx: &Sender<crate::scan::ScanMessage>,
+) -> Result<NtfsContext, MftError> {
+    let vol_path = wide(&format!(r"\\.\{drive_letter}:"));
+
+    // 打开卷设备
+    let vol_handle = unsafe {
+        let h = CreateFileW(
+            vol_path.as_ptr(),
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            return Err(MftError(format!(
+                "无法打开卷设备 \\\\.\\{drive_letter}:（需要管理员权限）"
+            )));
+        }
+        h
+    };
+    eprintln!("[mft_scan] 卷设备已打开: \\\\.\\{drive_letter}:");
+
+    // 拿卷信息
+    let mut vol_info: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
+    let mut bytes_returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            vol_handle,
+            FSCTL_GET_NTFS_VOLUME_DATA,
+            null_mut(),
+            0,
+            &mut vol_info as *mut _ as *mut _,
+            std::mem::size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
+            &mut bytes_returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        unsafe { CloseHandle(vol_handle); }
+        return Err(MftError(format!(
+            "FSCTL_GET_NTFS_VOLUME_DATA 失败（{} 可能不是 NTFS）",
+            drive_letter
+        )));
     }
-    visited.insert(frn, true);
+    let bytes_per_cluster = vol_info.BytesPerCluster;
+    let bytes_per_record = vol_info.BytesPerFileRecordSegment.max(1024);
+    eprintln!(
+        "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={}",
+        bytes_per_cluster, bytes_per_record, vol_info.MftStartLcn, vol_info.MftValidDataLength
+    );
 
-    let mut children = Vec::new();
-    if let Some(entries) = ptree.get(&frn) {
-        for (child_frn, child_name) in entries {
-            if let Some(base) = bases.get(child_frn) {
-                if (base.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-                    // Directory
-                    let child = build_subtree(*child_frn, child_name, bases, ptree, depth + 1, visited);
-                    children.push(child);
-                } else {
-                    // File
-                    children.push(Node {
-                        name: child_name.clone(),
-                        size: base.logical_size,
-                        allocated: base.physical_size,
-                        kind: NodeKind::File,
-                        color: file_color(),
-                        children: Vec::new(),
-                        expanded: false,
-                        file_count: 0,
-                        folder_count: 0,
-                        modified_ft: base.modified_ft,
-                        attributes: base.attributes,
-                    });
+    // 拿 MFT 的 retrieval pointers（打开 $MFT::$DATA 用 FILE_READ_ATTRIBUTES）
+    let mft_path = wide(&format!(r"\\.\{drive_letter}:\$MFT::$DATA"));
+    let mft_handle = unsafe {
+        let h = CreateFileW(
+            mft_path.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            // fallback: 不打开 $MFT 文件，直接用 MftStartLcn 做单 run
+            eprintln!("[mft_scan] 打开 $MFT::$DATA 失败，用 MftStartLcn 单 run");
+            INVALID_HANDLE_VALUE
+        } else {
+            h
+        }
+    };
+
+    // 收集 MFT 的物理 run 列表
+    let mft_runs: Vec<(u64, i64, u64)> = if mft_handle != INVALID_HANDLE_VALUE {
+        // 用 FSCTL_GET_RETRIEVAL_POINTERS
+        let mut input = STARTING_VCN_INPUT_BUFFER { StartingVcn: 0 };
+        let mut buf_size = std::mem::size_of::<RETRIEVAL_POINTERS_BUFFER>() + 32 * 16;
+        let mut buf = vec![0u8; buf_size];
+        let mut ok;
+        loop {
+            ok = unsafe {
+                DeviceIoControl(
+                    mft_handle,
+                    FSCTL_GET_RETRIEVAL_POINTERS,
+                    &mut input as *mut _ as *mut _,
+                    std::mem::size_of::<STARTING_VCN_INPUT_BUFFER>() as u32,
+                    buf.as_mut_ptr() as *mut _,
+                    buf_size as u32,
+                    &mut bytes_returned,
+                    null_mut(),
+                )
+            };
+            if ok != 0 {
+                break;
+            }
+            if unsafe { windows_sys::Win32::Foundation::GetLastError() } != 234 {
+                // ERROR_MORE_DATA = 234
+                break;
+            }
+            buf_size *= 2;
+            buf.resize(buf_size, 0);
+        }
+        unsafe { CloseHandle(mft_handle); }
+        if ok == 0 {
+            eprintln!("[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 失败，用 MftStartLcn 单 run");
+            let total_clusters = vol_info.MftValidDataLength as u64 / bytes_per_cluster as u64;
+            vec![(0, vol_info.MftStartLcn, total_clusters)]
+        } else {
+            parse_retrieval_pointers(&buf, vol_info.MftStartLcn as i64)
+        }
+    } else {
+        // 单 run fallback
+        let total_clusters = vol_info.MftValidDataLength as u64 / bytes_per_cluster as u64;
+        vec![(0, vol_info.MftStartLcn, total_clusters)]
+    };
+    eprintln!("[mft_scan] MFT 有 {} 个物理 run", mft_runs.len());
+
+    let mut ctx = NtfsContext {
+        base_file_records: HashMap::new(),
+        parent_to_children: HashMap::new(),
+        bytes_per_cluster,
+        bytes_per_record,
+    };
+
+    let cluster_size = bytes_per_cluster as u64;
+    let record_size = bytes_per_record as usize;
+    let mut records_processed: u64 = 0;
+
+    // 按 run 顺序读 MFT
+    let chunk_size = 4 * 1024 * 1024; // 4MB 一块
+    let mut chunk_buf: Vec<u8> = vec![0u8; chunk_size];
+
+    for (run_idx, &(run_vcn_start, cluster_start, cluster_count)) in mft_runs.iter().enumerate() {
+        let run_bytes = cluster_count * cluster_size;
+        let mut file_offset = cluster_start * cluster_size as i64;
+        let mft_run_offset = run_vcn_start * cluster_size;
+        let mut bytes_read_from_run: u64 = 0;
+        let mut bytes_to_read = run_bytes;
+
+        eprintln!(
+            "[mft_scan] run[{}]: VCN={}, LCN={}, {}MB",
+            run_idx, run_vcn_start, cluster_start, run_bytes as f64 / 1e6
+        );
+
+        while bytes_to_read > 0 {
+            let bytes_this = (bytes_to_read as usize).min(chunk_size);
+            let mut new_pos: i64 = 0;
+            let ok = unsafe {
+                SetFilePointerEx(vol_handle, file_offset, &mut new_pos, FILE_BEGIN)
+            };
+            if ok == 0 {
+                eprintln!("[mft_scan] SetFilePointerEx 失败");
+                break;
+            }
+            let mut bytes_returned: u32 = 0;
+            let ok = unsafe {
+                ReadFile(vol_handle, chunk_buf.as_mut_ptr(), bytes_this as u32, &mut bytes_returned, null_mut())
+            };
+            if ok == 0 || bytes_returned == 0 {
+                eprintln!("[mft_scan] ReadFile 结束: bytes={}", bytes_returned);
+                break;
+            }
+            let bytes_read = bytes_returned as usize;
+            // 逐条记录解析
+            let mut off = 0usize;
+            while off + record_size <= bytes_read {
+                let rec = &mut chunk_buf[off..off + record_size];
+                let rec_offset_in_mft = mft_run_offset + bytes_read_from_run + off as u64;
+                let current_record = rec_offset_in_mft / record_size as u64;
+                process_record(rec, current_record, &mut ctx);
+                records_processed += 1;
+                off += record_size;
+            }
+            bytes_read_from_run += bytes_read as u64;
+            bytes_to_read -= bytes_read as u64;
+            file_offset += bytes_read as i64;
+
+            if records_processed % 50_000 < (bytes_read / record_size) as u64 {
+                let _ = tx.send(crate::scan::ScanMessage::Progress(records_processed));
+            }
+        }
+    }
+    unsafe { CloseHandle(vol_handle); }
+
+    eprintln!("[mft_scan] 共处理 {} 条 MFT 记录", records_processed);
+    Ok(ctx)
+}
+
+/// 解析 RETRIEVAL_POINTERS_BUFFER，返回 (start_vcn, lcn, cluster_count) 列表。
+fn parse_retrieval_pointers(buf: &[u8], mft_start_lcn: i64) -> Vec<(u64, i64, u64)> {
+    let rp = unsafe { &*(buf.as_ptr() as *const RETRIEVAL_POINTERS_BUFFER) };
+    let extent_count = rp.ExtentCount as usize;
+    let mut runs = Vec::with_capacity(extent_count);
+    let extents_ptr: *const windows_sys::Win32::System::Ioctl::RETRIEVAL_POINTERS_BUFFER_0 = &rp.Extents[0];
+    let mut vcn_start = rp.StartingVcn;
+    for i in 0..extent_count {
+        let ext = unsafe { &*extents_ptr.add(i) };
+        let vcn_next = ext.NextVcn;
+        let lcn = ext.Lcn;
+        let count = (vcn_next - vcn_start) as u64;
+        // lcn == -1 表示 sparse，跳过（MFT 理论上不 sparse，但容错）
+        if lcn >= 0 {
+            runs.push((vcn_start as u64, lcn, count));
+        }
+        vcn_start = vcn_next;
+    }
+    // 如果没拿到 run，fallback 到 MftStartLcn
+    if runs.is_empty() {
+        runs.push((0, mft_start_lcn, 0));
+    }
+    runs
+}
+
+/// 处理单条 MFT 记录：做 USA fixup，解析属性，聚合到 base record。
+fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
+    if rec.len() < 48 || &rec[0..4] != b"FILE" {
+        return;
+    }
+    let usa_offset = u16::from_le_bytes([rec[4], rec[5]]) as usize;
+    let usa_count = u16::from_le_bytes([rec[6], rec[7]]) as usize;
+    let flags = u16::from_le_bytes([rec[22], rec[23]]);
+    let in_use = flags & 0x0001 != 0;
+    let is_dir = flags & 0x0002 != 0;
+    let first_attr_offset = u16::from_le_bytes([rec[20], rec[21]]) as usize;
+    let base_file_record = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+    let base_record_index = if base_file_record > 0 {
+        base_file_record & 0x0000_FFFF_FFFF_FFFF
+    } else {
+        current_record
+    };
+
+    // USA fixup
+    if usa_count > 0 {
+        let sector_words = 256usize; // 512/2
+        if usa_offset + usa_count * 2 <= rec.len() {
+            let usn = [rec[usa_offset], rec[usa_offset + 1]];
+            for i in 1..usa_count {
+                let sector_end = i * 512; // 每扇区最后 2 字节
+                if sector_end > rec.len() {
+                    break;
                 }
+                let check = &rec[sector_end - 2..sector_end];
+                if check != usn {
+                    return; // fixup 失败，跳过
+                }
+                let orig_off = usa_offset + i * 2;
+                rec[sector_end - 2] = rec[orig_off];
+                rec[sector_end - 1] = rec[orig_off + 1];
             }
         }
     }
 
-    visited.remove(&frn);
-    let mut folder = Node::new_folder(name, folder_color(depth), children);
-    // 可选：从 base_records[frn] 获取目录自身的时间
-    if let Some(b) = bases.get(&frn) {
-        if b.modified_ft > 0 {
-            folder.modified_ft = b.modified_ft;
+    if !in_use {
+        return;
+    }
+
+    // 获取或创建 base record 条目
+    let base_entry = ctx
+        .base_file_records
+        .entry(base_record_index)
+        .or_default();
+
+    // 遍历属性
+    let mut off = first_attr_offset;
+    while off + 16 <= rec.len() {
+        let attr_type = u32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
+        if attr_type == ATTR_END {
+            break;
+        }
+        let attr_len = u32::from_le_bytes(rec[off + 4..off + 8].try_into().unwrap()) as usize;
+        if attr_len == 0 || off + attr_len > rec.len() {
+            break;
+        }
+        let non_resident = rec[off + 8] != 0;
+        let name_len = rec[off + 9];
+        // let name_offset = u16::from_le_bytes([rec[off + 10], rec[off + 11]]) as usize;
+        let attr_flags = u16::from_le_bytes([rec[off + 12], rec[off + 13]]);
+
+        if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
+            // $STANDARD_INFORMATION（resident）
+            let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+            let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as usize;
+            let content = off + value_off;
+            // 布局：CreationTime(8) + LastModificationTime(8) + MftChangeTime(8) + AccessTime(8) + Flags(4)
+            if content + 0x24 <= rec.len() && value_len >= 0x24 {
+                base_entry.last_modified_ft = u64::from_le_bytes(
+                    rec[content + 0x08..content + 0x10].try_into().unwrap(),
+                );
+                base_entry.attributes = u32::from_le_bytes(
+                    rec[content + 0x20..content + 0x24].try_into().unwrap(),
+                );
+                if is_dir {
+                    base_entry.attributes |= FILE_ATTRIBUTE_DIRECTORY;
+                }
+                if base_entry.attributes == 0 {
+                    base_entry.attributes = FILE_ATTRIBUTE_NORMAL;
+                }
+            }
+        } else if attr_type == ATTR_FILE_NAME && !non_resident {
+            // $FILE_NAME（resident）
+            let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+            let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as usize;
+            let content = off + value_off;
+            if content + 0x42 <= rec.len() && value_len >= 0x42 {
+                let parent_ref = u64::from_le_bytes(rec[content..content + 8].try_into().unwrap());
+                let parent_dir = parent_ref & 0x0000_FFFF_FFFF_FFFF;
+                let ns = rec[content + 0x41]; // namespace
+                let name_len_chars = rec[content + 0x40] as usize;
+                // 跳过短名（ns==2 = DOS 8.3）
+                if ns == 0x02 {
+                    off += attr_len;
+                    continue;
+                }
+                let name_bytes_len = name_len_chars * 2;
+                if content + 0x42 + name_bytes_len <= rec.len() && name_len_chars > 0 {
+                    let name_u16: Vec<u16> = rec[content + 0x42..content + 0x42 + name_bytes_len]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    let name = String::from_utf16_lossy(&name_u16);
+                    // 跳过 . 和 ..
+                    if name == "." || name == ".." {
+                        off += attr_len;
+                        continue;
+                    }
+                    ctx.parent_to_children
+                        .entry(parent_dir)
+                        .or_default()
+                        .push(FileRecordName {
+                            name,
+                            base_record: base_record_index,
+                        });
+                }
+            }
+        } else if attr_type == ATTR_DATA {
+            // $DATA
+            if name_len > 0 {
+                // 命名 $DATA（ADS）：检查 WofCompressedData
+                let name_off = u16::from_le_bytes([rec[off + 10], rec[off + 11]]) as usize;
+                let name_start = off + name_off;
+                if name_start + (name_len as usize) * 2 <= rec.len() {
+                    let stream_u16: Vec<u16> = rec[name_start..name_start + (name_len as usize) * 2]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    let stream_name = String::from_utf16_lossy(&stream_u16);
+                    if stream_name == "WofCompressedData" {
+                        if !non_resident {
+                            // resident WofCompressedData
+                            let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as u64;
+                            base_entry.physical_size = (value_len + 7) & !7;
+                        } else {
+                            // non-resident WofCompressedData：检查 LowestVcn==0
+                            let lowest_vcn = u64::from_le_bytes(rec[off + 16..off + 24].try_into().unwrap());
+                            if lowest_vcn == 0 {
+                                let alloc_len = u64::from_le_bytes(rec[off + 0x28..off + 0x30].try_into().unwrap());
+                                base_entry.physical_size = alloc_len;
+                            }
+                        }
+                    }
+                }
+                off += attr_len;
+                continue;
+            }
+            // 未命名 $DATA
+            if !non_resident {
+                // resident：ValueLength = logical size，physical = (len+7)&~7
+                let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as u64;
+                base_entry.logical_size = value_len;
+                base_entry.physical_size = (value_len + 7) & !7;
+            } else {
+                // non-resident：只在 LowestVcn==0 时有效
+                let lowest_vcn = u64::from_le_bytes(rec[off + 16..off + 24].try_into().unwrap());
+                if lowest_vcn == 0 {
+                    let file_size = u64::from_le_bytes(rec[off + 0x30..off + 0x38].try_into().unwrap());
+                    base_entry.logical_size = file_size;
+                    // physical size：压缩/稀疏用 Compressed(0x40)，否则 AllocatedLength(0x28)
+                    let is_compressed = attr_flags & 0x0001 != 0;
+                    let is_sparse = attr_flags & 0x8000 != 0;
+                    let phys = if is_compressed || is_sparse {
+                        if off + 0x48 <= rec.len() {
+                            u64::from_le_bytes(rec[off + 0x40..off + 0x48].try_into().unwrap())
+                        } else {
+                            0
+                        }
+                    } else {
+                        u64::from_le_bytes(rec[off + 0x28..off + 0x30].try_into().unwrap())
+                    };
+                    if phys > 0 {
+                        base_entry.physical_size = phys;
+                    }
+                }
+            }
+        } else if attr_type == ATTR_REPARSE_POINT && !non_resident {
+            // $REPARSE_POINT（resident）
+            let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+            let content = off + value_off;
+            if content + 4 <= rec.len() {
+                base_entry.reparse_tag = u32::from_le_bytes(rec[content..content + 4].try_into().unwrap());
+                if base_entry.reparse_tag == IO_REPARSE_TAG_WOF {
+                    base_entry.attributes |= FILE_ATTRIBUTE_COMPRESSED;
+                }
+            }
+        }
+        off += attr_len;
+    }
+}
+
+/// 第二阶段：从指定 record 递归建树。
+fn build_tree(ctx: &NtfsContext, record: u64, display_name: &str, depth: usize) -> Node {
+    let is_reserved = record < NTFS_RESERVED_MAX;
+    let base = ctx.base_file_records.get(&record);
+    let (logical, physical, modified_ft, attributes, reparse_tag) = match base {
+        Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.attributes, b.reparse_tag),
+        None => (0, 0, 0, FILE_ATTRIBUTE_DIRECTORY, 0),
+    };
+    let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+
+    let mut children = Vec::new();
+    if let Some(child_names) = ctx.parent_to_children.get(&record) {
+        for cn in child_names {
+            let child_base = ctx.base_file_records.get(&cn.base_record);
+            let (c_logical, c_physical, c_modified, c_attrs, c_reparse) = match child_base {
+                Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.attributes, b.reparse_tag),
+                None => (0, 0, 0, 0, 0),
+            };
+            let c_is_dir = c_attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+            let c_is_reserved = cn.base_record < NTFS_RESERVED_MAX;
+            if c_is_dir {
+                let child_node = build_tree(ctx, cn.base_record, &cn.name, depth + 1);
+                children.push(child_node);
+            } else {
+                children.push(Node::new_file_with_meta(
+                    cn.name.clone(),
+                    c_logical,
+                    c_physical,
+                    file_color(),
+                    c_modified,
+                    c_attrs,
+                    c_reparse,
+                    c_is_reserved,
+                ));
+            }
         }
     }
-    folder
+
+    if is_dir {
+        Node::new_folder_with_meta(
+            display_name,
+            folder_color(depth),
+            children,
+            modified_ft,
+            attributes,
+            reparse_tag,
+            is_reserved,
+        )
+    } else {
+        Node::new_file_with_meta(
+            display_name.to_string(),
+            logical,
+            physical,
+            file_color(),
+            modified_ft,
+            attributes,
+            reparse_tag,
+            is_reserved,
+        )
+    }
+}
+
+/// 系统报告的磁盘空间（GetDiskFreeSpaceExW）。
+pub fn get_disk_space(drive_letter: char) -> Option<(u64, u64)> {
+    let path = wide(&format!("{drive_letter}:\\"));
+    unsafe {
+        let mut free_bytes = 0u64;
+        let mut total_bytes = 0u64;
+        let ok = GetDiskFreeSpaceExW(path.as_ptr(), null_mut(), &mut total_bytes, &mut free_bytes);
+        if ok == 0 { None } else { Some((total_bytes, free_bytes)) }
+    }
 }

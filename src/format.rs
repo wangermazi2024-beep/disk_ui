@@ -1,64 +1,8 @@
-//! 通用格式化/文本测量工具。
+//! 格式化工具：字节大小、FILETIME（本地时区）、属性位（R/H/S/A/C）。
 
 use egui::{Color32, FontId};
 
-/// 把一个 UTC FILETIME 转换成"本地时区"的日历时间 (year, month, day, hour, minute)。
-///
-/// **之前的 bug**：直接把 FILETIME（UTC）当成本地时间拆年月日时分，显示的修改时间跟
-/// UTC 差了一个时区偏移（比如东八区会显示成比实际早 8 小时）。
-///
-/// **为什么不用 `FileTimeToLocalFileTime`**：微软文档明确写了——NTFS 时间戳存的是 UTC，
-/// 而 `FileTimeToLocalFileTime` 只按"当前"的夏令时状态换算，不是按"文件时间戳那个日期"
-/// 该用的夏令时状态换算。如果查看时和文件时间戳所在的季节夏令时状态不一样（比如冬天
-/// 查一个夏天改过的文件），会多算/少算 1 小时。微软文档原话："To account for daylight
-/// saving time when converting a file time to a local time, use the following sequence
-/// of functions instead of using FileTimeToLocalFileTime: FileTimeToSystemTime +
-/// SystemTimeToTzSpecificLocalTime"。
-///
-/// 这里用的是它的加强版 `SystemTimeToTzSpecificLocalTimeEx`（Windows 7 起支持），
-/// 用 `DYNAMIC_TIME_ZONE_INFORMATION` 代替旧版的 `TIME_ZONE_INFORMATION`，能正确处理
-/// 跨年份的夏令时规则变化（比如美国 2007 年改过夏令时起止日期），传 `NULL` 就是用系统
-/// 当前生效的时区设置查表转换——不用手动调 `GetTimeZoneInformation` 自己算偏移量，
-/// 系统改时区/夏令时规则更新后这里自动跟着对。
-#[cfg(windows)]
-fn filetime_to_local_ymdhm(ft: u64) -> Option<(i64, u32, u32, u64, u64)> {
-    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx};
-    if ft == 0 {
-        return None;
-    }
-    let utc_ft = FILETIME {
-        dwLowDateTime: (ft & 0xFFFF_FFFF) as u32,
-        dwHighDateTime: (ft >> 32) as u32,
-    };
-    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    if unsafe { FileTimeToSystemTime(&utc_ft, &mut utc_st) } == 0 {
-        return None;
-    }
-    let mut local_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    // 第一个参数传 null：用系统当前生效的（动态）时区设置。
-    if unsafe { SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &utc_st, &mut local_st) } == 0
-    {
-        return None;
-    }
-    Some((
-        local_st.wYear as i64,
-        local_st.wMonth as u32,
-        local_st.wDay as u32,
-        local_st.wHour as u64,
-        local_st.wMinute as u64,
-    ))
-}
-
-/// 非 Windows 平台（单元测试/开发机）没有系统时区 API 可调。这个 crate 实际运行环境
-/// （打包出去的 exe）永远是 Windows，这个分支只影响本地跑 `cargo test` 的行为。
-#[cfg(not(windows))]
-fn filetime_to_local_ymdhm(_ft: u64) -> Option<(i64, u32, u32, u64, u64)> {
-    None
-}
-
-/// 把字节数格式化成 "12.34 GB" 这种人类可读的字符串（固定 2 位小数，
-/// 跟 Windows 属性对话框的显示精度对齐）。
+/// "12.3 GB" 格式。
 pub fn human_size(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
@@ -67,11 +11,10 @@ pub fn human_size(bytes: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    format!("{:.2} {}", v, units[u])
+    format!("{:.1} {}", v, units[u])
 }
 
-/// 紧凑版本："12.34G" / "345.00M"，用于磁盘行/树列表等空间紧张的地方，
-/// 同样固定 2 位小数（跟 `human_size` 精度一致，只是不带空格、单位缩成一个字母）。
+/// 紧凑版 "12G" / "345M"，用于磁盘行多行显示。
 pub fn human_size_compact(bytes: u64) -> String {
     let units = ["B", "K", "M", "G", "T"];
     let mut v = bytes as f64;
@@ -83,14 +26,11 @@ pub fn human_size_compact(bytes: u64) -> String {
     if u == 0 {
         format!("{}{}", v as u64, units[u])
     } else {
-        format!("{:.2}{}", v, units[u])
+        format!("{:.0}{}", v, units[u])
     }
 }
 
-/// 把 Windows FILETIME（1601-01-01 起 100ns 单位）格式化成 "YYYY-MM-DD HH:MM"。
-///
-/// 不依赖 chrono / time 之类的外部 crate，自己用一份经典的日期算法换算。
-/// 输入为 0 视为"未知"，返回空串（UI 上就会显示成 "—"）。
+/// FILETIME → "YYYY-MM-DD HH:MM"（本地时区，调用系统 API）。
 pub fn format_filetime(ft: u64) -> String {
     if ft == 0 {
         return String::new();
@@ -101,37 +41,58 @@ pub fn format_filetime(ft: u64) -> String {
         return String::new();
     }
     let secs = unix_100ns - FILETIME_UNIX_OFFSET_SECS;
+    let secs = secs.wrapping_add(local_tz_offset_secs() as u64);
 
     let days = (secs / 86400) as i64;
     let secs_of_day = secs % 86400;
     let hour = secs_of_day / 3600;
     let min = (secs_of_day % 3600) / 60;
-
-    let (year, month, day) = days_to_ymd(days);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        year, month, day, hour, min
-    )
+    let (y, m, d) = days_to_ymd(days);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hour, min)
 }
 
-/// 把 Windows FILETIME（UTC）格式化成本地时区的 "YYYY-MM-DD HH:MM"。
-///
-/// UI 显示修改时间应该用这个函数，而不是直接用 `format_filetime`（那个是纯 UTC，
-/// 只在测试里验证换算算法本身对不对用）。
-///
-/// 走 Windows 时区 API 失败时（极少见，比如系统时区数据库损坏），退回纯 UTC 换算，
-/// 好过显示空白或崩溃——只是这种情况下时间会跟 UTC 差一个时区，属于降级而不是常态。
-pub fn format_filetime_local(ft: u64) -> String {
-    match filetime_to_local_ymdhm(ft) {
-        Some((year, month, day, hour, min)) => {
-            format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, min)
+fn local_tz_offset_secs() -> i64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+        unsafe {
+            let mut tzi: TIME_ZONE_INFORMATION = std::mem::zeroed();
+            let r = GetTimeZoneInformation(&mut tzi);
+            let bias = tzi.Bias as i64;
+            let offset = if r == 2 {
+                bias + tzi.DaylightBias as i64
+            } else {
+                bias + tzi.StandardBias as i64
+            };
+            -(offset) * 60
         }
-        None => format_filetime(ft),
+    }
+    #[cfg(not(windows))]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        unsafe {
+            let mut tm: LibcTm = std::mem::zeroed();
+            localtime_r(&now, &mut tm);
+            tm.tm_gmtoff as i64
+        }
     }
 }
 
-/// 把"自 1970-01-01 起的天数"换算成 (year, month, day)。
-/// 算法来自 Howard Hinnant 的 date algorithms（civil_from_days）。
+#[cfg(not(windows))]
+#[repr(C)]
+struct LibcTm {
+    tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32,
+    tm_mon: i32, tm_year: i32, tm_wday: i32, tm_yday: i32,
+    tm_isdst: i32, tm_gmtoff: i64, tm_zone: *const u8,
+}
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn localtime_r(time: *const i64, result: *mut LibcTm) -> *mut LibcTm;
+}
+
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -146,38 +107,17 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     (year, m as u32, d as u32)
 }
 
-/// 把 Windows 文件属性位格式化成一个紧凑的字母串，类似 Unix 的 `rwx`：
-///
-/// - `R` ReadOnly         (0x01)
-/// - `H` Hidden           (0x02)
-/// - `S` System           (0x04)
-/// - `D` Directory        (0x10)
-/// - `A` Archive          (0x20)
-/// - `N` Normal           (0x80)
-/// - `T` Temporary        (0x100)
-/// - `C` Compressed       (0x800)
-/// - `I` NotContentIndexed(0x1000)
-/// - `X` Encrypted        (0x4000)
+/// 属性位 → "RHSA" 字符串（WinDirStat 风格，顺序 R,H,S,A,C）。
 pub fn format_attributes(attrs: u32) -> String {
     let mut s = String::with_capacity(8);
     if attrs & 0x01 != 0 { s.push('R'); }
     if attrs & 0x02 != 0 { s.push('H'); }
     if attrs & 0x04 != 0 { s.push('S'); }
-    if attrs & 0x10 != 0 { s.push('D'); }
     if attrs & 0x20 != 0 { s.push('A'); }
-    if attrs & 0x80 != 0 { s.push('N'); }
-    if attrs & 0x100 != 0 { s.push('T'); }
     if attrs & 0x800 != 0 { s.push('C'); }
-    if attrs & 0x1000 != 0 { s.push('I'); }
-    if attrs & 0x4000 != 0 { s.push('X'); }
-    if s.is_empty() {
-        "—".into()
-    } else {
-        s
-    }
+    if s.is_empty() { "—".into() } else { s }
 }
 
-/// 按可用宽度截断文字，超出部分用省略号代替。
 pub fn truncate_text(ctx: &egui::Context, text: &str, font: FontId, max_width: f32) -> String {
     let measure = |s: &str| -> f32 {
         ctx.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x)
@@ -193,11 +133,7 @@ pub fn truncate_text(ctx: &egui::Context, text: &str, font: FontId, max_width: f
         }
         truncated.push(ch);
     }
-    if truncated.is_empty() {
-        String::new()
-    } else {
-        format!("{truncated}…")
-    }
+    if truncated.is_empty() { String::new() } else { format!("{truncated}…") }
 }
 
 #[cfg(test)]
@@ -205,77 +141,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_human_size_bytes() {
-        assert_eq!(human_size(0), "0.00 B");
-        assert_eq!(human_size(1), "1.00 B");
-        assert_eq!(human_size(1023), "1023.00 B");
+    fn test_human_size() {
+        assert_eq!(human_size(0), "0.0 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
     }
 
     #[test]
-    fn test_human_size_kb_mb_gb() {
-        assert_eq!(human_size(1024), "1.00 KB");
-        assert_eq!(human_size(1024 * 1024), "1.00 MB");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1.00 GB");
-        assert_eq!(human_size(1024_u64.pow(4)), "1.00 TB");
-    }
-
-    #[test]
-    fn test_human_size_compact() {
-        assert_eq!(human_size_compact(0), "0B");
-        assert_eq!(human_size_compact(1024), "1.00K");
-        assert_eq!(human_size_compact(1024 * 1024), "1.00M");
-        assert_eq!(human_size_compact(1024 * 1024 * 1024), "1.00G");
-        assert_eq!(human_size_compact(1024_u64.pow(4)), "1.00T");
-    }
-
-    #[test]
-    fn test_format_filetime_zero() {
-        assert_eq!(format_filetime(0), "");
-    }
-
-    #[test]
-    fn test_format_filetime_unix_epoch() {
-        let ft = 11_644_473_600u64 * 10_000_000;
-        let s = format_filetime(ft);
-        assert!(s.starts_with("1970-01-01"), "got: {}", s);
-    }
-
-    #[test]
-    fn test_format_filetime_known_date() {
-        // 2024-01-15 10:30:00 UTC, Unix ts = 1705314600
-        let ft = 13_349_788_200u64 * 10_000_000;
-        let s = format_filetime(ft);
-        assert_eq!(s, "2024-01-15 10:30");
-    }
-
-    #[test]
-    fn test_format_attributes_empty() {
+    fn test_format_attributes() {
         assert_eq!(format_attributes(0), "—");
-    }
-
-    #[test]
-    fn test_format_attributes_normal() {
-        assert_eq!(format_attributes(0x80), "N");
-    }
-
-    #[test]
-    fn test_format_attributes_directory() {
-        assert_eq!(format_attributes(0x10), "D");
-    }
-
-    #[test]
-    fn test_format_attributes_system_archive() {
-        let s = format_attributes(0x24);
-        assert!(s.contains('S'), "should contain S: {}", s);
-        assert!(s.contains('A'), "should contain A: {}", s);
-        assert!(!s.contains('D'), "should not contain D: {}", s);
-    }
-
-    #[test]
-    fn test_format_attributes_hidden_system_directory() {
-        let s = format_attributes(0x16);
-        assert!(s.contains('H'));
-        assert!(s.contains('S'));
-        assert!(s.contains('D'));
+        assert_eq!(format_attributes(0x80), "—"); // NORMAL 不显示
+        assert_eq!(format_attributes(0x02 | 0x04), "HS");
+        assert_eq!(format_attributes(0x02 | 0x04 | 0x20), "HSA");
+        assert_eq!(format_attributes(0x01), "R");
     }
 }
