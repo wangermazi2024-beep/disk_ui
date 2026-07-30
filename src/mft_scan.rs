@@ -209,15 +209,14 @@ pub fn scan_drive_via_mft(drive_letter: char, _tx: &Sender<ScanMessage>) -> Resu
     crate::dlog!("[mft] 簇={} 记录={}", human_size(cls), rec_sz);
 
     // 获取 $MFT data runs via FSCTL_GET_RETRIEVAL_POINTERS
-    // 注意：$MFT 不能用 FILE_READ_DATA 打开（NTFS 驱动会拒绝），
-    // 只能用 FILE_READ_ATTRIBUTES + FILE_FLAG_OPEN_REPARSE_POINT
-    let mft_ws: Vec<u16> = format!(r"{}:\$MFT", drive_letter).encode_utf16().chain([0]).collect();
+    // WinDirStat: $MFT::$DATA 流语法 + FILE_FLAG_OPEN_REPARSE_POINT
+    let mft_ws: Vec<u16> = format!(r"{}:\$MFT::$DATA", drive_letter).encode_utf16().chain([0]).collect();
     let mut runs: Vec<(u64, i64, u64)> = Vec::new();
     {
         let fh = unsafe { CreateFileW(mft_ws.as_ptr(),
             FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null_mut(), OPEN_EXISTING,
-            0x02000000, // FILE_FLAG_BACKUP_SEMANTICS（旧版已验证可行）
+            0x00200000 | 0x10000000, // FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_NO_BUFFERING
             std::ptr::null_mut()) };
         if fh != INVALID_HANDLE_VALUE {
             let mut sv = 0i64;
@@ -270,132 +269,129 @@ pub fn scan_drive_via_mft(drive_letter: char, _tx: &Sender<ScanMessage>) -> Resu
     if raw_buf.is_null() { unsafe { CloseHandle(vol); } return Err("分配缓冲区失败".into()); }
 
     for (run_vcn, run_lcn, run_cls) in &runs {
-        let mut remain = run_cls * cls;
-        let mut off = (run_lcn * cls as i64) as i64;
-        let run_rec_off = run_vcn * rec_sz as u64;
+        let mut bytes_to_read = run_cls * cls;
+        let mut file_off = (*run_lcn as u64 * cls) as i64;
+        // WinDirStat: mftRunOffset = VCN * clusterSize (固定值，用于算记录号)
+        let mft_run_offset = run_vcn * cls;
+        let mut bytes_read_from_run = 0u64; // WinDirStat: 跨 chunk 累加
 
-        while remain > 0 {
-            let chunk = remain.min(bufsz as u64);
-            unsafe { SetFilePointerEx(vol, off, std::ptr::null_mut(), FILE_BEGIN); }
+        while bytes_to_read > 0 {
+            let chunk = bytes_to_read.min(bufsz as u64);
+            unsafe { SetFilePointerEx(vol, file_off, std::ptr::null_mut(), FILE_BEGIN); }
             let mut rd = 0u32;
             let ok = unsafe { ReadFile(vol, raw_buf as *mut _, chunk as u32, &mut rd, std::ptr::null_mut()) };
             if ok == 0 {
                 crate::dlog!("[mft] 读盘错误: {}", unsafe { GetLastError() });
                 break;
             }
+            let bytes_read = rd as u64;
 
-            let recs = rd as usize / rec_sz;
-            for ri in 0..recs {
-                let p = unsafe { &mut *(raw_buf.add(ri * rec_sz) as *mut FILE_RECORD) };
-                if p.signature != FILE_SIG { continue; }
-                if !apply_fixup(unsafe { std::slice::from_raw_parts_mut(raw_buf.add(ri * rec_sz), rec_sz) }, rec_sz) {
-                    fixup_fail += 1; continue;
-                }
-                if (p.flags & 1) == 0 { not_used += 1; continue; }
+            // WinDirStat: offset 逐记录递增，currentRecord = (mftRunOffset + bytesReadFromRun + offset) / rec_sz
+            let mut offset = 0usize;
+            while offset + rec_sz <= bytes_read as usize {
+                let p = unsafe { &mut *(raw_buf.add(offset) as *mut FILE_RECORD) };
+                if p.signature == FILE_SIG
+                    && apply_fixup(unsafe { std::slice::from_raw_parts_mut(raw_buf.add(offset), rec_sz) }, rec_sz)
+                    && (p.flags & 1) != 0
+                {
+                    let current_record = (mft_run_offset + bytes_read_from_run + offset as u64) / rec_sz as u64;
+                    let bref = p.base_ref & 0xFFFF_FFFF_FFFF;
+                    let bi = if bref > 0 { bref } else { current_record };
+                    let base_base = bref == 0;
 
-                let cr = run_rec_off + (ri * rec_sz) as u64 / rec_sz as u64;
-                let bref = p.base_ref & 0xFFFF_FFFF_FFFF;
-                let bi = if bref > 0 { bref } else { cr };
-                let base_base = bref == 0;
+                    if base_base && (p.flags & 2) != 0 { dc += 1; } else if base_base { fc += 1; }
 
-                if base_base && (p.flags & 2) != 0 { dc += 1; } else if base_base { fc += 1; }
+                    let b = bases.entry(bi).or_default();
 
-                let b = bases.entry(bi).or_default();
+                    let fao = p.first_attr_off as usize;
+                    if fao < rec_sz {
+                        let rd_bytes = unsafe { std::slice::from_raw_parts(raw_buf.add(offset), rec_sz) };
+                        let mut ao = fao;
+                        while ao + 16 <= rec_sz {
+                            let at = u32::from_le_bytes(rd_bytes[ao..ao + 4].try_into().unwrap_or([0xFF; 4]));
+                            if at == ATTR_END { break; }
+                            let al = u32::from_le_bytes(rd_bytes[ao + 4..ao + 8].try_into().unwrap_or([0; 4])) as usize;
+                            if al == 0 || ao + al > rec_sz { break; }
+                            let nr = rd_bytes[ao + 8] & 1;
+                            let nl = rd_bytes[ao + 9];
 
-                let fao = p.first_attr_off as usize;
-                if fao >= rec_sz { continue; }
-                let rd = unsafe { std::slice::from_raw_parts(raw_buf.add(ri * rec_sz), rec_sz) };
-                let mut ao = fao;
-                while ao + 16 <= rec_sz {
-                    let at = u32::from_le_bytes(rd[ao..ao + 4].try_into().unwrap_or([0xFF; 4]));
-                    if at == ATTR_END { break; }
-                    let al = u32::from_le_bytes(rd[ao + 4..ao + 8].try_into().unwrap_or([0; 4])) as usize;
-                    if al == 0 || ao + al > rec_sz { break; }
-                    let nr = rd[ao + 8] & 1;
-                    let nl = rd[ao + 9];
+                            match at {
+                                ATTR_SI if nr == 0 => {
+                                    let vo = u16::from_le_bytes(rd_bytes[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
+                                    let sp = ao + vo;
+                                    if sp + 36 <= ao + al {
+                                        let mt = i64::from_le_bytes(rd_bytes[sp + 8..sp + 16].try_into().unwrap_or([0; 8]));
+                                        let attrs = u32::from_le_bytes(rd_bytes[sp + 32..sp + 36].try_into().unwrap_or([0; 4]));
+                                        b.modified_ft = mt as u64;
+                                        b.attributes = if (p.flags & 2) != 0 { attrs | FILE_ATTRIBUTE_DIRECTORY } else { attrs };
+                                        if b.attributes == 0 { b.attributes = FILE_ATTRIBUTE_NORMAL; }
+                                    }
+                                }
+                                ATTR_FN if nr == 0 && nl == 0 => {
+                                    let vo = u16::from_le_bytes(rd_bytes[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
+                                    let fp = ao + vo;
+                                    if fp + 66 <= ao + al {
+                                        let fd = &rd_bytes[fp..];
+                                        let pr = u64::from_le_bytes(fd[0..8].try_into().unwrap_or([0; 8])) & 0xFFFF_FFFF_FFFF;
+                                        let ns = fd[65];
+                                        let nlb = fd[64];
+                                        // WinDirStat: 跳过短名（Flags==0x02 即 DOS namespace）和 . / ..
+                                        if ns == 2 { break; }
+                                        if nlb == 1 && fd[66] == b'.' { break; }
+                                        if nlb == 2 && fd[66] == b'.' && fd[68] == b'.' { break; }
 
-                    match at {
-                        ATTR_SI if nr == 0 => {
-                            let vo = u16::from_le_bytes(rd[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
-                            let sp = ao + vo;
-                            if sp + 36 <= ao + al {
-                                let mt = i64::from_le_bytes(rd[sp + 8..sp + 16].try_into().unwrap_or([0; 8]));
-                                let attrs = u32::from_le_bytes(rd[sp + 32..sp + 36].try_into().unwrap_or([0; 4]));
-                                b.modified_ft = mt as u64;
-                                b.attributes = if (p.flags & 2) != 0 { attrs | FILE_ATTRIBUTE_DIRECTORY } else { attrs };
-                                if b.attributes == 0 { b.attributes = FILE_ATTRIBUTE_NORMAL; }
+                                        let name_utf16 = unsafe { std::slice::from_raw_parts(fd.as_ptr().add(66) as *const u16, nlb as usize) };
+                                        let name = String::from_utf16_lossy(name_utf16);
+                                        // WinDirStat: 每个 $FILE_NAME 生成一条 (baseRecord, name) 到父目录
+                                        ptree.entry(pr).or_default().push((bi, name));
+                                    }
+                                }
+                                ATTR_DATA if nl == 0 => {
+                                    if nr != 0 {
+                                        if rec_sz < ao + 0x38 { break; }
+                                        let lvcn = i64::from_le_bytes(rd_bytes[ao + 0x10..ao + 0x18].try_into().unwrap_or([0xFF; 8]));
+                                        // WinDirStat: 只有 lowest_vcn==0 的 extent 才有完整大小
+                                        if lvcn != 0 { break; }
+                                        let fs = u64::from_le_bytes(rd_bytes[ao + 0x30..ao + 0x38].try_into().unwrap_or([0; 8]));
+                                        let al = u64::from_le_bytes(rd_bytes[ao + 0x28..ao + 0x30].try_into().unwrap_or([0; 8]));
+                                        let compressed = (u16::from_le_bytes(rd_bytes[ao + 0x0C..ao + 0x0E].try_into().unwrap_or([0; 2])) & 1) != 0;
+                                        let sparse = (u16::from_le_bytes(rd_bytes[ao + 0x0C..ao + 0x0E].try_into().unwrap_or([0; 2])) & 0x8000) != 0;
+                                        b.logical_size = fs;
+                                        // WinDirStat: 压缩/稀疏用 Compressed(+0x40)，否则用 AllocatedLength(+0x28)
+                                        let phys = if compressed || sparse {
+                                            if ao + 0x48 <= rec_sz {
+                                                u64::from_le_bytes(rd_bytes[ao + 0x40..ao + 0x48].try_into().unwrap_or([0; 8]))
+                                            } else { al }
+                                        } else { al };
+                                        if phys > 0 { // WinDirStat: 只有 >0 才赋值
+                                            b.physical_size = phys;
+                                        }
+                                        b.has_data = true;
+                                    } else {
+                                        let vl = u32::from_le_bytes(rd_bytes[ao + 0x10..ao + 0x14].try_into().unwrap_or([0; 4])) as u64;
+                                        b.logical_size = vl;
+                                        b.physical_size = (vl + 7) & !7;
+                                        b.has_data = true;
+                                    }
+                                }
+                                ATTR_RP if nr == 0 && nl == 0 => {
+                                    let vo = u16::from_le_bytes(rd_bytes[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
+                                    if vo + 4 <= al {
+                                        let _tag = u32::from_le_bytes(rd_bytes[ao + vo..ao + vo + 4].try_into().unwrap_or([0; 4]));
+                                    }
+                                }
+                                _ => {}
                             }
+                            ao += al;
                         }
-
-                        ATTR_FN if nr == 0 && nl == 0 => { // unnamed $FILE_NAME only
-                            let vo = u16::from_le_bytes(rd[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
-                            let fp = ao + vo;
-                            if fp + 66 <= ao + al {
-                                let fd = &rd[fp..];
-                                let pr = u64::from_le_bytes(fd[0..8].try_into().unwrap_or([0; 8])) & 0xFFFF_FFFF_FFFF;
-                                let ns = fd[65];
-                                let nlb = fd[64];
-                                // WinDirStat: 跳过短名 (DOS namespace == 2) 和 . / ..
-                                if ns == 2 { break; } // skip short name
-                                if nlb == 1 && fd[66] == b'.' { break; }
-                                if nlb == 2 && fd[66] == b'.' && fd[68] == b'.' { break; }
-
-                                let name_utf16 = unsafe { std::slice::from_raw_parts(fd.as_ptr().add(66) as *const u16, nlb as usize) };
-                                let name = String::from_utf16_lossy(name_utf16);
-                                // WinDirStat: 每个 $FILE_NAME 生成一条父子记录
-                                ptree.entry(pr).or_default().push((bi, name));
-                                // 注意：这个 fn 也提供 cached logical_size (file_size at +56) 和
-                                // physical_size (allocated_length at +48)。但它们可能过期，
-                                // 只在新代码找不到 $DATA 时才用做兜底。
-                            }
-                        }
-
-                        ATTR_DATA if nl == 0 => { // unnamed $DATA
-                            if nr != 0 {
-                                // non-resident
-                                if rec_sz < ao + 0x38 { break; }
-                                let lvcn = i64::from_le_bytes(rd[ao + 0x10..ao + 0x18].try_into().unwrap_or([0xFF; 8]));
-                                // WinDirStat: 只有 lowest_vcn==0 的 extent 才含完整大小信息
-                                if lvcn != 0 { break; }
-                                let fs = u64::from_le_bytes(rd[ao + 0x30..ao + 0x38].try_into().unwrap_or([0; 8]));
-                                let al = u64::from_le_bytes(rd[ao + 0x28..ao + 0x30].try_into().unwrap_or([0; 8]));
-                                let compressed = (u16::from_le_bytes(rd[ao + 0x0C..ao + 0x0E].try_into().unwrap_or([0; 2])) & 1) != 0;
-                                let sparse = (u16::from_le_bytes(rd[ao + 0x0C..ao + 0x0E].try_into().unwrap_or([0; 2])) & 0x8000) != 0;
-                                b.logical_size = fs;
-                                b.physical_size = if compressed || sparse {
-                                    // Compressed/sparse: 使用 total_allocated (+0x40)
-                                    if ao + 0x48 <= rec_sz {
-                                        u64::from_le_bytes(rd[ao + 0x40..ao + 0x48].try_into().unwrap_or([0; 8]))
-                                    } else { al }
-                                } else { al };
-                                b.has_data = true;
-                            } else {
-                                // resident
-                                let vl = u32::from_le_bytes(rd[ao + 0x10..ao + 0x14].try_into().unwrap_or([0; 4])) as u64;
-                                b.logical_size = vl;
-                                b.physical_size = (vl + 7) & !7;
-                                b.has_data = true;
-                            }
-                        }
-
-                        ATTR_RP if nr == 0 && nl == 0 => {
-                            // reparse point: 可选，WinDirStat 用来标记 junction/symlink
-                            let vo = u16::from_le_bytes(rd[ao + 0x14..ao + 0x16].try_into().unwrap_or([0; 2])) as usize;
-                            if vo + 4 <= al {
-                                let tag = u32::from_le_bytes(rd[ao + vo..ao + vo + 4].try_into().unwrap_or([0; 4]));
-                                b.attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
-                            }
-                        }
-
-                        _ => {}
                     }
-
-                    ao += al;
                 }
+                offset += rec_sz;
             }
 
-            off += rd as i64;
-            remain -= rd as u64;
+            bytes_read_from_run += bytes_read;
+            file_off += bytes_read as i64;
+            bytes_to_read -= bytes_read;
         }
     }
 
