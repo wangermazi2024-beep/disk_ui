@@ -1,11 +1,12 @@
-//! 目录扫描入口 + 常规遍历 fallback（参考 WinDirStat FinderBasic）。
+//! 目录扫描入口 + 常规遍历 fallback（参考 WinDirStat FinderBasic + EnableReadPrivileges）。
 //!
-//! WinDirStat 的常规遍历用 NtQueryDirectoryFile（比 FindFirstFile/FindNextFile 快），
-//! 并且对权限问题做了容错：
-//! - 用 FILE_OPEN_FOR_BACKUP_INTENT 打开目录（允许读受保护目录）
-//! - 对物理大小为 0 的文件用 GetCompressedFileSize 修正
-//! - 对逻辑大小为 0 但 AllocationSize>0 的文件用 GetFileSizeEx 修正
-//! - 启用 SeBackupPrivilege + SeRestorePrivilege（即使非管理员也能读更多文件）
+//! 参考 WinDirStat 的设计：
+//! - 启用 SeBackupPrivilege + SeRestorePrivilege（即使非管理员，token 里有就能读更多文件）
+//! - read_dir 失败不中断（权限拒绝等），当作空目录返回
+//! - 单个文件 metadata 失败不中断，跳过该文件
+//! - 物理大小修正：压缩/稀疏文件用 GetCompressedFileSizeW（FinderBasic.cpp:177-194）
+//! - 逻辑大小修正：EndOfFile==0 但 AllocationSize>0 时用 GetFileSizeEx（FinderBasic.cpp:197-208）
+//! - CreateFile 用 FILE_FLAG_BACKUP_SEMANTICS 打开受保护文件
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +41,7 @@ fn drive_letter_of(path: &Path) -> Option<char> {
         .map(|c| c.to_ascii_uppercase())
 }
 
+/// 启动扫描线程。
 pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
     std::thread::spawn(move || {
         let start = SystemTime::now();
@@ -48,6 +50,10 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
 
         #[cfg(windows)]
         {
+            // 尝试启用 SeBackupPrivilege + SeRestorePrivilege（参考 WinDirStat EnableReadPrivileges）
+            // 即使非管理员，如果 token 里有这两个 privilege（比如通过组策略授予），启用后能读更多文件
+            enable_read_privileges();
+
             if let Some(drive) = as_drive_root(&root) {
                 if crate::mft_scan::is_elevated() {
                     eprintln!("[scan] 走 MFT 直读: drive={}", drive);
@@ -133,11 +139,12 @@ fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
 
 /// 常规遍历：递归扫描目录树。
 ///
-/// 参考 WinDirStat FinderBasic 的设计：
+/// 参考 WinDirStat FinderBasic 的容错设计：
 /// - read_dir 失败不中断（权限拒绝等），当作空目录返回
 /// - 单个文件 metadata 失败不中断，跳过该文件
 /// - 子目录扫描失败不中断父目录
-/// - 物理大小 = logical_size（常规遍历不区分，MFT 路径才准）
+/// - 压缩/稀疏文件用 GetCompressedFileSizeW 获取真实物理大小
+/// - 普通文件物理大小 = 簇对齐（和 Explorer "占用空间" 一致）
 fn scan_dir(
     path: &Path, depth: usize,
     counter: &Arc<AtomicU64>, cancel: &Arc<AtomicBool>,
@@ -169,6 +176,7 @@ fn scan_dir(
     let self_attrs: u32 = 0x10;
 
     let mut children = Vec::new();
+    // read_dir 失败不中断（参考 WinDirStat：权限拒绝等返回空目录）
     let entries = match std::fs::read_dir(path) {
         Ok(e) => e,
         Err(e) => {
@@ -182,15 +190,20 @@ fn scan_dir(
     for entry in entries.flatten() {
         let n = counter.fetch_add(1, Ordering::Relaxed);
         if n % 5000 == 0 { let _ = tx.send(ScanMessage::Progress(n)); }
-        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+
+        // 单个文件 metadata 失败不中断（参考 WinDirStat：跳过该文件）
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         let entry_name = entry.file_name().to_string_lossy().into_owned();
         let modified = system_time_to_filetime(meta.modified().ok());
+
         #[cfg(windows)]
         let (attrs, logical, physical) = {
             use std::os::windows::fs::MetadataExt;
             let attrs = meta.file_attributes();
             let logical = meta.len();
-            // 物理大小：对压缩文件用 GetCompressedFileSize，否则用 allocated
             let physical = get_physical_size(&entry.path(), logical, attrs);
             (attrs, logical, physical)
         };
@@ -198,8 +211,14 @@ fn scan_dir(
         let (attrs, logical, physical) = (if meta.is_dir() { 0x10 } else { 0x80 }, meta.len(), meta.len());
 
         if meta.is_dir() {
-            if let Ok(child) = scan_dir(&entry.path(), depth + 1, counter, cancel, tx) {
-                children.push(child);
+            // 子目录扫描失败不中断父目录（参考 WinDirStat）
+            match scan_dir(&entry.path(), depth + 1, counter, cancel, tx) {
+                Ok(child) => children.push(child),
+                Err(e) => {
+                    if depth <= 3 {
+                        eprintln!("[scan] 子目录扫描失败 (path={}, err={})", entry.path().display(), e);
+                    }
+                }
             }
         } else {
             children.push(Node::new_file_with_meta(entry_name, logical, physical, file_color(), modified, 0, 0, attrs, 0, false, String::new()));
@@ -209,9 +228,10 @@ fn scan_dir(
 }
 
 /// Windows 下获取文件的物理大小（占用空间）。
+///
 /// 参考 WinDirStat FinderBasic.cpp:177-194：
-/// - 如果 AllocationSize==0 且文件较大或压缩/稀疏，用 GetCompressedFileSize 修正
-/// - 否则用 metadata 的 allocated 大小
+/// - 压缩/稀疏文件用 GetCompressedFileSizeW 拿真实占用
+/// - 普通文件用簇对齐估算（和 Explorer "占用空间" 一致）
 #[cfg(windows)]
 fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
     use std::os::windows::ffi::OsStrExt;
@@ -220,7 +240,8 @@ fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
     const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
     const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
 
-    // 对压缩/稀疏文件，用 GetCompressedFileSize 拿真实占用
+    // 对压缩/稀疏文件，用 GetCompressedFileSizeW 拿真实占用
+    // （参考 WinDirStat FinderBasic.cpp:177-194）
     if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let mut high: u32 = 0;
@@ -230,6 +251,55 @@ fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
         }
     }
     // 普通文件：logical 向上对齐到簇大小（4096）
+    // 和 Explorer "占用空间" 一致
     let cluster = 4096u64;
-    ((logical + cluster - 1) / cluster) * cluster
+    if logical == 0 { 0 } else { ((logical + cluster - 1) / cluster) * cluster }
+}
+
+/// 启用 SeBackupPrivilege + SeRestorePrivilege（参考 WinDirStat EnableReadPrivileges）。
+///
+/// 即使非管理员，如果 token 里有这两个 privilege（比如通过组策略授予），
+/// 启用后能读更多受保护文件。失败不中断（属于增强功能，不是必需的）。
+#[cfg(windows)]
+fn enable_read_privileges() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW,
+        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        TOKEN_PRIVILEGES, LUID_AND_ATTRIBUTES,
+        SE_BACKUP_NAME, SE_RESTORE_NAME,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
+            return;
+        }
+
+        // 对每个 privilege：LookupPrivilegeValue + AdjustTokenPrivileges
+        for priv_name in [SE_BACKUP_NAME, SE_RESTORE_NAME] {
+            let mut luid = LUID { LowPart: 0, HighPart: 0 };
+            if LookupPrivilegeValueW(std::ptr::null(), priv_name, &mut luid) == 0 {
+                continue;
+            }
+            // 构建 TOKEN_PRIVILEGES（1 个 privilege）
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            // AdjustTokenPrivileges 即使部分失败也返回非零，需要 GetLastError 检查
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &tp as *const _ as *const TOKEN_PRIVILEGES,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            // 不检查返回值——失败说明 token 里没这个 privilege，属于正常（非管理员）
+        }
+        CloseHandle(token);
+    }
+    eprintln!("[scan] 已尝试启用 SeBackupPrivilege + SeRestorePrivilege");
 }
