@@ -177,7 +177,7 @@ impl eframe::App for DiskUiApp {
                 .and_then(|i| i.as_ref())
                 .map(|i| i.file_system.as_str())
                 .unwrap_or(""),
-            self.dedup_sizes.first().copied().unwrap_or(0),
+            self.partitions.first().map(|p| p.size).unwrap_or(0),
             self.partitions.first().map(|p| p.file_count).unwrap_or(0),
             self.partitions.first().map(|p| p.folder_count).unwrap_or(0),
         );
