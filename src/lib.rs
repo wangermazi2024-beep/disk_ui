@@ -12,6 +12,8 @@ pub mod disk_info;
 pub mod format;
 pub mod mft_parse;
 pub mod model;
+pub mod applog;
+pub mod export;
 #[cfg(windows)]
 pub mod mft_scan;
 pub mod scan;

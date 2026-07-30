@@ -11,6 +11,7 @@ use crate::format::human_size;
 pub enum TopbarAction {
     None,
     StartScan,
+    ExportCsv,
 }
 
 pub struct TopbarState<'a> {
@@ -20,6 +21,10 @@ pub struct TopbarState<'a> {
     pub scan_error: Option<&'a str>,
     pub used_size: u64,
     pub total_size: u64,
+    /// 有扫描结果时才允许点"导出CSV"。
+    pub can_export: bool,
+    /// 上次导出的提示信息（成功路径或失败原因），导出后一直显示直到下次导出。
+    pub export_status: Option<&'a str>,
 }
 
 pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
@@ -57,6 +62,17 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                     );
                 } else if let Some(err) = state.scan_error {
                     ui.label(RichText::new(err).color(Color32::from_rgb(0xE0, 0x55, 0x5B)));
+                }
+
+                ui.add_space(8.0);
+                let export_btn = egui::Button::new(RichText::new("导出CSV").color(Color32::WHITE))
+                    .fill(Color32::from_rgb(0x5A, 0x5A, 0x60))
+                    .corner_radius(CornerRadius::same(6));
+                if ui.add_enabled(state.can_export && !state.scanning, export_btn).clicked() {
+                    action = TopbarAction::ExportCsv;
+                }
+                if let Some(msg) = state.export_status {
+                    ui.label(RichText::new(msg).color(Color32::from_rgb(0x8B, 0xC3, 0x4A)));
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

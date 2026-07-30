@@ -10,7 +10,7 @@
 // 把 lib 暴露的模块重新引入到 bin 的 crate 命名空间，
 // 这样 `mod app` 里的代码可以继续用 `crate::model::Node` 之类的路径。
 pub use disk_ui::{
-    categorize, disk_info, format, mft_parse, model, scan,
+    applog, categorize, disk_info, dlog, export, format, mft_parse, model, scan,
 };
 #[cfg(windows)]
 pub use disk_ui::mft_scan;
@@ -43,6 +43,7 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    applog::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 680.0]),
         ..Default::default()

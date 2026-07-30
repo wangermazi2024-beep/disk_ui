@@ -41,18 +41,21 @@ pub struct DiskUiApp {
     scanned_count: u64,
     scan_error: Option<String>,
     scan_rx: Option<Receiver<ScanMessage>>,
+
+    /// 上次点击"导出CSV"的结果提示（成功路径 / 失败原因），显示在顶栏。
+    export_status: Option<String>,
 }
 
 impl Default for DiskUiApp {
     fn default() -> Self {
-        eprintln!("[app] 初始化：枚举磁盘分区...");
+        crate::dlog!("[app] 初始化：枚举磁盘分区...");
         let all_drives = disk_info::enumerate_drives();
-        eprintln!("[app] 枚举到 {} 个分区", all_drives.len());
+        crate::dlog!("[app] 枚举到 {} 个分区", all_drives.len());
 
         // 默认只显示 C 盘；找不到 C 盘就退回第一个，再找不到就退回 demo 数据。
         let (partitions, partition_infos, root_path) =
             if let Some(c) = all_drives.iter().find(|d| d.drive_letter == 'C').cloned() {
-                eprintln!("[app] 默认显示 C 盘: {}", c.display_name());
+                crate::dlog!("[app] 默认显示 C 盘: {}", c.display_name());
                 let placeholder = Node::new_folder_with_meta(
                     c.display_name(),
                     folder_color_for_drive(),
@@ -62,7 +65,7 @@ impl Default for DiskUiApp {
                 );
                 (vec![placeholder], vec![Some(c.clone())], c.root_path())
             } else if let Some(first) = all_drives.first().cloned() {
-                eprintln!(
+                crate::dlog!(
                     "[app] 没找到 C 盘，退回第一个分区: {}",
                     first.display_name()
                 );
@@ -79,7 +82,7 @@ impl Default for DiskUiApp {
                     first.root_path(),
                 )
             } else {
-                eprintln!("[app] 没枚举到任何分区，使用 demo 数据");
+                crate::dlog!("[app] 没枚举到任何分区，使用 demo 数据");
                 let demos = scan::demo_partitions();
                 let infos = demos.iter().map(|_| None).collect();
                 let root = demos
@@ -103,6 +106,7 @@ impl Default for DiskUiApp {
             scanned_count: 0,
             scan_error: None,
             scan_rx: None,
+            export_status: None,
         }
     }
 }
@@ -159,10 +163,14 @@ impl eframe::App for DiskUiApp {
                 scan_error: self.scan_error.as_deref(),
                 used_size,
                 total_size,
+                can_export: !self.partitions.is_empty(),
+                export_status: self.export_status.as_deref(),
             },
         );
-        if matches!(topbar_action, TopbarAction::StartScan) {
-            self.start_scan();
+        match topbar_action {
+            TopbarAction::StartScan => self.start_scan(),
+            TopbarAction::ExportCsv => self.export_csv(),
+            TopbarAction::None => {}
         }
 
         sidebar::show(
@@ -205,12 +213,42 @@ impl DiskUiApp {
     fn start_scan(&mut self) {
         let path = PathBuf::from(self.root_path.trim());
         let (tx, rx) = mpsc::channel();
-        eprintln!("[app] 用户点击扫描，启动后台线程: root={}", path.display());
+        crate::dlog!("[app] 用户点击扫描，启动后台线程: root={}", path.display());
         scan::spawn_scan(path, tx);
         self.scan_rx = Some(rx);
         self.scanning = true;
         self.scanned_count = 0;
         self.scan_error = None;
+    }
+
+    fn export_csv(&mut self) {
+        let Some(root) = self.partitions.first() else {
+            self.export_status = Some("没有可导出的扫描结果".to_string());
+            return;
+        };
+        // 导出用的根路径：优先用这个分区的 DiskInfo（比如 "C:\\"），没有就退回
+        // 用户当前填在输入框里的路径。
+        let root_path = self
+            .partition_infos
+            .first()
+            .and_then(|i| i.as_ref())
+            .map(|i| i.root_path())
+            .unwrap_or_else(|| self.root_path.clone());
+        let drive_letter = root_path.chars().next().unwrap_or('C');
+        let out_path = crate::export::default_export_path(drive_letter);
+        crate::dlog!("[app] 用户点击导出CSV: root_path={} out={}", root_path, out_path.display());
+        match crate::export::export_tree_csv(root, &root_path, &out_path) {
+            Ok((files, folders)) => {
+                let msg = format!("已导出 {} 个文件 / {} 个文件夹 → {}", files, folders, out_path.display());
+                crate::dlog!("[app] 导出成功: {}", msg);
+                self.export_status = Some(msg);
+            }
+            Err(e) => {
+                let msg = format!("导出失败: {e}");
+                crate::dlog!("[app] {}", msg);
+                self.export_status = Some(msg);
+            }
+        }
     }
 
     fn poll_scan(&mut self) {
@@ -239,13 +277,13 @@ impl DiskUiApp {
                     self.selected = None;
                     self.scanning = false;
                     finished = true;
-                    eprintln!("[app] 扫描完成，已更新 partitions[0]");
+                    crate::dlog!("[app] 扫描完成，已更新 partitions[0]");
                 }
                 ScanMessage::Error(e) => {
                     self.scan_error = Some(e);
                     self.scanning = false;
                     finished = true;
-                    eprintln!(
+                    crate::dlog!(
                         "[app] 扫描报错: {}",
                         self.scan_error.as_deref().unwrap_or("")
                     );

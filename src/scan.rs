@@ -78,7 +78,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         let scan_start = SystemTime::now();
         // 先查磁盘信息
         let disk_info = drive_letter_of(&root).and_then(crate::disk_info::query_disk_info);
-        eprintln!(
+        crate::dlog!(
             "[scan] 启动扫描: root={}, disk_info={}",
             root.display(),
             disk_info
@@ -102,7 +102,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         {
             if let Some(drive) = as_drive_root(&root) {
                 if crate::mft_scan::mft_scan_available(drive) {
-                    eprintln!("[scan] 走 MFT 直读路径: drive={}", drive);
+                    crate::dlog!("[scan] 走 MFT 直读路径: drive={}", drive);
                     let mft_start = SystemTime::now();
                     match crate::mft_scan::scan_drive_via_mft(drive, &tx) {
                         Ok(result) => {
@@ -113,7 +113,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                 }
                             }
                             let mft_elapsed = mft_start.elapsed().unwrap_or_default();
-                            eprintln!(
+                            crate::dlog!(
                                 "[scan] MFT 直读完成: files={}, folders={}, size={}, 耗时 {:.1}s",
                                 root_node.file_count,
                                 root_node.folder_count,
@@ -133,38 +133,38 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                                 } else {
                                     0.0
                                 };
-                                eprintln!(
+                                crate::dlog!(
                                     "[scan] 一致性检查（物理去重口径）: 扫描汇总={}, 系统已用={}, 比例={:.1}%",
                                     scanned_str, used_str, ratio
                                 );
                                 if ratio < 60.0 {
-                                    eprintln!(
+                                    crate::dlog!(
                                         "[scan] ⚠ 扫描汇总不到系统已用的 60%，可能有丢数据（正常 70%~95%，差值含 $MFT/簇碎片/VSS/USN日志）"
                                     );
                                 } else if ratio > 105.0 {
-                                    eprintln!(
+                                    crate::dlog!(
                                         "[scan] ⚠ 扫描汇总超过系统已用 105%，即使已按 base record 去重仍偏高，可能含 ADS（备用数据流）未单独计入或压缩/稀疏文件的逻辑大小与占用不一致"
                                     );
                                 } else {
-                                    eprintln!(
+                                    crate::dlog!(
                                         "[scan] ✓ 扫描汇总在合理范围内（差值 = $MFT + 簇碎片 + VSS + NTFS元数据）"
                                     );
                                 }
                             }
                             let _ = tx.send(ScanMessage::Done(Box::new(root_node), disk_info, dedup_size));
                             let total = scan_start.elapsed().unwrap_or_default();
-                            eprintln!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
+                            crate::dlog!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
                             return;
                         }
                         Err(e) => {
-                            eprintln!("[scan] MFT 直读失败，回退到标准目录遍历: {e}");
+                            crate::dlog!("[scan] MFT 直读失败，回退到标准目录遍历: {e}");
                         }
                     }
                 } else {
-                    eprintln!("[scan] MFT 不可用，走标准目录遍历: drive={}", drive);
+                    crate::dlog!("[scan] MFT 不可用，走标准目录遍历: drive={}", drive);
                 }
             } else {
-                eprintln!(
+                crate::dlog!(
                     "[scan] 目标不是整盘根路径，走标准目录遍历: root={}",
                     root.display()
                 );
@@ -172,7 +172,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         }
         #[cfg(not(windows))]
         {
-            eprintln!(
+            crate::dlog!(
                 "[scan] 非 Windows 平台，走标准目录遍历: root={}",
                 root.display()
             );
@@ -187,7 +187,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                         node.name = info.display_name();
                     }
                 }
-                eprintln!(
+                crate::dlog!(
                     "[scan] 标准遍历完成: files={}, folders={}, size={}",
                     node.file_count,
                     node.folder_count,
@@ -203,12 +203,12 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                 let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info, dedup_size_fallback));
             }
             Err(e) => {
-                eprintln!("[scan] 标准遍历失败: {e}");
+                crate::dlog!("[scan] 标准遍历失败: {e}");
                 let _ = tx.send(ScanMessage::Error(format!("扫描失败: {e}")));
             }
         }
         let total = scan_start.elapsed().unwrap_or_default();
-        eprintln!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
+        crate::dlog!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
     });
 }
 
@@ -255,7 +255,7 @@ fn scan_dir(
 
     // 顶层目录开始时打一行日志（深度 0/1/2），方便定位卡在哪
     if depth <= 2 {
-        eprintln!("[scan] 扫描目录 (depth={}): {}", depth, path.display());
+        crate::dlog!("[scan] 扫描目录 (depth={}): {}", depth, path.display());
     }
 
     // 拿本目录自身的元数据
@@ -279,7 +279,7 @@ fn scan_dir(
         Err(e) => {
             // 只在浅层打这个警告，深层目录太多会刷屏
             if depth <= 3 {
-                eprintln!(
+                crate::dlog!(
                     "[scan] read_dir 失败 (depth={}, path={}, err={})，当作空目录继续",
                     depth,
                     path.display(),
@@ -310,7 +310,7 @@ fn scan_dir(
             Ok(m) => m,
             Err(e) => {
                 if depth <= 3 {
-                    eprintln!(
+                    crate::dlog!(
                         "[scan] metadata 失败 (entry={}, err={})，跳过",
                         entry.path().display(),
                         e
@@ -335,7 +335,7 @@ fn scan_dir(
                 Ok(child) => children.push(child),
                 Err(e) => {
                     if depth <= 3 {
-                        eprintln!(
+                        crate::dlog!(
                             "[scan] 子目录扫描失败 (path={}, err={})，跳过",
                             entry.path().display(),
                             e
@@ -355,7 +355,7 @@ fn scan_dir(
     }
     // 顶层目录扫完时打一行汇总
     if depth <= 1 {
-        eprintln!(
+        crate::dlog!(
             "[scan] 目录扫描完成 (depth={}, path={}, 本层 {} 项)",
             depth,
             path.display(),
@@ -742,17 +742,17 @@ mod tests {
             .iter()
             .find(|p| p.exists() && fs::read_dir(p).is_ok())
             .expect("至少要有一个候选目录可用");
-        eprintln!("[test] 真实目录测试: {}", target.display());
+        crate::dlog!("[test] 真实目录测试: {}", target.display());
         let counter = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
         let node = scan_dir(target, 0, &counter, &cancel, &tx).unwrap();
         let (files, folders, size) = ground_truth(target);
-        eprintln!(
+        crate::dlog!(
             "[test] scan_dir:     files={}, folders={}, size={}",
             node.file_count, node.folder_count, node.size
         );
-        eprintln!(
+        crate::dlog!(
             "[test] ground_truth: files={}, folders={}, size={}",
             files, folders, size
         );

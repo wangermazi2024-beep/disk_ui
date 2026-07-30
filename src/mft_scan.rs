@@ -114,7 +114,7 @@ fn jiff_timestamp_to_windows_filetime(ts: jiff::Timestamp) -> u64 {
 /// 真正读 MFT 是通过卷设备的 raw read，不需要 `SeBackupPrivilege`。
 pub fn mft_scan_available(drive_letter: char) -> bool {
     if !is_elevated() {
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] 不可用：当前进程非管理员 (drive={})",
             drive_letter
         );
@@ -133,7 +133,7 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            eprintln!(
+            crate::dlog!(
                 "[mft_scan] 不可用：无法打开卷设备 (drive={}, GetLastError={})",
                 drive_letter,
                 GetLastError()
@@ -154,14 +154,14 @@ pub fn mft_scan_available(drive_letter: char) -> bool {
         );
         CloseHandle(h);
         if ok == 0 {
-            eprintln!(
+            crate::dlog!(
                 "[mft_scan] 不可用：FSCTL_GET_NTFS_VOLUME_DATA 失败 (drive={}, GetLastError={})，可能不是 NTFS",
                 drive_letter,
                 GetLastError()
             );
             return false;
         }
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] 可用：drive={} 是 NTFS，BytesPerCluster={}, BytesPerFileRecordSegment={}, BytesPerSector={}, MftStartLcn={}, MftValidDataLength={}",
             drive_letter,
             buf.BytesPerCluster,
@@ -188,7 +188,7 @@ struct VolumeInfo {
 fn open_volume_and_get_info(drive_letter: char) -> Result<(HANDLE, VolumeInfo), MftError> {
     let path = wide(&format!(r"\\.\{drive_letter}:"));
     unsafe {
-        eprintln!("[mft_scan] 打开卷设备: \\\\.\\{drive_letter}:");
+        crate::dlog!("[mft_scan] 打开卷设备: \\\\.\\{drive_letter}:");
         let h = CreateFileW(
             path.as_ptr(),
             GENERIC_READ_U32,
@@ -203,7 +203,7 @@ fn open_volume_and_get_info(drive_letter: char) -> Result<(HANDLE, VolumeInfo), 
                 "无法打开卷设备 \\\\.\\{drive_letter}:（需要管理员权限）"
             )));
         }
-        eprintln!("[mft_scan] 卷设备句柄已打开: handle={:p}", h as *const ());
+        crate::dlog!("[mft_scan] 卷设备句柄已打开: handle={:p}", h as *const ());
 
         let mut buf: NTFS_VOLUME_DATA_BUFFER = std::mem::zeroed();
         let mut ret = 0u32;
@@ -229,7 +229,7 @@ fn open_volume_and_get_info(drive_letter: char) -> Result<(HANDLE, VolumeInfo), 
             mft_start_lcn: buf.MftStartLcn as u64,
             mft_valid_data_length: buf.MftValidDataLength as u64,
         };
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerSector={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={} ({:.2} MB)",
             info.bytes_per_cluster,
             info.bytes_per_sector,
@@ -259,7 +259,7 @@ struct MftRun {
 fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
     let mft_path = wide(&format!(r"{}:\$MFT", drive_letter));
     unsafe {
-        eprintln!("[mft_scan] 打开 $MFT 文件（FILE_READ_ATTRIBUTES）拿 retrieval pointers");
+        crate::dlog!("[mft_scan] 打开 $MFT 文件（FILE_READ_ATTRIBUTES）拿 retrieval pointers");
         let h = CreateFileW(
             mft_path.as_ptr(),
             FILE_READ_ATTRIBUTES as u32,
@@ -270,7 +270,7 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
             null_mut(),
         );
         if h == INVALID_HANDLE_VALUE || h.is_null() {
-            eprintln!(
+            crate::dlog!(
                 "[mft_scan] 打开 $MFT 失败 (GetLastError={})，退回到单 run 假设（用 MftStartLcn）",
                 GetLastError()
             );
@@ -303,7 +303,7 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
         CloseHandle(h);
 
         if ok == 0 {
-            eprintln!(
+            crate::dlog!(
                 "[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 失败 (GetLastError={})，退回到单 run 假设",
                 GetLastError()
             );
@@ -318,13 +318,13 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
         // 解析 RETRIEVAL_POINTERS_BUFFER
         let rp = &*(out_buf.as_ptr() as *const RETRIEVAL_POINTERS_BUFFER);
         let extent_count = rp.ExtentCount as usize;
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] MFT 有 {} 个 extent（连续段），StartingVcn={}",
             extent_count, rp.StartingVcn
         );
 
         if extent_count == 0 {
-            eprintln!("[mft_scan] MFT 没有 extent？退回到单 run 假设");
+            crate::dlog!("[mft_scan] MFT 没有 extent？退回到单 run 假设");
             let cluster_count = info.mft_valid_data_length / info.bytes_of_cluster();
             return vec![MftRun {
                 start_vcn: 0,
@@ -351,12 +351,12 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
                     start_lcn: lcn,
                     cluster_count: count,
                 });
-                eprintln!(
+                crate::dlog!(
                     "[mft_scan]   extent[{}]: VCN={} LCN={} clusters={}",
                     i, prev_vcn, lcn, count
                 );
             } else {
-                eprintln!(
+                crate::dlog!(
                     "[mft_scan]   extent[{}]: VCN={} SPARSE (跳过)",
                     i, prev_vcn
                 );
@@ -364,7 +364,7 @@ fn get_mft_runs(drive_letter: char, info: &VolumeInfo) -> Vec<MftRun> {
             prev_vcn = next_vcn;
         }
         if runs.is_empty() {
-            eprintln!("[mft_scan] 所有 extent 都是 sparse？退回到单 run 假设");
+            crate::dlog!("[mft_scan] 所有 extent 都是 sparse？退回到单 run 假设");
             let cluster_count = info.mft_valid_data_length / info.bytes_per_cluster;
             return vec![MftRun {
                 start_vcn: 0,
@@ -524,14 +524,14 @@ pub fn scan_drive_via_mft(
     let cluster_size = info.bytes_per_cluster.max(sector_size);
 
     let total_records = info.mft_valid_data_length / record_size as u64;
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 开始读 MFT: total_records={}, record_size={}B, sector_size={}B, cluster_size={}B",
         total_records, record_size, sector_size, cluster_size
     );
 
     // 拿 MFT 的簇映射表（处理碎片化）
     let runs = get_mft_runs(drive_letter, &info);
-    eprintln!("[mft_scan] MFT 共 {} 个物理 run", runs.len());
+    crate::dlog!("[mft_scan] MFT 共 {} 个物理 run", runs.len());
 
     // ── v14：把手撸的 fixup + 属性遍历 + 扩展记录二次读盘，换成
     //    omerbenamram/mft 这个经过审计的库来做 ──────────────────────────
@@ -546,7 +546,7 @@ pub fn scan_drive_via_mft(
     for (run_idx, run) in runs.iter().enumerate() {
         let run_bytes = run.cluster_count * cluster_size;
         let run_offset_bytes = run.start_lcn * cluster_size;
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] 读取 run[{}] 到缓冲区: LCN={}, 字节={} ({:.2} MB)",
             run_idx, run.start_lcn, run_bytes, run_bytes as f64 / 1e6
         );
@@ -571,7 +571,7 @@ pub fn scan_drive_via_mft(
                 ReadFile(vol_handle, buf.as_mut_ptr(), to_read as u32, &mut bytes_returned, null_mut())
             };
             if ok == 0 || bytes_returned == 0 {
-                eprintln!(
+                crate::dlog!(
                     "[mft_scan] ReadFile 提前结束 (run={}, GetLastError={})",
                     run_idx, unsafe { GetLastError() }
                 );
@@ -588,7 +588,7 @@ pub fn scan_drive_via_mft(
     // v17：vol_handle 先不关——下面解析属性时，如果碰到 non-resident 的
     // $ATTRIBUTE_LIST（`mft` 库解析不了，见 read_nonresident_attribute 的注释），
     // 需要用这个卷句柄按 mapping pairs 手动读盘重建内容。等整个解析循环结束后再关。
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] MFT 缓冲区读取完成: {} 字节 (~{} 条记录)",
         mft_buffer.len(),
         mft_buffer.len() / record_size
@@ -765,11 +765,11 @@ pub fn scan_drive_via_mft(
         });
     }
 
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 解析完成（mft 库）: 有效base={}, 目录={}, 文件={}, 无法解析={}, 已删除={}, 扩展记录={}, 无$FILE_NAME={}",
         valid_count, dir_count, file_count, fixup_failed, not_in_use, not_base, no_file_name
     );
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] non-resident $ATTRIBUTE_LIST 兜底: 遇到 {}, 读盘重建成功 {}, 失败 {}",
         nonresident_alist_seen, nonresident_alist_recovered, nonresident_alist_read_failed
     );
@@ -805,7 +805,7 @@ pub fn scan_drive_via_mft(
             None => resolve_failed += 1,
         }
     }
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 扩展记录大小解析（查表，无需二次读盘）: 成功 {}, 失败 {}",
         resolved_count, resolve_failed
     );
@@ -883,7 +883,7 @@ pub fn scan_drive_via_mft(
             }
         }
     }
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 邻接表构建完成: {} 个父节点, 额外硬链接挂载 {} 处",
         children_of.len(),
         hardlink_extra_count
@@ -913,7 +913,7 @@ pub fn scan_drive_via_mft(
         &mut ancestors,
     );
 
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 树构建完成: root.size(树汇总,含硬链接重复计入)={}, dedup_size(物理去重)={}, files={}, folders={}",
         crate::format::human_size(root_node.size),
         crate::format::human_size(dedup_size),
@@ -954,7 +954,7 @@ fn build_subtree(
     // ancestors 在进入本层时插入、退出前移除，只代表"从 root 到当前节点"这一条
     // 路径上的记录号集合，不是全树累计。
     if !ancestors.insert(record_idx) {
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] 警告：记录号 {} 在当前递归路径上形成了真正的自引用环（磁盘可能有损坏，子孙链指回了自己），跳过其子项避免死循环",
             record_idx
         );
