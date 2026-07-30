@@ -16,8 +16,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, SetFilePointerEx, FILE_BEGIN,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    FILE_FLAG_NO_BUFFERING, FILE_READ_DATA, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_NO_BUFFERING, FILE_READ_DATA, FILE_READ_ATTRIBUTES,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -178,7 +178,7 @@ struct VOL_INFO {
     rec_size: u32,
     _clus_per_rec: u32,
     _mft_valid: i64,
-    _mft_lcn: i64,
+    mft_lcn: i64,          // MftStartLcn — MFT 起始簇号
     _mft2_lcn: i64,
     _mft_zone_start: i64,
     _mft_zone_end: i64,
@@ -208,35 +208,52 @@ pub fn scan_drive_via_mft(drive_letter: char, _tx: &Sender<ScanMessage>) -> Resu
     let rec_sz = vi.rec_size as usize;
     crate::dlog!("[mft] 簇={} 记录={}", human_size(cls), rec_sz);
 
-    // 获取 $MFT data runs via FSCTL_GET_RETRIEVAL_POINTERS (WinDirStat 风格)
-    let mft_ws: Vec<u16> = format!(r"\\.\{}:\$MFT", drive_letter).encode_utf16().chain([0]).collect();
-    let fh = unsafe { CreateFileW(mft_ws.as_ptr(), FILE_READ_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null_mut(), OPEN_EXISTING, 0x200000, std::ptr::null_mut()) };
-    if fh == INVALID_HANDLE_VALUE { unsafe { CloseHandle(vol); } return Err("打开 $MFT 失败".into()); }
-
+    // 获取 $MFT data runs via FSCTL_GET_RETRIEVAL_POINTERS
+    // 注意：$MFT 不能用 FILE_READ_DATA 打开（NTFS 驱动会拒绝），
+    // 只能用 FILE_READ_ATTRIBUTES + FILE_FLAG_OPEN_REPARSE_POINT
+    let mft_ws: Vec<u16> = format!(r"{}:\$MFT", drive_letter).encode_utf16().chain([0]).collect();
     let mut runs: Vec<(u64, i64, u64)> = Vec::new();
-    let mut sv = 0i64;
-    loop {
-        let inp = STARTING_VCN_INPUT_BUFFER { StartingVcn: sv };
-        let mut buf = vec![0u8; std::mem::size_of::<RETRIEVAL_POINTERS_BUFFER>() + 4096];
-        let mut br2 = 0u32;
-        let ok = unsafe { DeviceIoControl(fh, FSCTL_GET_RETRIEVAL_POINTERS,
-            &inp as *const _ as *const _, std::mem::size_of::<STARTING_VCN_INPUT_BUFFER>() as u32,
-            buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut br2, std::ptr::null_mut()) };
-        let rp = unsafe { &*(buf.as_ptr() as *const RETRIEVAL_POINTERS_BUFFER) };
-        let ec = rp.ExtentCount as usize;
-        let ext_ptr: *const _ = &rp.Extents[0];
-        let exts = unsafe { std::slice::from_raw_parts(ext_ptr, ec) };
-        let mut vcn = rp.StartingVcn;
-        for ext in exts {
-            let nv = ext.NextVcn;
-            runs.push((vcn as u64, ext.Lcn, (nv - vcn) as u64));
-            vcn = nv;
+    {
+        let fh = unsafe { CreateFileW(mft_ws.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null_mut(), OPEN_EXISTING,
+            0x02000000, // FILE_FLAG_BACKUP_SEMANTICS（旧版已验证可行）
+            std::ptr::null_mut()) };
+        if fh != INVALID_HANDLE_VALUE {
+            let mut sv = 0i64;
+            loop {
+                let inp = STARTING_VCN_INPUT_BUFFER { StartingVcn: sv };
+                let mut buf = vec![0u8; std::mem::size_of::<RETRIEVAL_POINTERS_BUFFER>() + 4096];
+                let mut br2 = 0u32;
+                let ok = unsafe { DeviceIoControl(fh, FSCTL_GET_RETRIEVAL_POINTERS,
+                    &inp as *const _ as *const _, std::mem::size_of::<STARTING_VCN_INPUT_BUFFER>() as u32,
+                    buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut br2, std::ptr::null_mut()) };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err != 234 { break; } // ERROR_MORE_DATA means need bigger buffer
+                }
+                let rp = unsafe { &*(buf.as_ptr() as *const RETRIEVAL_POINTERS_BUFFER) };
+                let ec = rp.ExtentCount as usize;
+                let ext_ptr: *const _ = &rp.Extents[0];
+                let exts = unsafe { std::slice::from_raw_parts(ext_ptr, ec) };
+                let mut vcn = rp.StartingVcn;
+                for ext in exts {
+                    let nv = ext.NextVcn;
+                    runs.push((vcn as u64, ext.Lcn, (nv - vcn) as u64));
+                    vcn = nv;
+                }
+                if ok != 0 { break; }
+                sv = vcn;
+            }
+            unsafe { CloseHandle(fh); }
         }
-        if ok != 0 { break; }
-        sv = vcn;
     }
-    unsafe { CloseHandle(fh); }
+    // 如果 FSCTL 失败（权限不足等），退回到单 run 假设：MFT 从 mft_lcn 开始连续
+    if runs.is_empty() {
+        crate::dlog!("[mft] FSCTL 失败，退回到单 run 假设 (MFT LCN={})", vi.mft_lcn);
+        let cluster_count = vi._mft_valid as u64 / cls;
+        runs.push((0, vi.mft_lcn, cluster_count));
+    }
     crate::dlog!("[mft] {} 个 data run", runs.len());
 
     // ── WinDirStat 两表 ──
