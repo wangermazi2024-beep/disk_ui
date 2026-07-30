@@ -10,6 +10,23 @@ use std::path::{Path, PathBuf};
 
 use crate::model::Node;
 
+/// 手动拼路径字符串，而不是用 `PathBuf::join`。
+///
+/// **关键原因**：`std::path::PathBuf` 在 Windows 下对"以句点/空格结尾"的路径
+/// 分量处理不可靠（这类分量在 Win32 层面本来就是被 `GetFullPathNameW` 之类的
+/// API 特殊对待的边角情况，NTFS 底层允许，但路径库这一层会把结尾的点/空格
+/// 悄悄吃掉）。这份导出只是纯文本 CSV，不需要真的操作文件系统路径语义，
+/// 用字符串拼接可以完整保留原始文件名（比如 `92b.` 这种结尾带点的合法文件名），
+/// 之前用 `PathBuf::join` + `.display()` 时就是在这一步把结尾的 `.` 弄丢的——
+/// 扫描引擎本身拿到的名字和大小其实都是对的，只是导出这步把名字写错了。
+fn join_path(parent: &str, name: &str) -> String {
+    if parent.ends_with('\\') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}\\{name}")
+    }
+}
+
 /// 导出整棵树到 `out_path`。`root_path` 是这棵树对应的盘符根路径（比如 `"C:\\"`），
 /// 用来拼出每一行的完整路径——`Node` 本身只存相对的子节点名字，不存完整路径。
 ///
@@ -23,7 +40,7 @@ pub fn export_tree_csv(root: &Node, root_path: &str, out_path: &Path) -> io::Res
 
     let mut file_count = 0u64;
     let mut folder_count = 0u64;
-    let base = PathBuf::from(root_path);
+    let base = root_path.to_string();
 
     // 根节点自己也写一行（大小=整个树汇总，方便跟 WizTree CSV 里 "C:\" 那一行对比）。
     write_row(&mut f, &base, root.size, root.is_folder())?;
@@ -32,21 +49,21 @@ pub fn export_tree_csv(root: &Node, root_path: &str, out_path: &Path) -> io::Res
     Ok((file_count, folder_count))
 }
 
-fn write_row(f: &mut File, path: &Path, size: u64, is_folder: bool) -> io::Result<()> {
-    let path_str = path.display().to_string().replace('"', "\"\"");
+fn write_row(f: &mut File, path: &str, size: u64, is_folder: bool) -> io::Result<()> {
+    let path_str = path.replace('"', "\"\"");
     let kind = if is_folder { "D" } else { "F" };
     writeln!(f, "\"{path_str}\",{size},{kind}")
 }
 
 fn walk(
     node: &Node,
-    cur_path: &Path,
+    cur_path: &str,
     f: &mut File,
     file_count: &mut u64,
     folder_count: &mut u64,
 ) -> io::Result<()> {
     for child in &node.children {
-        let child_path = cur_path.join(&child.name);
+        let child_path = join_path(cur_path, &child.name);
         write_row(f, &child_path, child.size, child.is_folder())?;
         if child.is_folder() {
             *folder_count += 1;
