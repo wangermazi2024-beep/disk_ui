@@ -11,6 +11,8 @@ gui = ["dep:eframe", "dep:egui_extras"]
 egui = "0.35"
 egui_extras = { version = "0.35", optional = true }
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
+rayon = "1"
+dashmap = "6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -18,6 +20,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
     "Win32_System_Time",
     "Win32_Security",
     "Win32_Security_Authorization",
