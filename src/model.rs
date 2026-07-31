@@ -1,4 +1,7 @@
-//! 核心数据模型：递归的文件/文件夹树。
+//! 核心数据模型：递归的文件/文件夹树（v2 — WinDirStat 风格）。
+//!
+//! 参考 WinDirStat 的 CItem，每个节点同时保存 Logical Size 和 Physical Size。
+//! UI 默认以 Logical Size 为准（和 Explorer / WizTree 一致）。
 
 use egui::Color32;
 
@@ -9,52 +12,77 @@ pub enum NodeKind {
 }
 
 /// 树节点在树中的位置，用"从根节点出发的子节点下标序列"表示。
-/// 例如 `[]` 是根节点自己，`[2, 0]` 是根节点第 3 个孩子的第 1 个孩子。
 pub type NodePath = Vec<usize>;
 
 #[derive(Clone)]
 pub struct Node {
     pub name: String,
+    /// Logical Size（逻辑大小 = Explorer "大小" = $DATA.FileSize）。
+    /// UI 默认显示这个。向后兼容字段，等于 `logical_size`。
     pub size: u64,
-    /// 物理分配大小（allocated_length），cluster 对齐的磁盘占用。
-    /// 与 `size`（逻辑文件大小）不同：普通文件 ≈ size 向上取整到簇边界，
-    /// 稀疏文件可能远小于 size。
-    pub allocated: u64,
+    /// Logical Size（和 `size` 相同，显式保留方便区分）。
+    pub logical_size: u64,
+    /// Physical Size（物理大小 = Explorer "占用空间" = $DATA.AllocatedLength/Compressed）。
+    pub physical_size: u64,
     pub kind: NodeKind,
     pub color: Color32,
     pub children: Vec<Node>,
-
-    /// 该色块是否已展开显示子层（单击的效果）。
     pub expanded: bool,
 
-    /// 递归子树里的文件数（不含自己）。文件夹节点才有意义；文件节点恒为 0。
     pub file_count: u64,
-    /// 递归子树里的文件夹数（不含自己）。文件夹节点才有意义；文件节点恒为 0。
     pub folder_count: u64,
-    /// 最后修改时间，用 Windows FILETIME 格式（1601-01-01 起 100ns 单位）。
-    /// 0 表示未知。在非 Windows 平台上也会被填进去（用 SystemTime 折算），
-    /// 这样 UI 层格式化逻辑只有一份。
+    /// 最后修改时间（FILETIME，1601-01-01 起 100ns）。0=未知。
     pub modified_ft: u64,
-    /// Windows 文件属性位（`FILE_ATTRIBUTE_*`）。
-    /// 文件夹默认带 `0x10` (DIRECTORY)，文件默认带 `0x80` (NORMAL)。
+    /// 创建时间（FILETIME）。0=未知。
+    pub created_ft: u64,
+    /// 最后访问时间（FILETIME）。0=未知。
+    pub accessed_ft: u64,
+    /// Windows 文件属性位（FILE_ATTRIBUTE_*）。
     pub attributes: u32,
+    /// Reparse point tag（0=普通文件，IO_REPARSE_TAG_*=reparse point）。
+    pub reparse_tag: u32,
+    /// 是否是 NTFS 保留系统文件（record < 16，如 $MFT/$LogFile/$Bitmap）。
+    pub is_reserved: bool,
+    /// 所有者（SID 或用户名，可能为空）。
+    pub owner: String,
 }
 
 impl Node {
-    /// 用子节点列表构造一个文件夹节点；大小、文件数、文件夹数会自动汇总。
-    /// 修改时间取子节点里最大的；属性默认为 DIRECTORY。
     pub fn new_folder(name: impl Into<String>, color: Color32, children: Vec<Node>) -> Self {
-        let size = children.iter().map(|c| c.size).sum();
-        let allocated = children.iter().map(|c| c.allocated).sum();
+        Self::new_folder_with_meta(name, color, children, 0, 0, 0, 0x10, 0, false, String::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_folder_with_meta(
+        name: impl Into<String>,
+        color: Color32,
+        mut children: Vec<Node>,
+        modified_ft: u64,
+        created_ft: u64,
+        accessed_ft: u64,
+        attributes: u32,
+        reparse_tag: u32,
+        is_reserved: bool,
+        owner: String,
+    ) -> Self {
+        // 排序一次：按 logical_size 降序，文件夹优先
+        children.sort_by(|a, b| {
+            b.logical_size.cmp(&a.logical_size)
+                .then_with(|| b.is_folder().cmp(&a.is_folder()))
+        });
+        let logical_size = children.iter().map(|c| c.logical_size).sum();
+        let physical_size = children.iter().map(|c| c.physical_size).sum();
         let file_count = children.iter().map(|c| c.file_count).sum::<u64>()
             + children.iter().filter(|c| c.is_file()).count() as u64;
         let folder_count = children.iter().map(|c| c.folder_count).sum::<u64>()
             + children.iter().filter(|c| c.is_folder()).count() as u64;
-        let modified_ft = children.iter().map(|c| c.modified_ft).max().unwrap_or(0);
+        let modified_ft = modified_ft.max(children.iter().map(|c| c.modified_ft).max().unwrap_or(0));
+        let attributes = if attributes == 0 { 0x10 } else { attributes };
         Self {
             name: name.into(),
-            size,
-            allocated,
+            size: logical_size,
+            logical_size,
+            physical_size,
             kind: NodeKind::Folder,
             color,
             children,
@@ -62,42 +90,38 @@ impl Node {
             file_count,
             folder_count,
             modified_ft,
-            attributes: 0x10, // FILE_ATTRIBUTE_DIRECTORY
+            created_ft,
+            accessed_ft,
+            attributes,
+            reparse_tag,
+            is_reserved,
+            owner,
         }
     }
 
-    /// 同上，但允许显式指定本节点自身的修改时间和属性。
-    /// 文件夹的"修改时间"在 NTFS 上指的是该目录自身的 LastModificationTime
-    ///（不是子节点里的最大值），所以扫描时单独拿到后用这个构造器覆盖。
-    pub fn new_folder_with_meta(
-        name: impl Into<String>,
-        color: Color32,
-        children: Vec<Node>,
-        modified_ft: u64,
-        attributes: u32,
-    ) -> Self {
-        let mut node = Self::new_folder(name, color, children);
-        node.modified_ft = modified_ft.max(node.modified_ft);
-        node.attributes = if attributes == 0 { 0x10 } else { attributes };
-        node
+    pub fn new_file(name: impl Into<String>, logical: u64, color: Color32) -> Self {
+        Self::new_file_with_meta(name, logical, logical, color, 0, 0, 0, 0x80, 0, false, String::new())
     }
 
-    pub fn new_file(name: impl Into<String>, size: u64, color: Color32) -> Self {
-        Self::new_file_with_meta(name, size, size, color, 0, 0x80)
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub fn new_file_with_meta(
         name: impl Into<String>,
-        size: u64,
-        allocated: u64,
+        logical_size: u64,
+        physical_size: u64,
         color: Color32,
         modified_ft: u64,
+        created_ft: u64,
+        accessed_ft: u64,
         attributes: u32,
+        reparse_tag: u32,
+        is_reserved: bool,
+        owner: String,
     ) -> Self {
         Self {
             name: name.into(),
-            size,
-            allocated,
+            size: logical_size,
+            logical_size,
+            physical_size,
             kind: NodeKind::File,
             color,
             children: Vec::new(),
@@ -105,7 +129,12 @@ impl Node {
             file_count: 0,
             folder_count: 0,
             modified_ft,
+            created_ft,
+            accessed_ft,
             attributes: if attributes == 0 { 0x80 } else { attributes },
+            reparse_tag,
+            is_reserved,
+            owner,
         }
     }
 
@@ -125,7 +154,6 @@ impl Node {
         Some(cur)
     }
 
-    /// 递归清空所有节点的展开标记。
     pub fn collapse_all(&mut self) {
         self.expanded = false;
         for c in &mut self.children {
@@ -133,29 +161,16 @@ impl Node {
         }
     }
 
-    /// SpaceSniffer 风格的「独占展开」：
-    ///
-    /// 单击文件夹 X 时：
-    /// 1. 把 X 所在层（父节点的所有 children）全部 collapse_all。
-    /// 2. 如果 X 之前是折叠的，展开 X（toggle：如果已展开则折叠）。
-    /// 3. X 子树内部的旧展开状态也一并清除（换了视图就重置）。
     pub fn exclusive_toggle(&mut self, path: &[usize]) -> bool {
         if path.is_empty() {
             return false;
         }
-
         if path.len() == 1 {
             let target_idx = path[0];
-            let was_expanded = self
-                .children
-                .get(target_idx)
-                .map(|n| n.expanded)
-                .unwrap_or(false);
-
+            let was_expanded = self.children.get(target_idx).map(|n| n.expanded).unwrap_or(false);
             for child in &mut self.children {
                 child.collapse_all();
             }
-
             if !was_expanded {
                 if let Some(target) = self.children.get_mut(target_idx) {
                     target.expanded = true;
@@ -164,7 +179,6 @@ impl Node {
             }
             return false;
         }
-
         let next = path[0];
         if let Some(child) = self.children.get_mut(next) {
             child.exclusive_toggle(&path[1..])
@@ -174,7 +188,6 @@ impl Node {
     }
 }
 
-/// 文件类型分类统计。
 #[derive(Clone)]
 pub struct CategoryStat {
     pub label: &'static str,
