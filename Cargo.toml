@@ -1,0 +1,39 @@
+[package]
+name = "disk_ui"
+version = "0.2.0"
+edition = "2024"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui_extras"]
+
+[dependencies]
+egui = "0.35"
+egui_extras = { version = "0.35", optional = true }
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
+rayon = "1"
+dashmap = "6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Time",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "disk_ui"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "verify_mft"
+path = "src/bin/verify_mft.rs"
