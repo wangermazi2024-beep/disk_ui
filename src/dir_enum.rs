@@ -69,11 +69,12 @@ pub fn enum_dir_batch(path: &Path) -> std::io::Result<Vec<RawDirEntry>> {
         return Err(std::io::Error::last_os_error());
     }
 
-    // 1MB 缓冲区：以前是 64KB，对单层几千文件的目录（如 System32\）需要多次系统调用。
-    // 1MB 一次能装下更多条目，减少系统调用次数。NTFS 单次返回上限是 64K，但 API 会
-    // 自动多次填充缓冲区——这里给大点没坏处，内存占用 1MB×N 线程也可接受。
-    // 注意：GetFileInformationByHandleEx 不要求 buffer 是扇区对齐。
-    const BUF_SIZE: usize = 1024 * 1024;
+    // 64KB 缓冲区：单次系统调用通常能装下几百到上千条目录项。
+    // 曾经尝试扩到 1MB 想减少系统调用次数，结果反而慢了 6-10 倍——因为每个目录
+    // 都要 vec![0u8; BUF_SIZE] 分配+清零，1MB × 169608 文件夹 = 169GB 的内存写入，
+    // 加上 16 线程并发时 cache 频繁失效，开销远超省下的几次系统调用。
+    // 64KB 是 WinDirStat/Everything 等工具的常用值，实测最快。
+    const BUF_SIZE: usize = 64 * 1024;
     let mut buf: Vec<u8> = vec![0u8; BUF_SIZE];
     let mut out = Vec::new();
     let mut first_call = true;
