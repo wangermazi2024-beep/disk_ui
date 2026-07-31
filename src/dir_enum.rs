@@ -79,6 +79,10 @@ pub fn enum_dir_batch(path: &Path) -> std::io::Result<Vec<RawDirEntry>> {
         let class = if first_call { FileIdBothDirectoryRestartInfo } else { FileIdBothDirectoryInfo };
         first_call = false;
 
+        // 每次调用前清零：避免把上一轮调用残留在缓冲区尾部的陈旧字节，
+        // 误当成新条目解析（例如本轮返回的数据比上一轮少的情况）。
+        buf.iter_mut().for_each(|b| *b = 0);
+
         let ok = unsafe {
             GetFileInformationByHandleEx(
                 handle,
@@ -102,10 +106,20 @@ pub fn enum_dir_batch(path: &Path) -> std::io::Result<Vec<RawDirEntry>> {
 
         let mut offset: usize = 0;
         loop {
+            // 固定头部（不含变长 FileName）至少要完整落在缓冲区内才能安全读取。
+            let header_size = std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>();
+            if offset + header_size > BUF_SIZE {
+                break;
+            }
             let entry_ptr = unsafe { buf.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO };
             let entry: &FILE_ID_BOTH_DIR_INFO = unsafe { &*entry_ptr };
 
             let name_len_bytes = entry.FileNameLength as usize;
+            // 变长文件名部分也必须完整落在缓冲区内，否则这条记录不可信，直接停止本轮解析
+            // （不当成正常数据用，防止读出垃圾大小/名字污染统计）。
+            if offset + header_size + name_len_bytes > BUF_SIZE {
+                break;
+            }
             let name_ptr = entry.FileName.as_ptr();
             let name_u16: &[u16] = unsafe {
                 std::slice::from_raw_parts(name_ptr, name_len_bytes / 2)

@@ -11,3 +11,678 @@
 ==== DiskLens 启动 (unix_ts=1785476038) ====
 ==== DiskLens 启动 (unix_ts=1785476164) ====
 ==== DiskLens 启动 (unix_ts=1785476221) ====
+==== DiskLens 启动 (unix_ts=1785477170) ====
+[app] 初始化：枚举磁盘分区...
+[app] 枚举到 4 个分区
+[app] 默认显示 C 盘: 本地磁盘 (C:)
+[app] 用户点击扫描，启动后台线程: root=C:\
+[scan] 启动扫描: root=C:\, disk_info=本地磁盘 (C:)
+[mft_scan] 不可用：当前进程非管理员 (drive=C)
+[scan] MFT 不可用，走标准目录遍历: drive=C
+[scan] rayon 线程池: 16 线程
+[scan] 扫描目录 (depth=0): C:\
+[scan] 扫描目录 (depth=1): C:\SysGCC
+[scan] 扫描目录 (depth=1): C:\ProgramData
+[scan] 扫描目录 (depth=1): C:\PerfLogs
+[scan] 扫描目录 (depth=1): C:\Boot
+[scan] 扫描目录 (depth=1): C:\$Recycle.Bin
+[scan] 扫描目录 (depth=1): C:\Program Files
+[scan] 扫描目录 (depth=1): C:\GameAssistData
+[scan] 扫描目录 (depth=1): C:\Program Files (x86)
+[scan] 扫描目录 (depth=1): C:\Users
+[scan] 扫描目录 (depth=1): C:\Netease
+[scan] 扫描目录 (depth=1): C:\temp
+[scan] 扫描目录 (depth=1): C:\TEST
+[scan] 扫描目录 (depth=1): C:\System Volume Information
+[scan] 扫描目录 (depth=1): C:\Recovery
+[scan] 扫描目录 (depth=1): C:\Windows
+[scan] 扫描目录 (depth=2): C:\SysGCC\m68k-elf
+[scan] 扫描目录 (depth=2): C:\ProgramData\Alibaba
+[scan] 扫描目录 (depth=2): C:\ProgramData\OrayClient
+[scan] 扫描目录 (depth=2): C:\Boot\bg-BG
+[scan] 扫描目录 (depth=2): C:\$Recycle.Bin\S-1-5-18
+[scan] read_dir 失败 (depth=1, path=C:\PerfLogs, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\2345Soft
+[scan] read_dir 失败 (depth=1, path=C:\GameAssistData, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\2345Soft
+[scan] 扫描目录 (depth=2): C:\Users\CodexSandboxOffline
+[scan] 扫描目录 (depth=2): C:\Netease\GameViewer
+[scan] 目录扫描完成 (depth=1, path=C:\temp, 本层 0 项)
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Mail
+[scan] read_dir 失败 (depth=1, path=C:\System Volume Information, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=1, path=C:\Recovery, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\addins
+[scan] 扫描目录 (depth=2): C:\ProgramData\AntiCheatExpert
+[scan] 扫描目录 (depth=2): C:\ProgramData\Package Cache
+[scan] 扫描目录 (depth=2): C:\Boot\cs-CZ
+[scan] read_dir 失败 (depth=2, path=C:\$Recycle.Bin\S-1-5-18, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\NVIDIA Corporation
+[scan] 扫描目录 (depth=2): C:\Program Files\Eclipse Adoptium
+[scan] read_dir 失败 (depth=2, path=C:\Users\CodexSandboxOffline, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 目录扫描完成 (depth=1, path=C:\Netease, 本层 1 项)
+[scan] 目录扫描完成 (depth=1, path=C:\TEST, 本层 0 项)
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Media Player
+[scan] 扫描目录 (depth=2): C:\$Recycle.Bin\S-1-5-21-2708833987-1860422805-1439357699-1000
+[scan] 扫描目录 (depth=2): C:\Boot\it-IT
+[scan] 扫描目录 (depth=2): C:\Windows\appcompat
+[scan] 扫描目录 (depth=2): C:\ProgramData\boost_interprocess
+[scan] 扫描目录 (depth=2): C:\Boot\da-DK
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\360
+[scan] 扫描目录 (depth=2): C:\Users\Default
+[scan] 扫描目录 (depth=2): C:\Boot\el-GR
+[scan] 扫描目录 (depth=2): C:\Windows\Offline Web Pages
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Multimedia Platform
+[scan] read_dir 失败 (depth=2, path=C:\$Recycle.Bin\S-1-5-21-2708833987-1860422805-1439357699-1000, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\ja-JP
+[scan] 扫描目录 (depth=2): C:\$Recycle.Bin\S-1-5-21-2708833987-1860422805-1439357699-1001
+[scan] read_dir 失败 (depth=3, path=C:\Windows\appcompat\Backup, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\chocolatey
+[scan] 扫描目录 (depth=2): C:\Boot\de-DE
+[scan] 目录扫描完成 (depth=1, path=C:\SysGCC, 本层 1 项)
+[scan] 扫描目录 (depth=2): C:\Boot\en-GB
+[scan] 扫描目录 (depth=2): C:\Windows\Panther
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows NT
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Application Verifier
+[scan] 扫描目录 (depth=2): C:\Boot\fi-FI
+[scan] 扫描目录 (depth=2): C:\Boot\ko-KR
+[scan] 扫描目录 (depth=2): C:\Program Files\Git
+[scan] 扫描目录 (depth=2): C:\Boot\fr-FR
+[scan] read_dir 失败 (depth=3, path=C:\Windows\appcompat\Programs, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Speech
+[scan] 扫描目录 (depth=2): C:\Windows\rescache
+[scan] 扫描目录 (depth=2): C:\Users\Public
+[scan] 扫描目录 (depth=2): C:\ProgramData\ChocolateyHttpCache
+[scan] 扫描目录 (depth=2): C:\Boot\en-US
+[scan] 扫描目录 (depth=2): C:\Windows\Performance
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Common Files
+[scan] 扫描目录 (depth=2): C:\Program Files\NVIDIA GPU Computing Toolkit
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Photo Viewer
+[scan] 扫描目录 (depth=2): C:\Boot\Fonts
+[scan] 扫描目录 (depth=2): C:\Boot\lt-LT
+[scan] 扫描目录 (depth=2): C:\Boot\hr-HR
+[scan] 扫描目录 (depth=2): C:\Windows\apppatch
+[scan] 扫描目录 (depth=2): C:\Windows\Speech_OneCore
+[scan] 扫描目录 (depth=2): C:\ProgramData\clash-verge-service
+[scan] 扫描目录 (depth=2): C:\Users\wms
+[scan] 扫描目录 (depth=2): C:\Boot\es-ES
+[scan] 扫描目录 (depth=2): C:\Windows\PLA
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Portable Devices
+[scan] read_dir 失败 (depth=3, path=C:\Windows\PLA\Reports, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\lv-LV
+[scan] 扫描目录 (depth=2): C:\Boot\hu-HU
+[scan] 扫描目录 (depth=2): C:\Windows\AppReadiness
+[scan] 扫描目录 (depth=2): C:\ProgramData\Claude
+[scan] 扫描目录 (depth=2): C:\Windows\System
+[scan] 扫描目录 (depth=2): C:\ProgramData\Packages
+[scan] 扫描目录 (depth=2): C:\Boot\es-MX
+[scan] 扫描目录 (depth=2): C:\Boot\fr-CA
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Security
+[scan] read_dir 失败 (depth=3, path=C:\Windows\PLA\Rules, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\nb-NO
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Reference Assemblies
+[scan] 扫描目录 (depth=2): C:\Windows\assembly
+[scan] 扫描目录 (depth=2): C:\ProgramData\DockerDesktop
+[scan] 扫描目录 (depth=2): C:\Windows\System32
+[scan] read_dir 失败 (depth=2, path=C:\ProgramData\Packages, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Google
+[scan] 扫描目录 (depth=2): C:\Boot\et-EE
+[scan] 扫描目录 (depth=2): C:\ProgramData\Thunder Network
+[scan] 扫描目录 (depth=2): C:\Windows\Resources
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Sidebar
+[scan] read_dir 失败 (depth=3, path=C:\Windows\PLA\Templates, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\nl-NL
+[scan] 扫描目录 (depth=2): C:\ProgramData\Huorong
+[scan] 扫描目录 (depth=2): C:\Program Files\AntiCheatExpert
+[scan] 扫描目录 (depth=2): C:\ProgramData\regid.1991-06.com.microsoft
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\SogouInput
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Internet Explorer
+[scan] 扫描目录 (depth=2): C:\ProgramData\tianxiang
+[scan] 扫描目录 (depth=2): C:\Program Files\WindowsApps
+[scan] 扫描目录 (depth=2): C:\ProgramData\USOPrivate
+[scan] 扫描目录 (depth=2): C:\ProgramData\USOShared
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\WindowsApps\Deleted, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\SchCache
+[scan] 扫描目录 (depth=2): C:\Windows\PolicyDefinitions
+[scan] 扫描目录 (depth=2): C:\Boot\pl-PL
+[scan] 扫描目录 (depth=2): C:\ProgramData\IDM
+[scan] 扫描目录 (depth=2): C:\Program Files\Application Verifier
+[scan] 扫描目录 (depth=2): C:\ProgramData\Riot Games
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows NT
+[scan] 扫描目录 (depth=2): C:\ProgramData\Windows App Certification Kit
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\config, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Tencent
+[scan] 扫描目录 (depth=2): C:\Windows\schemas
+[scan] 扫描目录 (depth=2): C:\Boot\pt-BR
+[scan] 扫描目录 (depth=2): C:\Windows\Prefetch
+[scan] 扫描目录 (depth=2): C:\ProgramData\kingsoft
+[scan] 扫描目录 (depth=2): C:\Program Files\Clash Verge
+[scan] 扫描目录 (depth=2): C:\ProgramData\SGAIAssistant
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Photo Viewer
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\Configuration, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\Windows Master Store
+[scan] 扫描目录 (depth=2): C:\Boot\pt-PT
+[scan] read_dir 失败 (depth=2, path=C:\Windows\Prefetch, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\security
+[scan] 扫描目录 (depth=2): C:\ProgramData\Microsoft
+[scan] 扫描目录 (depth=2): C:\Program Files\CMake
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Defender
+[scan] 扫描目录 (depth=2): C:\ProgramData\SoftwareDistribution
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Portable Devices
+[scan] 扫描目录 (depth=2): C:\Boot\qps-ploc
+[scan] 扫描目录 (depth=2): C:\Windows\PrintDialog
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Windows Master Store\ServiceData, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\Oray
+[scan] read_dir 失败 (depth=3, path=C:\Windows\security\audit, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\DriverState, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Kits
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Microsoft\Diagnosis, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\SogouInput
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft SDKs
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Sidebar
+[scan] 扫描目录 (depth=2): C:\Boot\qps-plocm
+[scan] 扫描目录 (depth=2): C:\Windows\Provisioning
+[scan] 扫描目录 (depth=2): C:\ProgramData\WindowsHolographicDevices
+[scan] read_dir 失败 (depth=3, path=C:\Windows\security\cap, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Microsoft\SmsRouter, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\WindowsPowerShell
+[scan] 扫描目录 (depth=2): C:\Boot\Resources
+[scan] read_dir 失败 (depth=3, path=C:\Windows\Provisioning\Autopilot, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=2, path=C:\ProgramData\WindowsHolographicDevices, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\ServiceProfiles
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Microsoft\Spectrum, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\RUXIM
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft Visual Studio
+[scan] 扫描目录 (depth=2): C:\Boot\ro-RO
+[scan] 扫描目录 (depth=2): C:\Windows\Registration
+[scan] 扫描目录 (depth=2): C:\Program Files\Common Files
+[scan] 扫描目录 (depth=2): C:\ProgramData\xfolder
+[scan] read_dir 失败 (depth=3, path=C:\Windows\ServiceProfiles\LocalService, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\SquirrelDisk
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\XZHuYanBao
+[scan] 扫描目录 (depth=2): C:\ProgramData\ssh
+[scan] 扫描目录 (depth=2): C:\Boot\ru-RU
+[scan] 扫描目录 (depth=2): C:\Windows\RemotePackages
+[scan] 扫描目录 (depth=2): C:\ProgramData\Youdao
+[scan] read_dir 失败 (depth=3, path=C:\Windows\ServiceProfiles\NetworkService, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\Tencent
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\yxq_nethelper
+[scan] 扫描目录 (depth=2): C:\ProgramData\Tencent
+[scan] 扫描目录 (depth=2): C:\Boot\sk-SK
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\MSBuild
+[scan] 扫描目录 (depth=2): C:\Program Files\DIFX
+[scan] 扫描目录 (depth=2): C:\Windows\ServiceState
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\Tencent\GameAssist, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\护眼宝
+[scan] 扫描目录 (depth=2): C:\Boot\sl-SI
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Netease
+[scan] 扫描目录 (depth=2): C:\Program Files\Docker
+[scan] read_dir 失败 (depth=2, path=C:\Windows\ServiceState, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\TxGameAssistant
+[scan] 扫描目录 (depth=2): C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38
+[scan] 扫描目录 (depth=2): C:\Boot\sr-Latn-RS
+[scan] 扫描目录 (depth=2): C:\Program Files\dotnet
+[scan] 扫描目录 (depth=2): C:\Program Files\Cyotek
+[scan] 扫描目录 (depth=2): C:\Windows\servicing
+[scan] 扫描目录 (depth=2): C:\ProgramData\Netease
+[scan] 扫描目录 (depth=2): C:\Boot\sv-SE
+[scan] 扫描目录 (depth=2): C:\Windows\tracing
+[scan] 扫描目录 (depth=2): C:\Windows\SystemApps
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\NVIDIA Corporation
+[scan] 扫描目录 (depth=2): C:\ProgramData\NVIDIA
+[scan] 扫描目录 (depth=2): C:\Boot\tr-TR
+[scan] 扫描目录 (depth=2): C:\Windows\twain_32
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Media Player
+[scan] 扫描目录 (depth=2): C:\Boot\uk-UA
+[scan] 扫描目录 (depth=2): C:\Windows\Vss
+[scan] 扫描目录 (depth=2): C:\Boot\zh-CN
+[scan] 扫描目录 (depth=2): C:\Windows\WaaS
+[scan] 扫描目录 (depth=2): C:\Boot\zh-TW
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\QQMailPlugin
+[scan] 扫描目录 (depth=2): C:\Windows\Web
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Multimedia Platform
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft.NET
+[scan] 扫描目录 (depth=2): C:\Windows\SysWOW64
+[scan] 扫描目录 (depth=2): C:\ProgramData\Microsoft DevDiv
+[scan] 扫描目录 (depth=2): C:\Windows\Fonts
+[scan] 扫描目录 (depth=2): C:\ProgramData\Microsoft OneDrive
+[scan] 扫描目录 (depth=2): C:\Windows\GameBarPresenceWriter
+[scan] 扫描目录 (depth=2): C:\Windows\ShellComponents
+[scan] 扫描目录 (depth=2): C:\ProgramData\NVIDIA Corporation
+[scan] 扫描目录 (depth=2): C:\Windows\WinSxS
+[scan] 扫描目录 (depth=2): C:\Windows\Globalization
+[scan] 扫描目录 (depth=2): C:\Windows\ShellExperiences
+[scan] 扫描目录 (depth=2): C:\Windows\SKB
+[scan] 扫描目录 (depth=2): C:\Windows\SoftwareDistribution
+[scan] 扫描目录 (depth=2): C:\Windows\Help
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\NVIDIA Corporation\nvtopps, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\config, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\Configuration, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\NVIDIA GPU Computing Toolkit
+[scan] 扫描目录 (depth=2): C:\ProgramData\Oray
+[scan] 扫描目录 (depth=2): C:\Program Files\WindowsPowerShell
+[scan] 扫描目录 (depth=2): C:\Windows\IdentityCRL
+[scan] 扫描目录 (depth=2): C:\Windows\IME
+[scan] 扫描目录 (depth=2): C:\Windows\ImmersiveControlPanel
+[scan] 扫描目录 (depth=2): C:\Windows\InboxApps
+[scan] 扫描目录 (depth=2): C:\Windows\INF
+[scan] 扫描目录 (depth=2): C:\Program Files\WinHTTrack
+[scan] 扫描目录 (depth=2): C:\Program Files\Internet Explorer
+[scan] 扫描目录 (depth=2): C:\Program Files\LinkShellExtension
+[scan] 扫描目录 (depth=2): C:\Program Files\Microsoft Update Health Tools
+[scan] 扫描目录 (depth=2): C:\Program Files\ModifiableWindowsApps
+[scan] 扫描目录 (depth=2): C:\Program Files\Netease
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\Msdtc, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\WSL
+[scan] 扫描目录 (depth=2): C:\Program Files\GitHub CLI
+[scan] 扫描目录 (depth=2): C:\Program Files\Google
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\networklist, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\hpdk
+[scan] 扫描目录 (depth=2): C:\Program Files\Huorong
+[scan] 扫描目录 (depth=2): C:\Program Files\nodejs
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\sru, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\InputMethod
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\Tasks, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Installer
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\ias, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\L2Schemas
+[scan] 扫描目录 (depth=2): C:\Windows\LanguageOverlayCache
+[scan] 扫描目录 (depth=2): C:\Windows\LiveKernelReports
+[scan] read_dir 失败 (depth=2, path=C:\Windows\LiveKernelReports, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Logs
+[scan] 扫描目录 (depth=2): C:\Windows\Media
+[scan] 扫描目录 (depth=2): C:\Windows\Microsoft.NET
+[scan] 目录扫描完成 (depth=1, path=C:\ProgramData, 本层 44 项)
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\MsDtc, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\zh-CN
+[scan] 扫描目录 (depth=2): C:\Windows\Setup
+[scan] 扫描目录 (depth=2): C:\Windows\ModemLogs
+[scan] read_dir 失败 (depth=2, path=C:\Windows\ModemLogs, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Netease
+[scan] 扫描目录 (depth=2): C:\Windows\SystemResources
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\Tasks, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\OCR
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\networklist, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\WDI, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\TAPI
+[scan] 扫描目录 (depth=2): C:\Windows\Tasks
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\SleepStudy, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Temp
+[scan] read_dir 失败 (depth=2, path=C:\Windows\Temp, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\SystemTemp
+[scan] read_dir 失败 (depth=2, path=C:\Windows\SystemTemp, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\sru, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\bcastdvr
+[scan] 扫描目录 (depth=2): C:\Windows\BitLockerDiscoveryVolumeContents
+[scan] 扫描目录 (depth=2): C:\Windows\Boot
+[scan] 扫描目录 (depth=2): C:\Windows\Branding
+[scan] 扫描目录 (depth=2): C:\Windows\CbsTemp
+[scan] 扫描目录 (depth=2): C:\Windows\Containers
+[scan] 扫描目录 (depth=2): C:\Windows\CSC
+[scan] read_dir 失败 (depth=2, path=C:\Windows\CSC, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Cursors
+[scan] 扫描目录 (depth=2): C:\Windows\debug
+[scan] 扫描目录 (depth=2): C:\Windows\diagnostics
+[scan] 扫描目录 (depth=2): C:\Windows\DiagTrack
+[scan] 扫描目录 (depth=2): C:\Windows\DigitalLocker
+[scan] 扫描目录 (depth=2): C:\Windows\Downloaded Program Files
+[scan] 扫描目录 (depth=2): C:\Windows\ELAMBKUP
+[scan] 扫描目录 (depth=2): C:\Windows\en-US
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Mail
+[scan] 扫描目录 (depth=2): C:\Windows\Migration
+[scan] 扫描目录 (depth=2): C:\Windows\Minidump
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\WindowsApps\Mutable, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\WindowsApps\MutableBackup, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 目录扫描完成 (depth=1, path=C:\$Recycle.Bin, 本层 3 项)
+[scan] 扫描目录 (depth=2): C:\Program Files\VideoLAN
+[scan] 扫描目录 (depth=2): C:\Program Files\Uninstall Information
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Defender
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Defender Advanced Threat Protection
+[scan] 目录扫描完成 (depth=1, path=C:\Program Files (x86), 本层 31 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Program Files, 本层 46 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Boot, 本层 47 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Windows, 本层 106 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Users, 本层 7 项)
+[scan] 目录扫描完成 (depth=0, path=C:\, 本层 31 项)
+[scan] 标准遍历完成: files=797197, folders=168818, size=103.93 GB
+[scan] 扫描总耗时: 6.3s
+[app] 扫描完成，已更新 partitions[0]
+==== DiskLens 启动 (unix_ts=1785477204) ====
+[app] 初始化：枚举磁盘分区...
+[app] 枚举到 4 个分区
+[app] 默认显示 C 盘: 本地磁盘 (C:)
+[app] 用户点击扫描，启动后台线程: root=C:\
+[scan] 启动扫描: root=C:\, disk_info=本地磁盘 (C:)
+[mft_scan] 不可用：当前进程非管理员 (drive=C)
+[scan] MFT 不可用，走标准目录遍历: drive=C
+[scan] rayon 线程池: 16 线程
+[scan] 扫描目录 (depth=0): C:\
+[scan] 扫描目录 (depth=1): C:\$Recycle.Bin
+[scan] 扫描目录 (depth=1): C:\Boot
+[scan] 扫描目录 (depth=1): C:\Netease
+[scan] 扫描目录 (depth=1): C:\SysGCC
+[scan] 扫描目录 (depth=1): C:\GameAssistData
+[scan] 扫描目录 (depth=1): C:\ProgramData
+[scan] 扫描目录 (depth=1): C:\Users
+[scan] 扫描目录 (depth=1): C:\Program Files
+[scan] 扫描目录 (depth=2): C:\Users\CodexSandboxOffline
+[scan] 扫描目录 (depth=1): C:\Program Files (x86)
+[scan] 扫描目录 (depth=1): C:\temp
+[scan] 扫描目录 (depth=1): C:\TEST
+[scan] 扫描目录 (depth=1): C:\Windows
+[scan] 扫描目录 (depth=1): C:\System Volume Information
+[scan] 扫描目录 (depth=1): C:\PerfLogs
+[scan] 扫描目录 (depth=2): C:\$Recycle.Bin\S-1-5-18
+[scan] 扫描目录 (depth=2): C:\$Recycle.Bin\S-1-5-21-2708833987-1860422805-1439357699-1000
+[scan] 扫描目录 (depth=2): C:\Boot\bg-BG
+[scan] 扫描目录 (depth=2): C:\Netease\GameViewer
+[scan] 扫描目录 (depth=2): C:\SysGCC\m68k-elf
+[scan] 扫描目录 (depth=2): C:\ProgramData\Alibaba
+[scan] read_dir 失败 (depth=1, path=C:\GameAssistData, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=1): C:\Recovery
+[scan] 扫描目录 (depth=2): C:\Program Files\2345Soft
+[scan] read_dir 失败 (depth=2, path=C:\Users\CodexSandboxOffline, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\2345Soft
+[scan] 目录扫描完成 (depth=1, path=C:\temp, 本层 0 项)
+[scan] 目录扫描完成 (depth=1, path=C:\TEST, 本层 0 项)
+[scan] 扫描目录 (depth=2): C:\Windows\addins
+[scan] read_dir 失败 (depth=1, path=C:\System Volume Information, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=1, path=C:\PerfLogs, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=2, path=C:\$Recycle.Bin\S-1-5-18, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=2, path=C:\$Recycle.Bin\S-1-5-21-2708833987-1860422805-1439357699-1000, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\cs-CZ
+[scan] 目录扫描完成 (depth=1, path=C:\Netease, 本层 1 项)
+[scan] 扫描目录 (depth=2): C:\ProgramData\AntiCheatExpert
+[scan] read_dir 失败 (depth=1, path=C:\Recovery, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Users\Default
+[scan] 扫描目录 (depth=2): C:\ProgramData\OrayClient
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Reference Assemblies
+[scan] 扫描目录 (depth=2): C:\Windows\appcompat
+[scan] 扫描目录 (depth=2): C:\Boot\it-IT
+[scan] 扫描目录 (depth=2): C:\Program Files\NVIDIA Corporation
+[scan] 扫描目录 (depth=2): C:\$Recycle.Bin\S-1-5-21-2708833987-1860422805-1439357699-1001
+[scan] 扫描目录 (depth=2): C:\Windows\Offline Web Pages
+[scan] 扫描目录 (depth=2): C:\Boot\da-DK
+[scan] 扫描目录 (depth=2): C:\ProgramData\boost_interprocess
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft
+[scan] 扫描目录 (depth=2): C:\ProgramData\Package Cache
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\360
+[scan] 扫描目录 (depth=2): C:\Boot\qps-plocm
+[scan] 扫描目录 (depth=2): C:\Boot\sr-Latn-RS
+[scan] read_dir 失败 (depth=3, path=C:\Windows\appcompat\Backup, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\ja-JP
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\SogouInput
+[scan] 扫描目录 (depth=2): C:\ProgramData\IDM
+[scan] 扫描目录 (depth=2): C:\Windows\Panther
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows NT
+[scan] 扫描目录 (depth=2): C:\Boot\de-DE
+[scan] 扫描目录 (depth=2): C:\ProgramData\chocolatey
+[scan] 扫描目录 (depth=2): C:\Users\Public
+[scan] 扫描目录 (depth=2): C:\Boot\Resources
+[scan] 扫描目录 (depth=2): C:\Boot\sv-SE
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Application Verifier
+[scan] read_dir 失败 (depth=3, path=C:\Windows\appcompat\Programs, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\ko-KR
+[scan] 扫描目录 (depth=2): C:\ProgramData\kingsoft
+[scan] 扫描目录 (depth=2): C:\Windows\Performance
+[scan] 扫描目录 (depth=2): C:\Boot\el-GR
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Photo Viewer
+[scan] 扫描目录 (depth=2): C:\ProgramData\ChocolateyHttpCache
+[scan] 扫描目录 (depth=2): C:\Boot\ro-RO
+[scan] 扫描目录 (depth=2): C:\Users\wms
+[scan] 扫描目录 (depth=2): C:\Boot\tr-TR
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Common Files
+[scan] 扫描目录 (depth=2): C:\Windows\apppatch
+[scan] 扫描目录 (depth=2): C:\Boot\lt-LT
+[scan] 扫描目录 (depth=2): C:\ProgramData\Microsoft
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Tencent
+[scan] 扫描目录 (depth=2): C:\Windows\PLA
+[scan] 扫描目录 (depth=2): C:\Boot\en-GB
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Portable Devices
+[scan] 扫描目录 (depth=2): C:\ProgramData\clash-verge-service
+[scan] 扫描目录 (depth=2): C:\Program Files\NVIDIA GPU Computing Toolkit
+[scan] 扫描目录 (depth=2): C:\Boot\ru-RU
+[scan] 扫描目录 (depth=2): C:\Boot\uk-UA
+[scan] 扫描目录 (depth=2): C:\Boot\lv-LV
+[scan] 扫描目录 (depth=2): C:\Windows\AppReadiness
+[scan] read_dir 失败 (depth=3, path=C:\Windows\PLA\Reports, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\en-US
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Sidebar
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Microsoft\Diagnosis, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\Claude
+[scan] 扫描目录 (depth=2): C:\Boot\sk-SK
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Defender
+[scan] 扫描目录 (depth=2): C:\Boot\zh-CN
+[scan] 扫描目录 (depth=2): C:\Boot\nb-NO
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Google
+[scan] 扫描目录 (depth=2): C:\Windows\assembly
+[scan] read_dir 失败 (depth=3, path=C:\Windows\PLA\Rules, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\es-ES
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\WindowsPowerShell
+[scan] 扫描目录 (depth=2): C:\ProgramData\DockerDesktop
+[scan] 扫描目录 (depth=2): C:\Boot\sl-SI
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Kits
+[scan] 扫描目录 (depth=2): C:\Boot\zh-TW
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft SDKs
+[scan] 扫描目录 (depth=2): C:\Boot\nl-NL
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Internet Explorer
+[scan] read_dir 失败 (depth=3, path=C:\Windows\PLA\Templates, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Boot\es-MX
+[scan] 扫描目录 (depth=2): C:\ProgramData\Huorong
+[scan] 扫描目录 (depth=2): C:\Windows\Speech
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Microsoft\SmsRouter, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\AntiCheatExpert
+[scan] 扫描目录 (depth=2): C:\Boot\fi-FI
+[scan] 扫描目录 (depth=2): C:\ProgramData\Packages
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\XZHuYanBao
+[scan] 扫描目录 (depth=2): C:\Boot\pl-PL
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft Visual Studio
+[scan] 扫描目录 (depth=2): C:\Windows\PolicyDefinitions
+[scan] 扫描目录 (depth=2): C:\Boot\et-EE
+[scan] 扫描目录 (depth=2): C:\Program Files\Eclipse Adoptium
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Microsoft\Spectrum, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38
+[scan] 扫描目录 (depth=2): C:\Windows\Speech_OneCore
+[scan] 扫描目录 (depth=2): C:\Program Files\Application Verifier
+[scan] 扫描目录 (depth=2): C:\Boot\Fonts
+[scan] 扫描目录 (depth=2): C:\Boot\fr-CA
+[scan] 扫描目录 (depth=2): C:\Boot\pt-BR
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\yxq_nethelper
+[scan] 扫描目录 (depth=2): C:\Windows\Prefetch
+[scan] 扫描目录 (depth=2): C:\ProgramData\Microsoft DevDiv
+[scan] 扫描目录 (depth=2): C:\ProgramData\Netease
+[scan] 扫描目录 (depth=2): C:\Program Files\Clash Verge
+[scan] 扫描目录 (depth=2): C:\Windows\System
+[scan] 扫描目录 (depth=2): C:\Boot\fr-FR
+[scan] 扫描目录 (depth=2): C:\Boot\pt-PT
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\护眼宝
+[scan] 扫描目录 (depth=2): C:\Program Files\Oray
+[scan] read_dir 失败 (depth=2, path=C:\ProgramData\Packages, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=2, path=C:\Windows\Prefetch, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\Microsoft OneDrive
+[scan] 扫描目录 (depth=2): C:\ProgramData\NVIDIA
+[scan] 扫描目录 (depth=2): C:\Program Files\CMake
+[scan] 扫描目录 (depth=2): C:\Windows\System32
+[scan] 扫描目录 (depth=2): C:\Boot\hr-HR
+[scan] 扫描目录 (depth=2): C:\Boot\qps-ploc
+[scan] 扫描目录 (depth=2): C:\Boot\hu-HU
+[scan] 扫描目录 (depth=2): C:\ProgramData\regid.1991-06.com.microsoft
+[scan] 扫描目录 (depth=2): C:\Windows\PrintDialog
+[scan] 扫描目录 (depth=2): C:\Program Files\Git
+[scan] 扫描目录 (depth=2): C:\ProgramData\NVIDIA Corporation
+[scan] 扫描目录 (depth=2): C:\Windows\rescache
+[scan] 扫描目录 (depth=2): C:\Program Files\RUXIM
+[scan] 扫描目录 (depth=2): C:\Windows\tracing
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Mail
+[scan] 扫描目录 (depth=2): C:\ProgramData\Riot Games
+[scan] 扫描目录 (depth=2): C:\Windows\Provisioning
+[scan] 扫描目录 (depth=2): C:\Program Files\Common Files
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\NVIDIA Corporation\nvtopps, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\config, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\SquirrelDisk
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Media Player
+[scan] 扫描目录 (depth=2): C:\ProgramData\SGAIAssistant
+[scan] read_dir 失败 (depth=3, path=C:\Windows\Provisioning\Autopilot, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\twain_32
+[scan] 扫描目录 (depth=2): C:\ProgramData\NVIDIA GPU Computing Toolkit
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\Configuration, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\Tencent
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Multimedia Platform
+[scan] 扫描目录 (depth=2): C:\ProgramData\SoftwareDistribution
+[scan] 扫描目录 (depth=2): C:\Windows\Registration
+[scan] 扫描目录 (depth=2): C:\Windows\Vss
+[scan] 扫描目录 (depth=2): C:\ProgramData\Oray
+[scan] 扫描目录 (depth=2): C:\Windows\Resources
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows NT
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\Tencent\GameAssist, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\SogouInput
+[scan] 扫描目录 (depth=2): C:\Windows\RemotePackages
+[scan] 扫描目录 (depth=2): C:\Windows\WaaS
+[scan] 扫描目录 (depth=2): C:\Program Files\Cyotek
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\DriverState, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\SchCache
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Photo Viewer
+[scan] 扫描目录 (depth=2): C:\Program Files\TxGameAssistant
+[scan] 扫描目录 (depth=2): C:\Windows\SystemApps
+[scan] 扫描目录 (depth=2): C:\Windows\Web
+[scan] 扫描目录 (depth=2): C:\Program Files\DIFX
+[scan] 扫描目录 (depth=2): C:\Windows\schemas
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Portable Devices
+[scan] 扫描目录 (depth=2): C:\ProgramData\ssh
+[scan] 扫描目录 (depth=2): C:\Windows\WinSxS
+[scan] 扫描目录 (depth=2): C:\Program Files\Docker
+[scan] 扫描目录 (depth=2): C:\Windows\SysWOW64
+[scan] 扫描目录 (depth=2): C:\Windows\security
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Security
+[scan] 扫描目录 (depth=2): C:\ProgramData\Tencent
+[scan] 扫描目录 (depth=2): C:\Program Files\dotnet
+[scan] read_dir 失败 (depth=3, path=C:\Windows\security\audit, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\config, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Sidebar
+[scan] 扫描目录 (depth=2): C:\Program Files\GitHub CLI
+[scan] 扫描目录 (depth=2): C:\ProgramData\Thunder Network
+[scan] read_dir 失败 (depth=3, path=C:\Windows\security\cap, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\SystemResources
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\Configuration, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\WindowsApps
+[scan] 扫描目录 (depth=2): C:\Program Files\Google
+[scan] 扫描目录 (depth=2): C:\ProgramData\tianxiang
+[scan] 扫描目录 (depth=2): C:\Windows\ServiceProfiles
+[scan] 扫描目录 (depth=2): C:\Windows\SystemTemp
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\Msdtc, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\WindowsApps\Deleted, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\hpdk
+[scan] read_dir 失败 (depth=3, path=C:\Windows\ServiceProfiles\LocalService, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\USOPrivate
+[scan] read_dir 失败 (depth=2, path=C:\Windows\SystemTemp, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\networklist, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\Huorong
+[scan] read_dir 失败 (depth=3, path=C:\Windows\ServiceProfiles\NetworkService, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\zh-CN
+[scan] 扫描目录 (depth=2): C:\ProgramData\USOShared
+[scan] 扫描目录 (depth=2): C:\Windows\ServiceState
+[scan] 扫描目录 (depth=2): C:\Program Files\Internet Explorer
+[scan] read_dir 失败 (depth=2, path=C:\Windows\ServiceState, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\Windows App Certification Kit
+[scan] 扫描目录 (depth=2): C:\Windows\servicing
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\sru, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\SysWOW64\Tasks, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\Windows Master Store
+[scan] 扫描目录 (depth=2): C:\Program Files\LinkShellExtension
+[scan] 扫描目录 (depth=2): C:\Program Files\Microsoft Update Health Tools
+[scan] 扫描目录 (depth=2): C:\Program Files\ModifiableWindowsApps
+[scan] read_dir 失败 (depth=3, path=C:\ProgramData\Windows Master Store\ServiceData, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files\Netease
+[scan] 扫描目录 (depth=2): C:\ProgramData\WindowsHolographicDevices
+[scan] read_dir 失败 (depth=2, path=C:\ProgramData\WindowsHolographicDevices, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\ProgramData\xfolder
+[scan] 扫描目录 (depth=2): C:\ProgramData\Youdao
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\MSBuild
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Netease
+[scan] 扫描目录 (depth=2): C:\Program Files\nodejs
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\ias, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\TAPI
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\NVIDIA Corporation
+[scan] 扫描目录 (depth=2): C:\Windows\Tasks
+[scan] 扫描目录 (depth=2): C:\Windows\Temp
+[scan] read_dir 失败 (depth=2, path=C:\Windows\Temp, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\QQMailPlugin
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\MsDtc, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\networklist, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\bcastdvr
+[scan] 扫描目录 (depth=2): C:\Windows\BitLockerDiscoveryVolumeContents
+[scan] 扫描目录 (depth=2): C:\Windows\Boot
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\SleepStudy, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\sru, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Microsoft.NET
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\Tasks, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Media Player
+[scan] 扫描目录 (depth=2): C:\Windows\Branding
+[scan] read_dir 失败 (depth=3, path=C:\Windows\System32\WDI, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Multimedia Platform
+[scan] 扫描目录 (depth=2): C:\Program Files\VideoLAN
+[scan] 扫描目录 (depth=2): C:\Windows\CbsTemp
+[scan] 扫描目录 (depth=2): C:\Windows\Fonts
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Defender
+[scan] 扫描目录 (depth=2): C:\Windows\Containers
+[scan] 扫描目录 (depth=2): C:\Windows\GameBarPresenceWriter
+[scan] 扫描目录 (depth=2): C:\Program Files\Windows Defender Advanced Threat Protection
+[scan] 扫描目录 (depth=2): C:\Windows\CSC
+[scan] 扫描目录 (depth=2): C:\Windows\Globalization
+[scan] read_dir 失败 (depth=2, path=C:\Windows\CSC, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\diagnostics
+[scan] 扫描目录 (depth=2): C:\Windows\Cursors
+[scan] 扫描目录 (depth=2): C:\Windows\Help
+[scan] 扫描目录 (depth=2): C:\Windows\debug
+[scan] 扫描目录 (depth=2): C:\Windows\DiagTrack
+[scan] 扫描目录 (depth=2): C:\Windows\IdentityCRL
+[scan] 扫描目录 (depth=2): C:\Windows\IME
+[scan] 扫描目录 (depth=2): C:\Windows\DigitalLocker
+[scan] 扫描目录 (depth=2): C:\Windows\Downloaded Program Files
+[scan] 扫描目录 (depth=2): C:\Windows\ImmersiveControlPanel
+[scan] 扫描目录 (depth=2): C:\Windows\ELAMBKUP
+[scan] 扫描目录 (depth=2): C:\Windows\en-US
+[scan] 扫描目录 (depth=2): C:\Program Files (x86)\Windows Mail
+[scan] 扫描目录 (depth=2): C:\Program Files\WindowsPowerShell
+[scan] 扫描目录 (depth=2): C:\Windows\InboxApps
+[scan] 扫描目录 (depth=2): C:\Program Files\Uninstall Information
+[scan] 扫描目录 (depth=2): C:\Windows\INF
+[scan] 扫描目录 (depth=2): C:\Program Files\WinHTTrack
+[scan] 扫描目录 (depth=2): C:\Program Files\WSL
+[scan] 扫描目录 (depth=2): C:\Windows\InputMethod
+[scan] 扫描目录 (depth=2): C:\Windows\Installer
+[scan] 扫描目录 (depth=2): C:\Windows\L2Schemas
+[scan] 扫描目录 (depth=2): C:\Windows\LanguageOverlayCache
+[scan] 扫描目录 (depth=2): C:\Windows\ShellComponents
+[scan] 扫描目录 (depth=2): C:\Windows\LiveKernelReports
+[scan] 扫描目录 (depth=2): C:\Windows\ShellExperiences
+[scan] read_dir 失败 (depth=2, path=C:\Windows\LiveKernelReports, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\SKB
+[scan] 扫描目录 (depth=2): C:\Windows\Logs
+[scan] 扫描目录 (depth=2): C:\Windows\SoftwareDistribution
+[scan] 扫描目录 (depth=2): C:\Windows\Media
+[scan] 扫描目录 (depth=2): C:\Windows\Microsoft.NET
+[scan] 扫描目录 (depth=2): C:\Windows\Setup
+[scan] 扫描目录 (depth=2): C:\Windows\ModemLogs
+[scan] read_dir 失败 (depth=2, path=C:\Windows\ModemLogs, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 扫描目录 (depth=2): C:\Windows\Netease
+[scan] 扫描目录 (depth=2): C:\Windows\OCR
+[scan] 扫描目录 (depth=2): C:\Windows\Migration
+[scan] 扫描目录 (depth=2): C:\Windows\Minidump
+[scan] 目录扫描完成 (depth=1, path=C:\Program Files (x86), 本层 31 项)
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\WindowsApps\Mutable, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] read_dir 失败 (depth=3, path=C:\Program Files\WindowsApps\MutableBackup, err=拒绝访问。 (os error 5))，当作空目录继续
+[scan] 目录扫描完成 (depth=1, path=C:\Users, 本层 7 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Program Files, 本层 46 项)
+[scan] 目录扫描完成 (depth=1, path=C:\SysGCC, 本层 1 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Boot, 本层 47 项)
+[scan] 目录扫描完成 (depth=1, path=C:\$Recycle.Bin, 本层 3 项)
+[scan] 目录扫描完成 (depth=1, path=C:\ProgramData, 本层 44 项)
+[scan] 目录扫描完成 (depth=1, path=C:\Windows, 本层 106 项)
+[scan] 目录扫描完成 (depth=0, path=C:\, 本层 31 项)
+[scan] 标准遍历完成: files=797196, folders=168818, size=103.93 GB
+[scan] 扫描总耗时: 6.3s
+[app] 扫描完成，已更新 partitions[0]
+==== DiskLens 启动 (unix_ts=1785477378) ====
+==== DiskLens 启动 (unix_ts=1785477426) ====
+==== DiskLens 启动 (unix_ts=1785477681) ====

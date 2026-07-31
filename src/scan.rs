@@ -262,19 +262,40 @@ fn process_dir<'scope>(
         let _ = tx.send(ScanMessage::Progress(n));
     }
 
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
     let mut subdirs: Vec<crate::dir_enum::RawDirEntry> = Vec::new();
-    {
-        let mut children = task.children.lock().unwrap();
-        for e in entries {
-            if e.is_dir {
-                subdirs.push(e);
-            } else {
-                children.push(Node::new_file_with_meta(
-                    e.name, e.logical, e.physical, file_color(),
-                    e.modified_ft, e.created_ft, e.accessed_ft, e.attrs, 0, false, String::new(),
+    let mut leaf_nodes: Vec<Node> = Vec::new();
+    for e in entries {
+        if e.is_dir {
+            if e.attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                // 目录 reparse point（junction / symlink / 已知文件夹重定向，如
+                // C:\Users\All Users -> C:\ProgramData）。这类目录在文件系统语义上
+                // 是"指向别处"，不是真正独立的子树——如果递归进去，会把 target 目录下的
+                // 文件在树里重复计入一遍（原始位置一次，junction 里再一次），
+                // 逻辑/物理大小之和就会超过磁盘实际占用（>100%）。
+                // WinDirStat / WizTree 都不会跟随这类目录，我们照做：只记一个叶子节点，
+                // 不递归、不产生子节点。
+                #[cfg(windows)]
+                let tag = get_reparse_tag(&path.join(&e.name));
+                #[cfg(not(windows))]
+                let tag = 0u32;
+                leaf_nodes.push(Node::new_folder_with_meta(
+                    e.name, folder_color(depth + 1), Vec::new(),
+                    e.modified_ft, e.created_ft, e.accessed_ft, e.attrs, tag, false, String::new(),
                 ));
+            } else {
+                subdirs.push(e);
             }
+        } else {
+            leaf_nodes.push(Node::new_file_with_meta(
+                e.name, e.logical, e.physical, file_color(),
+                e.modified_ft, e.created_ft, e.accessed_ft, e.attrs, 0, false, String::new(),
+            ));
         }
+    }
+    if !leaf_nodes.is_empty() {
+        task.children.lock().unwrap().extend(leaf_nodes);
     }
 
     if subdirs.is_empty() {
@@ -381,6 +402,50 @@ fn read_entries_fallback(path: &Path) -> std::io::Result<Vec<crate::dir_enum::Ra
         }
     }
     Ok(out)
+}
+
+/// 读取一个 reparse point 的 ReparseTag（IO_REPARSE_TAG_MOUNT_POINT / SYMLINK / 等）。
+/// 只在真正遇到 reparse 目录（数量很少，通常几十个）时才调用一次，不影响整体性能。
+/// REPARSE_DATA_BUFFER 结构体第一个字段就是 ULONG ReparseTag，直接读前 4 字节即可，
+/// 不需要引入完整的结构体定义。
+#[cfg(windows)]
+fn get_reparse_tag(path: &Path) -> u32 {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(), OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return 0;
+    }
+    let mut buf = [0u8; 16 * 1024];
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle, FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(), 0,
+            buf.as_mut_ptr() as *mut _, buf.len() as u32,
+            &mut returned, std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 || returned < 4 {
+        return 0;
+    }
+    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
 }
 
 /// Windows 下获取文件的物理大小（仅 fallback 路径使用；批量枚举路径直接拿 AllocationSize）。
