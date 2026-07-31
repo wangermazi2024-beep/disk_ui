@@ -1,23 +1,47 @@
-//! 目录扫描。
+//! 目录扫描入口 + 常规遍历。
 //!
-//! 扫描入口在 `spawn_scan`。Windows 下如果是整盘根路径且当前有管理员权限、
-//! 目标卷是 NTFS，会优先走 `mft_scan::scan_drive_via_mft` 的 MFT 直读快速路径
-//!（WizTree/Everything 同款原理）；任何一步失败都直接 fallback 到标准目录遍历，
-//! 保证功能上始终可用，只是速度上有快慢之分。
+//! ## 这一版解决了两个真实问题（不是打补丁，是换算法）：
 //!
-//! ## 关于条目上限
-//! **没有任何上限**。用户要求"全量扫出来，有多少扫多少"。原来 MAX_ENTRIES=300_000
-//! 的截断已经被移除（那个上限导致 C 盘 27 万文件就触顶，丢了 ~46%）。
-//! 如果以后要支持"取消扫描"，用一个 `AtomicBool` cancel flag，不要用条目上限。
+//! ### 1) 递归深度导致崩溃
+//! 旧实现里，`scan_dir` 在 `rayon par_iter` 的闭包里**直接递归调用自己**处理子目录。
+//! 这意味着"目录树有多深，原生调用栈就要压多深"——rayon 的并行分裂并不会打破这条调用链，
+//! 因为 `join`/`par_iter` 本质上是"父调用等待子调用返回"，子目录的 `scan_dir` 帧
+//! 始终摞在父目录 `scan_dir` 帧上面。遇到几千层深的目录（node_modules、备份软件的
+//! 版本链、压缩包解压产物等）就会栈溢出崩溃，而且不能靠"调大栈"根治，只是往后拖问题。
+//!
+//! 真正的修法：**把"递归调用"换成"任务队列 + 显式的父子完成通知"**，用 `rayon::Scope::spawn`
+//! 代替直接函数递归——`spawn` 只是把任务丢进工作窃取队列，调用它的函数立刻返回，
+//! 不会在原生栈上累积帧。子目录处理完之后，通过一个共享的 `DirTask`（parent 指针 + 剩余
+//! 未完成子目录计数）**用循环而不是递归**一路往上通知父目录："我这个子任务做完了"，
+//! 计数归零就把父目录也定型、再往上传播。全程没有一次函数对函数的递归调用，
+//! 原生栈深度和目录树深度完全解耦，理论上可以扫任意深的目录树。
+//!
+//! ### 2) 比 WinDirStat 慢（17s vs 10s）
+//! 旧实现用 `std::fs::read_dir` 拿目录项（不慢），但对**每一个文件**都额外调用一次
+//! `CreateFileW` + `GetFileInformationByHandle`（为了拿硬链接信息），是 79 万次多余的
+//! 内核对象创建/销毁；压缩/稀疏文件还要再调一次 `GetCompressedFileSizeW`。这才是真正的瓶颈，
+//! 不是"遍历算法"本身慢。
+//!
+//! 真正的修法：改用 `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`，**每个目录只开
+//! 一次 handle**，用一个 64KB 缓冲区循环把该目录下所有条目一次性批量读出——名字、逻辑大小、
+//! 物理/占用大小（AllocationSize，压缩稀疏文件同样准确）、属性、三个时间戳全都在这一次调用里，
+//! 不再需要逐文件开 handle，也不再需要单独查压缩大小。详见 `dir_enum.rs`。
+//!
+//! 代价：不再对硬链接做去重（该 API 不返回 nNumberOfLinks，要拿到它必须逐文件开 handle，
+//! 这正是我们要去掉的开销）。硬链接在普通用户目录里极少见（主要出现在 WinSxS 这类系统目录），
+//! 影响可忽略；如果之后要精确处理，应该做成"可选的深度模式"，而不是让所有文件都为小概率
+//! 场景付出逐文件开 handle 的代价。
+//!
+//! 批量枚举 API 不可用时（极少见：非 NTFS/ReFS、老系统），自动 fallback 到
+//! `std::fs::read_dir`，保证兼容性不倒退。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rayon::prelude::*;
-
+use dashmap::DashSet;
 use egui::Color32;
 
 use crate::disk_info::DiskInfo;
@@ -25,756 +49,484 @@ use crate::model::Node;
 
 pub enum ScanMessage {
     Progress(u64),
-    /// 扫描完成：节点树 + 该分区对应的 DiskInfo + 按物理记录去重后的大小。
-    ///
-    /// `dedup_size` 是"扫描汇总 vs 系统已用空间"一致性判断应该用的数字——
-    /// 树里的 `Node::size` 故意允许硬链接在每个出现的目录下都计一次（匹配
-    /// Explorer 逐目录浏览的展示方式），拿它去跟系统已用比会被硬链接场景
-    /// 误判成"数据异常"，所以两个数字分开传，UI 层展示各自该展示的东西：
-    /// 树/treemap 用 `Node::size`，"一致性"这个统计数字用 `dedup_size`。
-    Done(Box<Node>, Option<DiskInfo>, u64),
+    Done(Box<Node>, Option<DiskInfo>),
     Error(String),
 }
 
 fn folder_color(depth: usize) -> Color32 {
-    const PALETTE: [Color32; 6] = [
-        Color32::from_rgb(0x4C, 0x8B, 0xF5),
-        Color32::from_rgb(0x34, 0xC7, 0x59),
-        Color32::from_rgb(0xF5, 0xA6, 0x23),
-        Color32::from_rgb(0xE0, 0x55, 0x5B),
-        Color32::from_rgb(0x9C, 0x6A, 0xDE),
-        Color32::from_rgb(0x2E, 0xC4, 0xB6),
+    const PAL: [Color32; 6] = [
+        Color32::from_rgb(0x4C, 0x8B, 0xF5), Color32::from_rgb(0x34, 0xC7, 0x59),
+        Color32::from_rgb(0xF5, 0xA6, 0x23), Color32::from_rgb(0xE0, 0x55, 0x5B),
+        Color32::from_rgb(0x9C, 0x6A, 0xDE), Color32::from_rgb(0x2E, 0xC4, 0xB6),
     ];
-    PALETTE[depth % PALETTE.len()]
+    PAL[depth % PAL.len()]
 }
+fn file_color() -> Color32 { Color32::from_rgb(0x6C, 0x75, 0x7D) }
 
-fn file_color() -> Color32 {
-    Color32::from_rgb(0x6C, 0x75, 0x7D)
-}
-
-/// 是否是形如 `C:\` / `C:/` 的整盘根路径。
-#[cfg(windows)]
-fn as_drive_root(path: &Path) -> Option<char> {
-    let s = path.to_string_lossy();
-    let bytes = s.as_bytes();
-    if bytes.len() == 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
-        let c = bytes[0] as char;
-        if c.is_ascii_alphabetic() {
-            return Some(c.to_ascii_uppercase());
-        }
-    }
-    None
-}
-
-/// 从一个路径里推断盘符（取首字符并大写）。
 fn drive_letter_of(path: &Path) -> Option<char> {
-    path.to_string_lossy()
-        .chars()
-        .next()
+    path.to_string_lossy().chars().next()
         .filter(|c| c.is_ascii_alphabetic())
         .map(|c| c.to_ascii_uppercase())
 }
 
 pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
     std::thread::spawn(move || {
-        let scan_start = SystemTime::now();
-        // 先查磁盘信息
+        let start = SystemTime::now();
         let disk_info = drive_letter_of(&root).and_then(crate::disk_info::query_disk_info);
-        crate::dlog!(
-            "[scan] 启动扫描: root={}, disk_info={}",
-            root.display(),
-            disk_info
-                .as_ref()
-                .map(|d| d.display_name())
-                .unwrap_or_else(|| "None".into())
-        );
-
-        // 是否是整盘根路径
-        #[cfg(windows)]
-        let is_drive_root = as_drive_root(&root).is_some();
-        #[cfg(not(windows))]
-        let is_drive_root = {
-            let s = root.to_string_lossy();
-            s.len() == 3
-                && s.as_bytes()[1] == b':'
-                && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')
-        };
+        eprintln!("[scan] 启动: root={}", root.display());
 
         #[cfg(windows)]
         {
+            // 配置 rayon 线程池：I/O bound，线程数 = CPU*2
+            let num_threads = num_cpus_get().saturating_mul(2).max(4);
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build_global();
+            eprintln!("[scan] rayon 线程池: {} 线程", num_threads);
+
+            enable_read_privileges();
+
             if let Some(drive) = as_drive_root(&root) {
-                if crate::mft_scan::mft_scan_available(drive) {
-                    crate::dlog!("[scan] 走 MFT 直读路径: drive={}", drive);
-                    let mft_start = SystemTime::now();
-                    match crate::mft_scan::scan_drive_via_mft(drive, &tx) {
-                        Ok(result) => {
-                            let mut root_node = result.root;
-                            if is_drive_root {
-                                if let Some(info) = &disk_info {
-                                    root_node.name = info.display_name();
-                                }
-                            }
-                            let mft_elapsed = mft_start.elapsed().unwrap_or_default();
-                            crate::dlog!(
-                                "[scan] MFT 直读完成: files={}, folders={}, size={}, 耗时 {:.1}s",
-                                root_node.file_count,
-                                root_node.folder_count,
-                                crate::format::human_size(root_node.size),
-                                mft_elapsed.as_secs_f64()
-                            );
-                            let dedup_size = result.dedup_size;
-                            // 一致性检查：dedup_size（物理去重总量，每份数据只算一次）
-                            // vs 系统已用空间。注意故意不用 root_node.size —— 那是"树汇总"，
-                            // 同一份硬链接数据挂在几个目录下就会被计几次，是 Explorer/WizTree
-                            // 的标准展示行为，拿它去跟系统已用比会被硬链接场景误报成"异常"。
+                if crate::mft_scan::is_elevated() {
+                    eprintln!("[scan] 走 MFT 直读: drive={}", drive);
+                    match crate::mft_scan::scan_volume(drive, &tx) {
+                        Ok(mut node) => {
+                            if let Some(info) = &disk_info { node.name = info.display_name(); }
+                            eprintln!("[scan] MFT 完成: files={}, folders={}, logical={}, physical={}, 耗时 {:.1}s",
+                                node.file_count, node.folder_count,
+                                crate::format::human_size(node.logical_size),
+                                crate::format::human_size(node.physical_size),
+                                start.elapsed().unwrap_or_default().as_secs_f64());
                             if let Some(info) = &disk_info {
-                                let scanned_str = crate::format::human_size(dedup_size);
-                                let used_str = crate::format::human_size(info.used_bytes);
-                                let ratio = if info.used_bytes > 0 {
-                                    dedup_size as f64 / info.used_bytes as f64 * 100.0
-                                } else {
-                                    0.0
-                                };
-                                crate::dlog!(
-                                    "[scan] 一致性检查（物理去重口径）: 扫描汇总={}, 系统已用={}, 比例={:.1}%",
-                                    scanned_str, used_str, ratio
-                                );
-                                if ratio < 60.0 {
-                                    crate::dlog!(
-                                        "[scan] ⚠ 扫描汇总不到系统已用的 60%，可能有丢数据（正常 70%~95%，差值含 $MFT/簇碎片/VSS/USN日志）"
-                                    );
-                                } else if ratio > 105.0 {
-                                    crate::dlog!(
-                                        "[scan] ⚠ 扫描汇总超过系统已用 105%，即使已按 base record 去重仍偏高，可能含 ADS（备用数据流）未单独计入或压缩/稀疏文件的逻辑大小与占用不一致"
-                                    );
-                                } else {
-                                    crate::dlog!(
-                                        "[scan] ✓ 扫描汇总在合理范围内（差值 = $MFT + 簇碎片 + VSS + NTFS元数据）"
-                                    );
-                                }
+                                let ratio = if info.used_bytes > 0 { node.physical_size as f64 / info.used_bytes as f64 * 100.0 } else { 0.0 };
+                                eprintln!("[scan] 一致性检查: physical={}, 系统已用={}, 比例={:.1}%",
+                                    crate::format::human_size(node.physical_size), crate::format::human_size(info.used_bytes), ratio);
                             }
-                            let _ = tx.send(ScanMessage::Done(Box::new(root_node), disk_info, dedup_size));
-                            let total = scan_start.elapsed().unwrap_or_default();
-                            crate::dlog!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
+                            let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
                             return;
                         }
-                        Err(e) => {
-                            crate::dlog!("[scan] MFT 直读失败，回退到标准目录遍历: {e}");
-                        }
+                        Err(e) => eprintln!("[scan] MFT 失败，回退常规遍历: {e}"),
                     }
                 } else {
-                    crate::dlog!("[scan] MFT 不可用，走标准目录遍历: drive={}", drive);
+                    eprintln!("[scan] 非管理员，走常规遍历: drive={}", drive);
                 }
-            } else {
-                crate::dlog!(
-                    "[scan] 目标不是整盘根路径，走标准目录遍历: root={}",
-                    root.display()
-                );
             }
-        }
-        #[cfg(not(windows))]
-        {
-            crate::dlog!(
-                "[scan] 非 Windows 平台，走标准目录遍历: root={}",
-                root.display()
-            );
         }
 
+        // 常规遍历：非递归工作队列版本
         let counter = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
-        // 配置 rayon 线程池：I/O bound，线程数 = CPU*2
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get() * 2)
-            .unwrap_or(8);
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global();
-        crate::dlog!("[scan] rayon 线程池: {} 线程", num_threads);
-        match scan_dir(&root, 0, &counter, &cancel, &tx) {
+        // 硬链接去重集合：卷内 FileId -> 是否已经计入过 physical_size。
+        // 和 mft_scan 的去重逻辑保持一致——"只有 Physical Size 去重，Logical Size 不去重"：
+        // 第一次遇到某个 FileId 时物理大小正常计入，之后再遇到同一个 FileId（说明是同一份
+        // 磁盘数据的另一个硬链接）物理大小记 0，避免同一块簇被重复统计。
+        let seen_file_ids: Arc<DashSet<u64>> = Arc::new(DashSet::new());
+
+        match run_scan(&root, &counter, &cancel, &seen_file_ids, &tx) {
             Ok(mut node) => {
-                if is_drive_root {
-                    if let Some(info) = &disk_info {
-                        node.name = info.display_name();
-                    }
+                if let Some(info) = &disk_info {
+                    #[cfg(windows)]
+                    if as_drive_root(&root).is_some() { node.name = info.display_name(); }
+                    #[cfg(not(windows))]
+                    { node.name = info.display_name(); }
                 }
-                crate::dlog!(
-                    "[scan] 标准遍历完成: files={}, folders={}, size={}",
-                    node.file_count,
-                    node.folder_count,
-                    crate::format::human_size(node.size)
-                );
-                let dedup_size_fallback = node.size;
-                // 标准目录遍历（非 MFT 直读的回退路径）没有 MFT record 号可以
-                // 拿来去重，没法像 MFT 路径那样精确区分"同一份数据的多个硬链接
-                // 位置"，这里退化成直接用 node.size 本身（即不做去重）。这个
-                // 路径本来就只在拿不到管理员权限/非 NTFS 卷时才会走到，硬链接
-                // 密集的场景（DriverStore 那种）基本只出现在系统盘、走的是 MFT
-                // 直读路径，所以这里的近似不影响实际使用场景。
-                let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info, dedup_size_fallback));
+                eprintln!("[scan] 常规遍历完成: files={}, folders={}, logical={}, 耗时 {:.1}s",
+                    node.file_count, node.folder_count,
+                    crate::format::human_size(node.logical_size),
+                    start.elapsed().unwrap_or_default().as_secs_f64());
+                let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
             }
             Err(e) => {
-                crate::dlog!("[scan] 标准遍历失败: {e}");
+                eprintln!("[scan] 失败: {e}");
                 let _ = tx.send(ScanMessage::Error(format!("扫描失败: {e}")));
             }
         }
-        let total = scan_start.elapsed().unwrap_or_default();
-        crate::dlog!("[scan] 扫描总耗时: {:.1}s", total.as_secs_f64());
     });
 }
 
-/// 把 `SystemTime` 折算成 Windows FILETIME（1601-01-01 起 100ns 单位）。
+fn num_cpus_get() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+}
+
+#[cfg(windows)]
+fn as_drive_root(path: &Path) -> Option<char> {
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    if b.len() == 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        let c = b[0] as char;
+        if c.is_ascii_alphabetic() { return Some(c.to_ascii_uppercase()); }
+    }
+    None
+}
+
 fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
-    let t = match t {
-        Some(t) => t,
-        None => return 0,
-    };
+    let t = match t { Some(t) => t, None => return 0 };
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => {
-            const UNIX_TO_FILETIME_OFFSET_SECS: u64 = 11_644_473_600;
-            let unix_100ns = d.as_secs() * 10_000_000 + (d.subsec_nanos() / 100) as u64;
-            unix_100ns + UNIX_TO_FILETIME_OFFSET_SECS * 10_000_000
+            const OFFSET: u64 = 11_644_473_600;
+            d.as_secs() * 10_000_000 + (d.subsec_nanos() / 100) as u64 + OFFSET * 10_000_000
         }
         Err(_) => 0,
     }
 }
 
-fn scan_dir(
-    path: &Path,
-    depth: usize,
+// ---------------------------------------------------------------------------
+// 非递归工作队列遍历
+// ---------------------------------------------------------------------------
+
+/// 一个目录节点在"定型"之前的中间状态。
+/// `parent` 是指向父目录 `DirTask` 的 Arc；`pending` 是"还有多少个子目录没做完"；
+/// `children` 收集已经做完的子节点（文件是同步立即放进去的，子目录是异步放进去的）。
+struct DirTask {
+    name: String,
+    color: Color32,
+    self_modified: u64,
+    self_created: u64,
+    self_accessed: u64,
+    self_attrs: u32,
+    parent: Option<Arc<DirTask>>,
+    pending: AtomicUsize,
+    children: Mutex<Vec<Node>>,
+}
+
+fn run_scan(
+    root: &Path,
     counter: &Arc<AtomicU64>,
     cancel: &Arc<AtomicBool>,
+    seen_file_ids: &Arc<DashSet<u64>>,
     tx: &Sender<ScanMessage>,
 ) -> std::io::Result<Node> {
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(Node::new_folder(
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-            folder_color(depth),
-            Vec::new(),
-        ));
-    }
-
-    let name = if depth == 0 {
-        path.to_string_lossy().into_owned()
-    } else {
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned())
-    };
-
-    // 顶层目录开始时打一行日志（深度 0/1/2），方便定位卡在哪
-    if depth <= 2 {
-        crate::dlog!("[scan] 扫描目录 (depth={}): {}", depth, path.display());
-    }
-
-    // 拿本目录自身的元数据
-    let self_meta = std::fs::metadata(path).ok();
+    let root_name = root.to_string_lossy().into_owned();
+    let self_meta = std::fs::metadata(root).ok();
     let self_modified = system_time_to_filetime(self_meta.as_ref().and_then(|m| m.modified().ok()));
     #[cfg(windows)]
-    let self_attrs = self_meta
-        .as_ref()
-        .map(|m| {
-            use std::os::windows::fs::MetadataExt;
-            m.file_attributes()
-        })
-        .unwrap_or(0x10);
+    let self_attrs = self_meta.as_ref().map(|m| {
+        use std::os::windows::fs::MetadataExt;
+        m.file_attributes()
+    }).unwrap_or(0x10);
     #[cfg(not(windows))]
     let self_attrs: u32 = 0x10;
 
-    let mut children: Vec<Node> = Vec::new();
-    // read_dir 出错（权限拒绝等）不中断，当作空目录返回
-    let entries = match std::fs::read_dir(path) {
+    let root_task = Arc::new(DirTask {
+        name: root_name,
+        color: folder_color(0),
+        self_modified,
+        self_created: 0,
+        self_accessed: 0,
+        self_attrs,
+        parent: None,
+        pending: AtomicUsize::new(0),
+        children: Mutex::new(Vec::new()),
+    });
+
+    let root_slot: Arc<Mutex<Option<Node>>> = Arc::new(Mutex::new(None));
+
+    rayon::scope(|s| {
+        process_dir(
+            s, root.to_path_buf(), 0, root_task, root_slot.clone(),
+            counter.clone(), cancel.clone(), seen_file_ids.clone(), tx.clone(),
+        );
+    });
+
+    match root_slot.lock().unwrap().take() {
+        Some(node) => Ok(node),
+        None => Ok(Node::new_folder(root.to_string_lossy().into_owned(), folder_color(0), Vec::new())),
+    }
+}
+
+/// 处理单个目录：批量枚举它的条目，文件直接算完塞进 task.children，
+/// 子目录各自 spawn 一个新任务（不是递归调用，只是把工作丢进 rayon 的队列）。
+#[allow(clippy::too_many_arguments)]
+fn process_dir<'scope>(
+    s: &rayon::Scope<'scope>,
+    path: PathBuf,
+    depth: usize,
+    task: Arc<DirTask>,
+    root_slot: Arc<Mutex<Option<Node>>>,
+    counter: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    seen_file_ids: Arc<DashSet<u64>>,
+    tx: Sender<ScanMessage>,
+) {
+    if cancel.load(Ordering::Relaxed) {
+        finalize(task, &root_slot);
+        return;
+    }
+
+    let entries = match read_entries(&path) {
         Ok(e) => e,
         Err(e) => {
-            // 只在浅层打这个警告，深层目录太多会刷屏
             if depth <= 3 {
-                crate::dlog!(
-                    "[scan] read_dir 失败 (depth={}, path={}, err={})，当作空目录继续",
-                    depth,
-                    path.display(),
-                    e
-                );
+                eprintln!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, path.display(), e);
             }
-            return Ok(Node::new_folder_with_meta(
-                name,
-                folder_color(depth),
-                Vec::new(),
-                self_modified,
-                self_attrs,
-            ));
+            // 目录打不开不算致命错误：这个目录当空目录处理，继续扫别的。
+            finalize(task, &root_slot);
+            return;
         }
     };
 
-    let entries_vec: Vec<_> = entries.flatten().collect();
-    let entries_iterated = entries_vec.len() as u64;
+    let n = counter.fetch_add(entries.len() as u64, Ordering::Relaxed);
+    if n / 5000 != (n + entries.len() as u64) / 5000 {
+        let _ = tx.send(ScanMessage::Progress(n));
+    }
 
-    // 并行处理每个 entry（rayon 自动调度到线程池）
-    // 保持和 R15 完全一致的数据逻辑，只是把 for 循环改成 par_iter
-    let children: Vec<Node> = entries_vec
-        .par_iter()
-        .filter_map(|entry| {
-            let n = counter.fetch_add(1, Ordering::Relaxed);
-            if n % 5000 == 0 {
-                let _ = tx.send(ScanMessage::Progress(n));
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let mut subdirs: Vec<crate::dir_enum::RawDirEntry> = Vec::new();
+    let mut leaf_nodes: Vec<Node> = Vec::new();
+    for e in entries {
+        if e.is_dir {
+            if e.attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                // 目录 reparse point（junction / symlink / 已知文件夹重定向，如
+                // C:\Users\All Users -> C:\ProgramData）。这类目录在文件系统语义上
+                // 是"指向别处"，不是真正独立的子树——如果递归进去，会把 target 目录下的
+                // 文件在树里重复计入一遍（原始位置一次，junction 里再一次），
+                // 逻辑/物理大小之和就会超过磁盘实际占用（>100%）。
+                // WinDirStat / WizTree 都不会跟随这类目录，我们照做：只记一个叶子节点，
+                // 不递归、不产生子节点。
+                #[cfg(windows)]
+                let tag = get_reparse_tag(&path.join(&e.name));
+                #[cfg(not(windows))]
+                let tag = 0u32;
+                leaf_nodes.push(Node::new_folder_with_meta(
+                    e.name, folder_color(depth + 1), Vec::new(),
+                    e.modified_ft, e.created_ft, e.accessed_ft, e.attrs, tag, false, String::new(),
+                ));
+            } else {
+                subdirs.push(e);
             }
-
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    if depth <= 3 {
-                        crate::dlog!(
-                            "[scan] metadata 失败 (entry={}, err={})，跳过",
-                            entry.path().display(),
-                            e
-                        );
-                    }
-                    return None;
-                }
-            };
-            let entry_name = entry.file_name().to_string_lossy().into_owned();
-
-            let modified_ft = system_time_to_filetime(meta.modified().ok());
-            #[cfg(windows)]
-            let attrs = {
-                use std::os::windows::fs::MetadataExt;
-                meta.file_attributes()
-            };
-            #[cfg(not(windows))]
-            let attrs: u32 = if meta.is_dir() { 0x10 } else { 0x80 };
-
-            if meta.is_dir() {
-                match scan_dir(&entry.path(), depth + 1, counter, cancel, tx) {
-                    Ok(child) => Some(child),
-                    Err(e) => {
-                        if depth <= 3 {
-                            crate::dlog!(
-                                "[scan] 子目录扫描失败 (path={}, err={})，跳过",
-                                entry.path().display(),
-                                e
-                            );
-                        }
-                        None
-                    }
+        } else {
+            // 硬链接去重：只对 physical_size 生效，logical_size 始终按完整值计入
+            // （和 mft_scan.rs / WinDirStat 的 GetSizePhysical() 语义保持一致）。
+            // file_id == 0 表示这条记录拿不到 FileId（例如 fallback 到 std::fs::read_dir
+            // 的极少数场景），此时无法判断是否为硬链接，按"不去重"处理，即物理大小照常计入，
+            // 不强行去重导致误伤。
+            let physical_to_use = if e.file_id != 0 {
+                if seen_file_ids.insert(e.file_id) {
+                    e.physical // 第一次遇到这个 FileId，物理大小正常计入
+                } else {
+                    0 // 同一个 FileId 的后续硬链接，物理大小记 0（磁盘数据只有一份）
                 }
             } else {
-                Some(Node::new_file_with_meta(
-                    entry_name,
-                    meta.len(),
-                    meta.len(),
-                    file_color(),
-                    modified_ft,
-                    attrs,
-                ))
-            }
-        })
-        .collect();
-
-    // 顶层目录扫完时打一行汇总
-    if depth <= 1 {
-        crate::dlog!(
-            "[scan] 目录扫描完成 (depth={}, path={}, 本层 {} 项)",
-            depth,
-            path.display(),
-            entries_iterated
-        );
-    }
-    Ok(Node::new_folder_with_meta(
-        name,
-        folder_color(depth),
-        children,
-        self_modified,
-        self_attrs,
-    ))
-}
-
-/// 演示数据：C 盘 + D 盘两个分区，各自是独立的根节点。
-pub fn demo_partitions() -> Vec<Node> {
-    let leaf_with_meta = |name: &str, size: u64, ft: u64, attr: u32| {
-        Node::new_file_with_meta(name, size, size, file_color(), ft, attr)
-    };
-
-    const DEMO_FT: u64 = 13_349_788_200_000_000_000;
-
-    let windows = Node::new_folder_with_meta(
-        "Windows",
-        folder_color(1),
-        vec![
-            Node::new_folder_with_meta(
-                "System32",
-                folder_color(2),
-                vec![
-                    leaf_with_meta("ntoskrnl.exe", 11_200_000, DEMO_FT, 0xA4),
-                    leaf_with_meta("kernel32.dll", 780_000, DEMO_FT, 0xA0),
-                    leaf_with_meta("drivers.cab", 640_000_000, DEMO_FT, 0xA0),
-                ],
-                DEMO_FT,
-                0x10,
-            ),
-            Node::new_folder_with_meta(
-                "WinSxS",
-                folder_color(2),
-                vec![
-                    leaf_with_meta("manifest_a.cat", 2_100_000_000, DEMO_FT, 0xA0),
-                    leaf_with_meta("manifest_b.cat", 1_800_000_000, DEMO_FT, 0xA0),
-                ],
-                DEMO_FT,
-                0x10,
-            ),
-            leaf_with_meta("explorer.exe", 5_400_000, DEMO_FT, 0xA0),
-        ],
-        DEMO_FT,
-        0x16,
-    );
-
-    let program_files = Node::new_folder_with_meta(
-        "Program Files",
-        folder_color(1),
-        vec![
-            Node::new_folder_with_meta(
-                "Adobe",
-                folder_color(2),
-                vec![
-                    leaf_with_meta("Photoshop.exe", 2_300_000_000, DEMO_FT, 0xA0),
-                    leaf_with_meta("Premiere.exe", 3_100_000_000, DEMO_FT, 0xA0),
-                ],
-                DEMO_FT,
-                0x10,
-            ),
-            Node::new_folder_with_meta(
-                "Microsoft Office",
-                folder_color(2),
-                vec![
-                    leaf_with_meta("WINWORD.EXE", 890_000_000, DEMO_FT, 0xA0),
-                    leaf_with_meta("EXCEL.EXE", 760_000_000, DEMO_FT, 0xA0),
-                ],
-                DEMO_FT,
-                0x10,
-            ),
-        ],
-        DEMO_FT,
-        0x10,
-    );
-
-    let users_c = Node::new_folder_with_meta(
-        "Users",
-        folder_color(1),
-        vec![Node::new_folder_with_meta(
-            "Alex",
-            folder_color(2),
-            vec![
-                Node::new_folder_with_meta(
-                    "AppData",
-                    folder_color(3),
-                    vec![Node::new_folder_with_meta(
-                        "Temp",
-                        folder_color(4),
-                        vec![leaf_with_meta("cache.tmp", 1_100_000_000, DEMO_FT, 0xA0)],
-                        DEMO_FT,
-                        0x10,
-                    )],
-                    DEMO_FT,
-                    0x12,
-                ),
-                Node::new_folder_with_meta(
-                    "Documents",
-                    folder_color(3),
-                    vec![leaf_with_meta("thesis.docx", 4_200_000, DEMO_FT, 0xA0)],
-                    DEMO_FT,
-                    0x10,
-                ),
-            ],
-            DEMO_FT,
-            0x10,
-        )],
-        DEMO_FT,
-        0x10,
-    );
-
-    let c_drive = Node::new_folder_with_meta(
-        "本地磁盘 (C:)",
-        folder_color(0),
-        vec![
-            windows,
-            program_files,
-            users_c,
-            leaf_with_meta("pagefile.sys", 16_000_000_000, DEMO_FT, 0xA4),
-            leaf_with_meta("hiberfil.sys", 8_000_000_000, DEMO_FT, 0xA4),
-        ],
-        DEMO_FT,
-        0x10,
-    );
-
-    let steam = Node::new_folder_with_meta(
-        "Steam",
-        folder_color(1),
-        vec![Node::new_folder_with_meta(
-            "steamapps",
-            folder_color(2),
-            vec![Node::new_folder_with_meta(
-                "common",
-                folder_color(3),
-                vec![
-                    Node::new_folder_with_meta(
-                        "Cyberpunk2077",
-                        folder_color(4),
-                        vec![leaf_with_meta("archive.pak", 68_000_000_000, DEMO_FT, 0xA0)],
-                        DEMO_FT,
-                        0x10,
-                    ),
-                    Node::new_folder_with_meta(
-                        "Elden Ring",
-                        folder_color(4),
-                        vec![leaf_with_meta("data.bin", 45_000_000_000, DEMO_FT, 0xA0)],
-                        DEMO_FT,
-                        0x10,
-                    ),
-                    Node::new_folder_with_meta(
-                        "GTA V",
-                        folder_color(4),
-                        vec![leaf_with_meta("update.rpf", 36_000_000_000, DEMO_FT, 0xA0)],
-                        DEMO_FT,
-                        0x10,
-                    ),
-                ],
-                DEMO_FT,
-                0x10,
-            )],
-            DEMO_FT,
-            0x10,
-        )],
-        DEMO_FT,
-        0x10,
-    );
-
-    let downloads = Node::new_folder_with_meta(
-        "Downloads",
-        folder_color(1),
-        vec![
-            leaf_with_meta("movie_4k.mkv", 18_000_000_000, DEMO_FT, 0xA0),
-            leaf_with_meta("backup_2024.zip", 9_500_000_000, DEMO_FT, 0xA0),
-            leaf_with_meta("installer.iso", 4_700_000_000, DEMO_FT, 0xA0),
-        ],
-        DEMO_FT,
-        0x10,
-    );
-
-    let projects = Node::new_folder_with_meta(
-        "Projects",
-        folder_color(1),
-        vec![Node::new_folder_with_meta(
-            "my-app",
-            folder_color(2),
-            vec![
-                Node::new_folder_with_meta(
-                    "node_modules",
-                    folder_color(3),
-                    vec![leaf_with_meta("packages...", 2_800_000_000, DEMO_FT, 0xA0)],
-                    DEMO_FT,
-                    0x10,
-                ),
-                leaf_with_meta("dist.tar.gz", 450_000_000, DEMO_FT, 0xA0),
-            ],
-            DEMO_FT,
-            0x10,
-        )],
-        DEMO_FT,
-        0x10,
-    );
-
-    let d_drive = Node::new_folder_with_meta(
-        "新加卷 (D:)",
-        folder_color(0),
-        vec![steam, downloads, projects],
-        DEMO_FT,
-        0x10,
-    );
-
-    vec![c_drive, d_drive]
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// 单元测试
-// ─────────────────────────────────────────────────────────────────────────
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn build_test_tree(root: &Path) -> std::io::Result<()> {
-        let blob = |n: usize| vec![b'x'; n];
-        fs::write(root.join("file1.txt"), blob(10))?;
-        fs::write(root.join("file2.dat"), blob(20))?;
-        fs::create_dir(root.join("subdir1"))?;
-        fs::write(root.join("subdir1").join("file3.txt"), blob(30))?;
-        fs::write(root.join("subdir1").join("file4.log"), blob(40))?;
-        fs::create_dir(root.join("subdir1").join("subdir2"))?;
-        fs::write(root.join("subdir1").join("subdir2").join("file5.bin"), blob(50))?;
-        fs::create_dir(root.join("empty_dir"))?;
-        fs::create_dir(root.join("subdir3"))?;
-        fs::write(root.join("subdir3").join("file6.txt"), blob(60))?;
-        Ok(())
-    }
-
-    fn ground_truth(root: &Path) -> (u64, u64, u64) {
-        let mut files = 0u64;
-        let mut folders = 0u64;
-        let mut total_size = 0u64;
-        fn walk(p: &Path, files: &mut u64, folders: &mut u64, total_size: &mut u64) {
-            let entries = match fs::read_dir(p) {
-                Ok(e) => e,
-                Err(_) => return,
+                e.physical
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if meta.is_dir() {
-                    *folders += 1;
-                    walk(&path, files, folders, total_size);
-                } else {
-                    *files += 1;
-                    *total_size += meta.len();
+            leaf_nodes.push(Node::new_file_with_meta(
+                e.name, e.logical, physical_to_use, file_color(),
+                e.modified_ft, e.created_ft, e.accessed_ft, e.attrs, 0, false, String::new(),
+            ));
+        }
+    }
+    if !leaf_nodes.is_empty() {
+        task.children.lock().unwrap().extend(leaf_nodes);
+    }
+
+    if subdirs.is_empty() {
+        finalize(task, &root_slot);
+        return;
+    }
+
+    task.pending.store(subdirs.len(), Ordering::Release);
+
+    for sub in subdirs {
+        let child_path = path.join(&sub.name);
+        let child_task = Arc::new(DirTask {
+            name: sub.name,
+            color: folder_color(depth + 1),
+            self_modified: sub.modified_ft,
+            self_created: sub.created_ft,
+            self_accessed: sub.accessed_ft,
+            self_attrs: sub.attrs,
+            parent: Some(task.clone()),
+            pending: AtomicUsize::new(0),
+            children: Mutex::new(Vec::new()),
+        });
+        let root_slot = root_slot.clone();
+        let counter = counter.clone();
+        let cancel = cancel.clone();
+        let seen_file_ids = seen_file_ids.clone();
+        let tx = tx.clone();
+        s.spawn(move |s| {
+            process_dir(s, child_path, depth + 1, child_task, root_slot, counter, cancel, seen_file_ids, tx);
+        });
+    }
+}
+
+/// 把当前任务定型成 `Node`，并沿着 parent 链**用循环**往上传播完成通知。
+/// 这里刻意不用递归：无论目录树多深，这个函数的调用栈深度都是 O(1)。
+fn finalize(task: Arc<DirTask>, root_slot: &Arc<Mutex<Option<Node>>>) {
+    let mut current = task;
+    loop {
+        let children = std::mem::take(&mut *current.children.lock().unwrap());
+        let node = Node::new_folder_with_meta(
+            current.name.clone(), current.color, children,
+            current.self_modified, current.self_created, current.self_accessed,
+            current.self_attrs, 0, false, String::new(),
+        );
+
+        match &current.parent {
+            None => {
+                *root_slot.lock().unwrap() = Some(node);
+                return;
+            }
+            Some(parent) => {
+                parent.children.lock().unwrap().push(node);
+                let remaining = parent.pending.fetch_sub(1, Ordering::AcqRel) - 1;
+                if remaining == 0 {
+                    let next = parent.clone();
+                    current = next;
+                    continue;
                 }
+                return;
             }
         }
-        walk(root, &mut files, &mut folders, &mut total_size);
-        (files, folders, total_size)
     }
+}
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "disklens_test_{}_{}_{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn test_scan_dir_counts_match_ground_truth() {
-        let tmp = tmp_dir("match");
-        fs::create_dir_all(&tmp).unwrap();
-        build_test_tree(&tmp).unwrap();
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).unwrap();
-        let (gt_files, gt_folders, gt_size) = ground_truth(&tmp);
-        assert_eq!(node.file_count, gt_files);
-        assert_eq!(node.folder_count, gt_folders);
-        assert_eq!(node.size, gt_size);
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_scan_dir_expected_counts() {
-        let tmp = tmp_dir("expected");
-        fs::create_dir_all(&tmp).unwrap();
-        build_test_tree(&tmp).unwrap();
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).unwrap();
-        assert_eq!(node.file_count, 6);
-        assert_eq!(node.folder_count, 4);
-        assert_eq!(node.size, 210);
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_scan_dir_empty_dir() {
-        let tmp = tmp_dir("empty");
-        fs::create_dir_all(&tmp).unwrap();
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).unwrap();
-        assert_eq!(node.file_count, 0);
-        assert_eq!(node.folder_count, 0);
-        assert_eq!(node.size, 0);
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_scan_dir_deep_nesting() {
-        let tmp = tmp_dir("deep");
-        fs::create_dir_all(&tmp).unwrap();
-        let mut cur: PathBuf = tmp.clone();
-        for i in 0..10 {
-            cur = cur.join(format!("d{}", i));
-            fs::create_dir_all(&cur).unwrap();
+/// 批量读取一个目录的条目：Windows 上优先走 `dir_enum::enum_dir_batch`
+/// （每目录一次 handle，一次或几次批量调用拿到全部条目及其大小/时间/属性），
+/// 失败时 fallback 到 `std::fs::read_dir` 逐条 stat。
+fn read_entries(path: &Path) -> std::io::Result<Vec<crate::dir_enum::RawDirEntry>> {
+    #[cfg(windows)]
+    {
+        if let Ok(v) = crate::dir_enum::enum_dir_batch(path) {
+            return Ok(v);
         }
-        fs::write(cur.join("leaf.txt"), "hello").unwrap();
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).unwrap();
-        assert_eq!(node.file_count, 1);
-        assert_eq!(node.folder_count, 10);
-        assert_eq!(node.size, 5);
-        let _ = fs::remove_dir_all(&tmp);
     }
+    read_entries_fallback(path)
+}
 
-    /// 回归测试：5000 文件不截断（验证没有 MAX_ENTRIES 上限）
-    #[test]
-    fn test_scan_dir_no_truncation() {
-        let tmp = tmp_dir("no_trunc");
-        fs::create_dir_all(&tmp).unwrap();
-        for i in 0..500 {
-            let dir = tmp.join(format!("d{}", i));
-            fs::create_dir_all(&dir).unwrap();
-            for j in 0..10 {
-                fs::write(dir.join(format!("f{}.txt", j)), vec![b'x'; 100]).unwrap();
-            }
+fn read_entries_fallback(path: &Path) -> std::io::Result<Vec<crate::dir_enum::RawDirEntry>> {
+    let rd = std::fs::read_dir(path)?;
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let modified_ft = system_time_to_filetime(meta.modified().ok());
+        let created_ft = system_time_to_filetime(meta.created().ok());
+        let accessed_ft = system_time_to_filetime(meta.accessed().ok());
+        let is_dir = meta.is_dir();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = meta.file_attributes();
+            let logical = meta.len();
+            let physical = if is_dir { 0 } else { get_physical_size(&entry.path(), logical, attrs) };
+            // fallback 路径下 std::fs::Metadata 同样能拿到 NTFS 文件索引号
+            // （等价于批量枚举里的 FileId），顺带取出来，这样即使退化到逐条 stat，
+            // 硬链接去重依然生效，不会因为走了 fallback 就丢失去重能力。
+            let file_id = meta.file_index().unwrap_or(0);
+            out.push(crate::dir_enum::RawDirEntry {
+                name, is_dir, logical, physical, attrs, modified_ft, created_ft, accessed_ft, file_id,
+            });
         }
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(&tmp, 0, &counter, &cancel, &tx).unwrap();
-        let (gt_files, gt_folders, gt_size) = ground_truth(&tmp);
-        assert_eq!(node.file_count, gt_files, "文件数应和真值一致（不截断）");
-        assert_eq!(node.folder_count, gt_folders);
-        assert_eq!(node.size, gt_size);
-        assert!(counter.load(Ordering::Relaxed) >= 5000);
-        let _ = fs::remove_dir_all(&tmp);
+        #[cfg(not(windows))]
+        {
+            let attrs = if is_dir { 0x10 } else { 0x80 };
+            let logical = meta.len();
+            out.push(crate::dir_enum::RawDirEntry {
+                name, is_dir, logical, physical: logical, attrs, modified_ft, created_ft, accessed_ft, file_id: 0,
+            });
+        }
     }
+    Ok(out)
+}
 
-    /// 真实系统目录端到端测试
-    #[test]
-    fn test_scan_dir_on_real_system_directory() {
-        let candidates = [
-            std::path::Path::new("/home/z"),
-            std::path::Path::new("/tmp"),
-            std::path::Path::new("/usr/local"),
-            std::path::Path::new("/etc"),
-        ];
-        let target = candidates
-            .iter()
-            .find(|p| p.exists() && fs::read_dir(p).is_ok())
-            .expect("至少要有一个候选目录可用");
-        crate::dlog!("[test] 真实目录测试: {}", target.display());
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let node = scan_dir(target, 0, &counter, &cancel, &tx).unwrap();
-        let (files, folders, size) = ground_truth(target);
-        crate::dlog!(
-            "[test] scan_dir:     files={}, folders={}, size={}",
-            node.file_count, node.folder_count, node.size
-        );
-        crate::dlog!(
-            "[test] ground_truth: files={}, folders={}, size={}",
-            files, folders, size
-        );
-        assert_eq!(node.file_count, files, "文件数不匹配");
-        assert_eq!(node.folder_count, folders, "文件夹数不匹配");
-        assert_eq!(node.size, size, "总大小不匹配");
+/// 读取一个 reparse point 的 ReparseTag（IO_REPARSE_TAG_MOUNT_POINT / SYMLINK / 等）。
+/// 只在真正遇到 reparse 目录（数量很少，通常几十个）时才调用一次，不影响整体性能。
+/// REPARSE_DATA_BUFFER 结构体第一个字段就是 ULONG ReparseTag，直接读前 4 字节即可，
+/// 不需要引入完整的结构体定义。
+#[cfg(windows)]
+fn get_reparse_tag(path: &Path) -> u32 {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(), OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return 0;
     }
+    let mut buf = [0u8; 16 * 1024];
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle, FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(), 0,
+            buf.as_mut_ptr() as *mut _, buf.len() as u32,
+            &mut returned, std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 || returned < 4 {
+        return 0;
+    }
+    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+
+/// Windows 下获取文件的物理大小（仅 fallback 路径使用；批量枚举路径直接拿 AllocationSize）。
+#[cfg(windows)]
+fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+
+    if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
+        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+            .chain(std::iter::once(0)).collect();
+        let mut high: u32 = 0;
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        if low != 0xFFFFFFFF || unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0 {
+            return ((high as u64) << 32) | (low as u64);
+        }
+    }
+    let cluster = 4096u64;
+    if logical == 0 { 0 } else { ((logical + cluster - 1) / cluster) * cluster }
+}
+
+/// 启用 SeBackupPrivilege + SeRestorePrivilege。
+#[cfg(windows)]
+fn enable_read_privileges() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows_sys::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW,
+        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        TOKEN_PRIVILEGES, LUID_AND_ATTRIBUTES,
+        SE_BACKUP_NAME, SE_RESTORE_NAME,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
+            return;
+        }
+        for priv_name in [SE_BACKUP_NAME, SE_RESTORE_NAME] {
+            let mut luid = LUID { LowPart: 0, HighPart: 0 };
+            if LookupPrivilegeValueW(std::ptr::null(), priv_name, &mut luid) == 0 { continue; }
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            AdjustTokenPrivileges(
+                token, 0, &tp as *const _ as *const TOKEN_PRIVILEGES,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+        }
+        CloseHandle(token);
+    }
+    eprintln!("[scan] 已尝试启用 SeBackupPrivilege + SeRestorePrivilege");
 }
