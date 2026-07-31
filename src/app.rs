@@ -1,11 +1,12 @@
-//! 应用主状态。
+//! 应用主状态 + 顶层编排。
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+
 use egui::{Color32, Vec2};
+
 use crate::categorize::compute_categories;
 use crate::disk_info::{self, DiskInfo};
-use crate::export;
 use crate::model::{Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
@@ -13,183 +14,330 @@ use crate::ui::{sidebar, tree_list, TreeAction};
 
 pub struct DiskUiApp {
     root_path: String,
+
+    /// 所有磁盘分区，每个分区是独立的根节点。
+    /// 多分区时列表顶层显示 C / D / E ... 各一行，用户展开后看子目录。
     partitions: Vec<Node>,
+
+    /// 与 `partitions` 一一对应的磁盘元信息（卷标 / 总容量 / 可用空间）。
+    /// `None` 表示没查到（非 Windows、子目录扫描、或 API 失败）。
     partition_infos: Vec<Option<DiskInfo>>,
+
+    /// 与 `partitions` 一一对应的"按物理记录去重后的大小"（详见
+    /// `scan::ScanMessage::Done` 的文档注释）。目前仅在日志的一致性检查中使用。
+    #[allow(dead_code)]
+    dedup_sizes: Vec<u64>,
+
+    /// 系统里枚举到的所有分区。当前 UI 只展示 `partitions` 里的（默认只有 C），
+    /// 以后做多盘选择时把这个列表显示给用户即可。
+    #[allow(dead_code)]
+    all_drives: Vec<DiskInfo>,
+
     selected: Option<NodePath>,
+
     categories: Vec<crate::model::CategoryStat>,
+
     scanning: bool,
     scanned_count: u64,
     scan_error: Option<String>,
     scan_rx: Option<Receiver<ScanMessage>>,
+
+    /// 上次点击"导出CSV"的结果提示（成功路径 / 失败原因），显示在顶栏。
+    export_status: Option<String>,
 }
 
 impl Default for DiskUiApp {
     fn default() -> Self {
+        crate::dlog!("[app] 初始化：枚举磁盘分区...");
         let all_drives = disk_info::enumerate_drives();
+        crate::dlog!("[app] 枚举到 {} 个分区", all_drives.len());
+
+        // 默认只显示 C 盘；找不到 C 盘就退回第一个，再找不到就退回 demo 数据。
         let (partitions, partition_infos, root_path) =
             if let Some(c) = all_drives.iter().find(|d| d.drive_letter == 'C').cloned() {
-                let placeholder = Node::new_folder_with_meta(c.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
+                crate::dlog!("[app] 默认显示 C 盘: {}", c.display_name());
+                let placeholder = Node::new_folder_with_meta(
+                    c.display_name(),
+                    folder_color_for_drive(),
+                    Vec::new(),
+                    0,
+                    0x10,
+                );
                 (vec![placeholder], vec![Some(c.clone())], c.root_path())
             } else if let Some(first) = all_drives.first().cloned() {
-                let placeholder = Node::new_folder_with_meta(first.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
-                (vec![placeholder], vec![Some(first.clone())], first.root_path())
+                crate::dlog!(
+                    "[app] 没找到 C 盘，退回第一个分区: {}",
+                    first.display_name()
+                );
+                let placeholder = Node::new_folder_with_meta(
+                    first.display_name(),
+                    folder_color_for_drive(),
+                    Vec::new(),
+                    0,
+                    0x10,
+                );
+                (
+                    vec![placeholder],
+                    vec![Some(first.clone())],
+                    first.root_path(),
+                )
             } else {
-                let demos = vec![Node::new_folder("本地磁盘 (C:)", Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new())];
-                (demos, vec![None], r"C:\".into())
+                crate::dlog!("[app] 没枚举到任何分区，使用 demo 数据");
+                let demos = scan::demo_partitions();
+                let infos = demos.iter().map(|_| None).collect();
+                let root = demos
+                    .first()
+                    .map(|_| r"C:\".to_string())
+                    .unwrap_or_default();
+                (demos, infos, root)
             };
-        let categories = compute_categories(&partitions[0]);
-        Self { root_path, partitions, partition_infos, selected: None, categories, scanning: false, scanned_count: 0, scan_error: None, scan_rx: None }
+
+        let categories = compute_categories_multi(&partitions);
+        let dedup_sizes = partitions.iter().map(|p| p.size).collect();
+        Self {
+            root_path,
+            partitions,
+            partition_infos,
+            dedup_sizes,
+            all_drives,
+            selected: None,
+            categories,
+            scanning: false,
+            scanned_count: 0,
+            scan_error: None,
+            scan_rx: None,
+            export_status: None,
+        }
     }
+}
+
+fn folder_color_for_drive() -> Color32 {
+    Color32::from_rgb(0x4C, 0x8B, 0xF5)
+}
+
+/// 合并所有分区的分类统计。
+fn compute_categories_multi(partitions: &[Node]) -> Vec<crate::model::CategoryStat> {
+    if partitions.is_empty() {
+        return Vec::new();
+    }
+    let mut stats = compute_categories(&partitions[0]);
+    for p in &partitions[1..] {
+        let more = compute_categories(p);
+        for (s, m) in stats.iter_mut().zip(more.iter()) {
+            s.size += m.size;
+        }
+    }
+    stats
 }
 
 impl eframe::App for DiskUiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.apply_theme(ui.ctx());
+        self.apply_dark_theme(ui.ctx());
         self.poll_scan();
-        let (total_size, _free) = self.partition_infos.first().and_then(|i|i.as_ref())
-            .map(|i|(i.total_bytes, i.free_bytes))
-            .unwrap_or_else(|| {
-                let used: u64 = self.partitions.iter().map(|p| p.logical_size).sum();
-                (((used as f64)*1.25).max(1.0) as u64, 0)
-            });
-        let used_size = self.partition_infos.first().and_then(|i|i.as_ref())
-            .map(|i| i.used_bytes)
-            .unwrap_or_else(|| self.partitions.iter().map(|p| p.logical_size).sum());
 
-        let topbar_action = topbar::show(ui, TopbarState {
-            root_path: &mut self.root_path, scanning: self.scanning, scanned_count: self.scanned_count,
-            scan_error: self.scan_error.as_deref(), used_size, total_size,
-            has_result: !self.partitions.is_empty() && self.partitions[0].file_count > 0,
-            #[cfg(windows)]
-            is_admin: crate::mft_scan::is_elevated(),
-        });
+        // 真实磁盘容量：优先用 DiskInfo，没拿到时再退回到旧的"已用 * 1.25"估算。
+        let (total_size, _free_size) = self
+            .partition_infos
+            .first()
+            .and_then(|i| i.as_ref())
+            .map(|i| (i.total_bytes, i.free_bytes))
+            .unwrap_or_else(|| {
+                let used: u64 = self.partitions.iter().map(|p| p.size).sum();
+                let total = ((used as f64) * 1.25).max(1.0) as u64;
+                (total, total.saturating_sub(used))
+            });
+        // 已用空间：优先用系统报告的 used_bytes（更准），没拿到时退回扫描汇总。
+        let used_size = self
+            .partition_infos
+            .first()
+            .and_then(|i| i.as_ref())
+            .map(|i| i.used_bytes)
+            .unwrap_or_else(|| self.partitions.iter().map(|p| p.size).sum());
+
+        let topbar_action = topbar::show(
+            ui,
+            TopbarState {
+                root_path: &mut self.root_path,
+                scanning: self.scanning,
+                scanned_count: self.scanned_count,
+                scan_error: self.scan_error.as_deref(),
+                used_size,
+                total_size,
+                can_export: !self.partitions.is_empty(),
+                export_status: self.export_status.as_deref(),
+            },
+        );
         match topbar_action {
             TopbarAction::StartScan => self.start_scan(),
             TopbarAction::ExportCsv => self.export_csv(),
-            #[cfg(windows)]
-            TopbarAction::RestartAsAdmin => self.restart_as_admin(),
             TopbarAction::None => {}
-            #[cfg(not(windows))]
-            _ => {}
         }
 
-        let p = self.partitions.first();
-        sidebar::show(ui, used_size, total_size, total_size.saturating_sub(used_size), &self.categories,
-            self.partition_infos.first().and_then(|i|i.as_ref()).map(|i|i.file_system.as_str()).unwrap_or(""),
-            p.map(|p|p.logical_size).unwrap_or(0), p.map(|p|p.physical_size).unwrap_or(0),
-            p.map(|p|p.file_count).unwrap_or(0), p.map(|p|p.folder_count).unwrap_or(0));
+        sidebar::show(
+            ui,
+            used_size,
+            total_size,
+            total_size.saturating_sub(used_size),
+            &self.categories,
+            self.partition_infos
+                .first()
+                .and_then(|i| i.as_ref())
+                .map(|i| i.file_system.as_str())
+                .unwrap_or(""),
+            self.partitions.first().map(|p| p.size).unwrap_or(0),
+            self.partitions.first().map(|p| p.file_count).unwrap_or(0),
+            self.partitions.first().map(|p| p.folder_count).unwrap_or(0),
+        );
 
-        let action = self.show_central(ui);
+        let action = self.show_central_panel(ui);
         self.apply_action(action);
+
         ui.ctx().request_repaint();
     }
 }
 
 impl DiskUiApp {
-    fn apply_theme(&self, ctx: &egui::Context) {
+    fn apply_dark_theme(&self, ctx: &egui::Context) {
         ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals {
-            window_fill: Color32::from_rgb(0x36,0x36,0x3A), panel_fill: Color32::from_rgb(0x36,0x36,0x3A), ..Default::default()
+            window_fill: Color32::from_rgb(0x36, 0x36, 0x3A),
+            panel_fill: Color32::from_rgb(0x36, 0x36, 0x3A),
+            ..Default::default()
         });
-        ctx.style_mut_of(egui::Theme::Dark, |s| {
-            s.spacing.item_spacing = Vec2::new(10.0, 8.0);
-            s.spacing.button_padding = Vec2::new(12.0, 6.0);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+            style.spacing.button_padding = Vec2::new(12.0, 6.0);
+            style.interaction.tooltip_delay = 0.05;
         });
     }
+
     fn start_scan(&mut self) {
         let path = PathBuf::from(self.root_path.trim());
         let (tx, rx) = mpsc::channel();
+        crate::dlog!("[app] 用户点击扫描，启动后台线程: root={}", path.display());
         scan::spawn_scan(path, tx);
-        self.scan_rx = Some(rx); self.scanning = true; self.scanned_count = 0; self.scan_error = None;
+        self.scan_rx = Some(rx);
+        self.scanning = true;
+        self.scanned_count = 0;
+        self.scan_error = None;
     }
 
-    #[cfg(windows)]
-    fn restart_as_admin(&mut self) {
-        crate::applog::log("[app] 用户请求以管理员身份重启");
-        if let Some(exe) = std::env::current_exe().ok() {
-            let exe_str = exe.to_string_lossy().to_string();
-            let wide: Vec<u16> = exe_str.encode_utf16().chain(std::iter::once(0)).collect();
-            let verb: Vec<u16> = "runas\0".encode_utf16().collect();
-            // ShellExecuteW(hwnd, verb, file, params, dir, show_cmd)
-            let ret = unsafe {
-                windows_sys::Win32::UI::Shell::ShellExecuteW(
-                    std::ptr::null_mut(),
-                    verb.as_ptr(),
-                    wide.as_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    1, // SW_SHOWNORMAL
-                )
-            };
-            if ret as usize > 32 {
-                // 成功启动了管理员实例，退出当前进程
-                std::process::exit(0);
-            } else {
-                crate::applog::log("[app] 管理员重启失败，用户可能取消了 UAC 提示");
-                self.scan_error = Some("管理员重启失败（用户可能取消了 UAC 提示）".into());
-            }
-        }
-    }
     fn export_csv(&mut self) {
-        if self.partitions.is_empty() { return; }
-        let root = &self.partitions[0];
-        let root_path = self.partition_infos.first()
+        let Some(root) = self.partitions.first() else {
+            self.export_status = Some("没有可导出的扫描结果".to_string());
+            return;
+        };
+        // 导出用的根路径：优先用这个分区的 DiskInfo（比如 "C:\\"），没有就退回
+        // 用户当前填在输入框里的路径。
+        let root_path = self
+            .partition_infos
+            .first()
             .and_then(|i| i.as_ref())
             .map(|i| i.root_path())
             .unwrap_or_else(|| self.root_path.clone());
-        let out = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("disklens_export.csv")))
-            .unwrap_or_else(|| std::path::PathBuf::from("disklens_export.csv"));
-        match export::export_tree_csv(root, &root_path, &out) {
-            Ok((f, d)) => {
-                crate::applog::log(&format!(
-                    "[app] CSV 导出成功: {} (文件={}, 文件夹={})",
-                    out.display(), f, d
-                ));
-                self.scan_error = Some(format!("CSV 已导出到: {}", out.display()));
+        let drive_letter = root_path.chars().next().unwrap_or('C');
+        let out_path = crate::export::default_export_path(drive_letter);
+        crate::dlog!("[app] 用户点击导出CSV: root_path={} out={}", root_path, out_path.display());
+        match crate::export::export_tree_csv(root, &root_path, &out_path) {
+            Ok((files, folders)) => {
+                let msg = format!("已导出 {} 个文件 / {} 个文件夹 → {}", files, folders, out_path.display());
+                crate::dlog!("[app] 导出成功: {}", msg);
+                self.export_status = Some(msg);
             }
             Err(e) => {
-                crate::applog::log(&format!("[app] CSV 导出失败: {e}"));
+                let msg = format!("导出失败: {e}");
+                crate::dlog!("[app] {}", msg);
+                self.export_status = Some(msg);
             }
         }
     }
+
     fn poll_scan(&mut self) {
-        let Some(rx) = &self.scan_rx else { return };
+        let Some(rx) = &self.scan_rx else {
+            return;
+        };
         let mut finished = false;
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 ScanMessage::Progress(n) => self.scanned_count = n,
-                ScanMessage::Done(node, info) => {
-                    if self.partitions.is_empty() { self.partitions.push(*node); self.partition_infos.push(info); }
-                    else { self.partitions[0] = *node; self.partition_infos[0] = info; }
-                    self.categories = compute_categories(&self.partitions[0]);
-                    self.selected = None; self.scanning = false; finished = true;
+                ScanMessage::Done(node, disk_info, dedup_size) => {
+                    if self.partitions.is_empty() {
+                        self.partitions.push(*node);
+                        self.partition_infos.push(disk_info);
+                        self.dedup_sizes.push(dedup_size);
+                    } else {
+                        self.partitions[0] = *node;
+                        self.partition_infos[0] = disk_info;
+                        if self.dedup_sizes.is_empty() {
+                            self.dedup_sizes.push(dedup_size);
+                        } else {
+                            self.dedup_sizes[0] = dedup_size;
+                        }
+                    }
+                    self.categories = compute_categories_multi(&self.partitions);
+                    self.selected = None;
+                    self.scanning = false;
+                    finished = true;
+                    crate::dlog!("[app] 扫描完成，已更新 partitions[0]");
                 }
-                ScanMessage::Error(e) => { self.scan_error = Some(e); self.scanning = false; finished = true; }
+                ScanMessage::Error(e) => {
+                    self.scan_error = Some(e);
+                    self.scanning = false;
+                    finished = true;
+                    crate::dlog!(
+                        "[app] 扫描报错: {}",
+                        self.scan_error.as_deref().unwrap_or("")
+                    );
+                }
             }
         }
-        if finished { self.scan_rx = None; }
+        if finished {
+            self.scan_rx = None;
+        }
     }
-    fn show_central(&self, ui: &mut egui::Ui) -> TreeAction {
+
+    fn show_central_panel(&self, ui: &mut egui::Ui) -> TreeAction {
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Color32::from_rgb(0x36,0x36,0x3A)).inner_margin(egui::Margin::same(16)))
-            .show(ui, |ui| { ui.add_space(4.0); tree_list::show(ui, &self.partitions, &self.partition_infos, &self.selected) })
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(0x36, 0x36, 0x3A))
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                tree_list::show(ui, &self.partitions, &self.partition_infos, &self.selected)
+            })
             .inner
     }
+
     fn apply_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::None => {}
-            TreeAction::Select(p) => { self.selected = Some(p); }
-            TreeAction::ToggleExpand(p) => {
-                if let Some(&pi) = p.first() {
-                    if let Some(part) = self.partitions.get_mut(pi) {
-                        if p.len() == 1 { part.expanded = !part.expanded; }
-                        else { part.exclusive_toggle(&p[1..]); }
+
+            TreeAction::Select(path) => {
+                self.selected = Some(path);
+            }
+
+            TreeAction::ToggleExpand(path) => {
+                if let Some(&pi) = path.first() {
+                    if let Some(partition) = self.partitions.get_mut(pi) {
+                        if path.len() == 1 {
+                            partition.expanded = !partition.expanded;
+                        } else {
+                            partition.exclusive_toggle(&path[1..]);
+                        }
                     }
                 }
-                self.selected = Some(p);
+                self.selected = Some(path);
             }
-            TreeAction::EnterNode(p) => { self.selected = Some(p); }
+
+            TreeAction::EnterNode(path) => {
+                self.selected = Some(path);
+            }
+
+            TreeAction::NavigateTo(path) => {
+                self.selected = None;
+                let _ = path;
+            }
         }
     }
 }

@@ -1,9 +1,13 @@
 [package]
 name = "disk_ui"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 [features]
+# 默认开启 GUI（eframe）。在 Linux 上做单元测试 / 编译 verify_mft 时
+# 用 `--no-default-features` 跳过 eframe（它依赖的 winit 在无 X11 头的 Linux 上编不过）。
 default = ["gui"]
 gui = ["dep:eframe", "dep:egui_extras"]
 
@@ -11,29 +15,37 @@ gui = ["dep:eframe", "dep:egui_extras"]
 egui = "0.35"
 egui_extras = { version = "0.35", optional = true }
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
+rand = "0.8"
 rayon = "1"
-dashmap = "6"
+# v14: 换用 omerbenamram/mft（crates.io 主流、被多篇取证/工具评测文章
+# 引用为可信解析器，纯 safe rust）来做 MFT 记录级解析，替代我们自己手撸的
+# fixup + 属性遍历逻辑，减少"重新发明轮子"带来的边角案例 bug（比如硬链接、
+# $ATTRIBUTE_LIST 合并这些容易出错的地方）。
+mft = "0.7"
+# `mft` 库的 $STANDARD_INFORMATION 用 jiff::Timestamp 表示时间，我们自己代码里也直接
+# 用到了这个类型（转换回 Windows FILETIME），所以要显式声明这个依赖，不能只靠 mft 带进来。
+jiff = "0.2"
 
+# 仅 Windows 平台需要：直接读取 NTFS $MFT 的底层 API 绑定。
+# （FSCTL_GET_NTFS_VOLUME_DATA / CreateFileW / DeviceIoControl / 权限检测等）
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Time",
     "Win32_Security",
-    "Win32_Security_Authorization",
     "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Com",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
 ] }
-
 [[bin]]
 name = "disk_ui"
 path = "src/main.rs"
 required-features = ["gui"]
 
+# verify_mft 不需要 eframe，可以在没有 GUI 依赖的环境下编译。
 [[bin]]
 name = "verify_mft"
 path = "src/bin/verify_mft.rs"
