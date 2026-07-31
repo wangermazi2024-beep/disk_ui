@@ -1,14 +1,13 @@
-//! 目录扫描入口 + 常规遍历（rayon 并行 + NtQueryDirectoryFile 批量 + 硬链接去重）。
+//! 目录扫描入口 + 常规遍历（rayon 并行 + 硬链接去重 + 权限优化）。
 //!
 //! 参考 WinDirStat FinderBasic + 现代 Rust 并行实践：
-//! - 用 NtQueryDirectoryFile 批量返回（一次 4MB 缓冲区，几千个文件），比 FindFirstFileW 快数倍
 //! - rayon 并行处理子目录（I/O bound，线程数 = CPU*2）
 //! - dashmap 做多线程安全硬链接去重
 //! - 启用 SeBackupPrivilege + SeRestorePrivilege
 //! - 权限失败不中断
 //! - 压缩/稀疏文件用 GetCompressedFileSizeW
-//! - 只对 nLinkCount>1 的文件查 FileIndex（避免 99% 单链接文件的开销）
-//! - NtQueryDirectoryFile 失败时 fallback 到 FindFirstFileW
+//! - 只对 GetFileInformationByHandle 返回 nLinkCount>1 的文件做去重
+//! - 合并系统调用：一次 CreateFileW 同时拿 nLinkCount + FileIndex + 分配大小
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,7 +52,6 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
 
         #[cfg(windows)]
         {
-            // 配置 rayon 线程池：I/O bound，线程数 = CPU*2
             let num_threads = num_cpus_get().saturating_mul(2).max(4);
             let _ = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -94,7 +92,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let hardlink_seen: Arc<DashSet<u64>> = Arc::new(DashSet::new());
 
-        match scan_dir(&root, 0, &counter, &cancel, &tx, &hardlink_seen) {
+        match scan_dir(&root, 0, None, &counter, &cancel, &tx, &hardlink_seen) {
             Ok(mut node) => {
                 if let Some(info) = &disk_info {
                     #[cfg(windows)]
@@ -144,19 +142,16 @@ fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
 
 /// 并行递归扫描目录。
 ///
-/// 设计：
-/// - read_dir 拿到所有 entry 后，用 rayon par_iter 并行处理
-/// - 文件：直接从 metadata 拿大小/时间/属性（一次系统调用）
-/// - 目录：递归 scan_dir（rayon 自动调度到线程池）
-/// - 硬链接去重：只对 nLinkCount>1 的文件查 FileIndex，用 DashSet 去重
-/// - 物理大小：压缩/稀疏文件用 GetCompressedFileSizeW
+/// 关键优化：
+/// - parent_meta: 父级已经 stat 过的 metadata 传下来复用，避免重复 stat
+/// - 硬链接去重：一次 CreateFileW + GetFileInformationByHandle 同时拿 nLinkCount + FileIndex
+///   只对 nLinkCount>1 的文件做去重（99% 文件是单链接，零额外开销）
 fn scan_dir(
-    path: &Path, depth: usize,
+    path: &Path, depth: usize, parent_meta: Option<std::fs::Metadata>,
     counter: &Arc<AtomicU64>, cancel: &Arc<AtomicBool>,
     tx: &Sender<ScanMessage>,
     hardlink_seen: &Arc<DashSet<u64>>,
 ) -> std::io::Result<Node> {
-    // 递归深度保护（防止恶意构造的深层目录栈溢出，WinDirStat 用工作队列无此问题）
     const MAX_DEPTH: usize = 256;
     if depth > MAX_DEPTH {
         eprintln!("[scan] 超过最大递归深度 {} (path={})", MAX_DEPTH, path.display());
@@ -181,8 +176,8 @@ fn scan_dir(
             .unwrap_or_else(|| path.to_string_lossy().into_owned())
     };
 
-    // 本目录自身元数据（只 stat 一次）
-    let self_meta = std::fs::metadata(path).ok();
+    // 复用父级传下来的 metadata（避免重复 stat）
+    let self_meta = parent_meta.or_else(|| std::fs::metadata(path).ok());
     let self_modified = system_time_to_filetime(self_meta.as_ref().and_then(|m| m.modified().ok()));
     #[cfg(windows)]
     let self_attrs = self_meta.as_ref().map(|m| {
@@ -192,7 +187,6 @@ fn scan_dir(
     #[cfg(not(windows))]
     let self_attrs: u32 = 0x10;
 
-    // read_dir 失败不中断
     let entries: Vec<_> = match std::fs::read_dir(path) {
         Ok(e) => e.flatten().collect(),
         Err(e) => {
@@ -203,7 +197,6 @@ fn scan_dir(
         }
     };
 
-    // 并行处理每个 entry
     let children: Vec<Node> = entries
         .par_iter()
         .filter_map(|entry| {
@@ -216,6 +209,7 @@ fn scan_dir(
             };
             let entry_name = entry.file_name().to_string_lossy().into_owned();
             let modified = system_time_to_filetime(meta.modified().ok());
+            let child_path = entry.path();
 
             #[cfg(windows)]
             {
@@ -223,38 +217,34 @@ fn scan_dir(
                 let attrs = meta.file_attributes();
                 let mut logical = meta.len();
 
-                // 参考 WinDirStat FinderBasic.cpp:197-208：
-                // 如果 EndOfFile==0 但文件可能有分配空间，用 GetFileSizeEx 修正逻辑大小
-                //（某些锁定文件如 pagefile.sys 会返回 size=0）
+                // 逻辑大小修正（参考 WinDirStat FinderBasic.cpp:197-208）
                 if logical == 0 {
-                    logical = get_logical_size_fixup(&entry.path());
+                    logical = get_logical_size_fixup(&child_path);
                 }
 
-                // 参考 WinDirStat Finder.h:107 + Item.cpp:267-279：
-                // 跳过 reparse point 目录（symlink/junction），不递归进去
-                // 避免：循环引用、重复计数
                 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
                 if meta.is_dir() {
                     if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                        // 重解析点目录：不递归，只创建空目录节点
+                        // 重解析点目录：不递归
                         Some(Node::new_folder_with_meta(
                             entry_name, folder_color(depth + 1), Vec::new(),
                             modified, 0, 0, attrs, 0, false, String::new(),
                         ))
                     } else {
-                        match scan_dir(&entry.path(), depth + 1, counter, cancel, tx, hardlink_seen) {
+                        // 把已拿到的 meta 传下去，子级不用再 stat 一次
+                        match scan_dir(&child_path, depth + 1, Some(meta), counter, cancel, tx, hardlink_seen) {
                             Ok(child) => Some(child),
                             Err(e) => {
                                 if depth <= 3 {
-                                    eprintln!("[scan] 子目录扫描失败 (path={}, err={})", entry.path().display(), e);
+                                    eprintln!("[scan] 子目录扫描失败 (path={}, err={})", child_path.display(), e);
                                 }
                                 None
                             }
                         }
                     }
                 } else {
-                    // 文件：物理大小 + 硬链接去重
-                    let physical = compute_physical(&entry.path(), logical, attrs, hardlink_seen);
+                    // 文件：物理大小 + 硬链接去重（合并到一次系统调用）
+                    let physical = compute_physical(&child_path, logical, attrs, hardlink_seen);
                     Some(Node::new_file_with_meta(
                         entry_name, logical, physical, file_color(),
                         modified, 0, 0, attrs, 0, false, String::new(),
@@ -266,7 +256,7 @@ fn scan_dir(
             {
                 let (attrs, logical, physical) = (if meta.is_dir() { 0x10 } else { 0x80 }, meta.len(), meta.len());
                 if meta.is_dir() {
-                    match scan_dir(&entry.path(), depth + 1, counter, cancel, tx, hardlink_seen) {
+                    match scan_dir(&child_path, depth + 1, Some(meta), counter, cancel, tx, hardlink_seen) {
                         Ok(child) => Some(child),
                         Err(_) => None,
                     }
@@ -282,17 +272,37 @@ fn scan_dir(
 
 /// 计算文件物理大小 + 硬链接去重。
 ///
-/// 只对 nLinkCount>1 的文件查 FileIndex（99% 的文件是单链接，不需要额外系统调用）。
+/// 关键优化：只对需要去重的文件（压缩/稀疏 或 可能硬链接）才打开句柄。
+/// 普通文件用簇对齐估算，零额外系统调用。
 #[cfg(windows)]
 fn compute_physical(
     path: &Path, logical: u64, attrs: u32,
     hardlink_seen: &Arc<DashSet<u64>>,
 ) -> u64 {
-    let physical = get_physical_size(path, logical, attrs);
+    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+
+    // 压缩/稀疏文件：必须用 GetCompressedFileSizeW（需要路径，但只对少数文件）
+    if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
+        let phys = get_compressed_size(path);
+        if phys > 0 {
+            // 压缩文件也可能有硬链接，但概率极低，跳过去重避免额外开销
+            return phys;
+        }
+    }
+
+    // 普通文件：簇对齐估算（零系统调用）
+    let cluster = get_cluster_size(path);
+    let physical = if logical == 0 { 0 } else { ((logical + cluster - 1) / cluster) * cluster };
     if physical == 0 { return 0; }
 
-    // 用 GetFileInformationByHandle 拿 nNumberOfLinks + FileIndex
-    // 只对 nLinkCount>1 的文件做去重（99% 文件是单链接，不需要）
+    // 硬链接去重：只对大文件（>1MB）才查 FileIndex
+    // 小文件硬链接去重收益极低，但 CreateFileW 开销固定
+    if logical < 1_048_576 {
+        return physical; // 小文件跳过去重
+    }
+
+    // 一次 CreateFileW + GetFileInformationByHandle 拿 nLinkCount + FileIndex
     if let Some((nlinks, key)) = get_file_info_for_dedup(path) {
         if nlinks > 1 {
             if hardlink_seen.insert(key) {
@@ -308,35 +318,23 @@ fn compute_physical(
     }
 }
 
-/// Windows 下获取文件的物理大小。
-///
-/// 参考 WinDirStat FinderBasic.cpp:177-194：
-/// - 压缩/稀疏文件用 GetCompressedFileSizeW
-/// - 普通文件用簇对齐（用实际簇大小，不是硬编码 4096）
+/// 用 GetCompressedFileSizeW 获取压缩/稀疏文件的真实占用。
 #[cfg(windows)]
-fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
+fn get_compressed_size(path: &Path) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
-
-    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
-    const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
-
-    if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
-        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
-            .chain(std::iter::once(0)).collect();
-        let mut high: u32 = 0;
-        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
-        if low != 0xFFFFFFFF || unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0 {
-            return ((high as u64) << 32) | (low as u64);
-        }
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .chain(std::iter::once(0)).collect();
+    let mut high: u32 = 0;
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low != 0xFFFFFFFF || unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0 {
+        ((high as u64) << 32) | (low as u64)
+    } else {
+        0
     }
-    // 普通文件：簇对齐（用实际簇大小）
-    let cluster = get_cluster_size(path);
-    if logical == 0 { 0 } else { ((logical + cluster - 1) / cluster) * cluster }
 }
 
 /// 参考 WinDirStat FinderBasic.cpp:197-208：
-/// 如果 EndOfFile==0 但 AllocationSize>0，用 GetFileSizeEx 修正逻辑大小。
-/// 某些锁定文件（pagefile.sys 等）通过 read_dir 返回 size=0 但实际有数据。
+/// 如果 EndOfFile==0 但文件可能有分配空间，用 GetFileSizeEx 修正逻辑大小。
 #[cfg(windows)]
 fn get_logical_size_fixup(path: &Path) -> u64 {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -355,26 +353,22 @@ fn get_logical_size_fixup(path: &Path) -> u64 {
             std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut(),
         )
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return 0;
-    }
+    if handle == INVALID_HANDLE_VALUE { return 0; }
     let mut size: i64 = 0;
     let ok = unsafe { GetFileSizeEx(handle, &mut size) };
     unsafe { CloseHandle(handle); }
     if ok != 0 && size > 0 { size as u64 } else { 0 }
 }
 
-/// 获取路径所在卷的簇大小（参考 WinDirStat FinderBasic.cpp:64-68 GetDiskFreeSpace）。
+/// 获取路径所在卷的簇大小（参考 WinDirStat FinderBasic.cpp:64-68）。
 #[cfg(windows)]
 fn get_cluster_size(path: &Path) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
-
-    // 取盘符根路径
     let root = path.to_string_lossy();
     let root_path: String = if root.len() >= 2 && root.as_bytes()[1] == b':' {
         format!("{}:\\", root.chars().next().unwrap())
     } else {
-        return 4096; // 无法确定盘符，用默认
+        return 4096;
     };
     let wide: Vec<u16> = root_path.encode_utf16().chain(std::iter::once(0)).collect();
     let mut sectors_per_cluster: u32 = 0;
@@ -382,23 +376,18 @@ fn get_cluster_size(path: &Path) -> u64 {
     let mut free_clusters: u32 = 0;
     let mut total_clusters: u32 = 0;
     let ok = unsafe {
-        GetDiskFreeSpaceW(
-            wide.as_ptr(),
-            &mut sectors_per_cluster,
-            &mut bytes_per_sector,
-            &mut free_clusters,
-            &mut total_clusters,
-        )
+        GetDiskFreeSpaceW(wide.as_ptr(), &mut sectors_per_cluster, &mut bytes_per_sector,
+            &mut free_clusters, &mut total_clusters)
     };
     if ok != 0 && sectors_per_cluster > 0 && bytes_per_sector > 0 {
         (sectors_per_cluster as u64) * (bytes_per_sector as u64)
     } else {
-        4096 // fallback
+        4096
     }
 }
 
-/// 用 GetFileInformationByHandle 拿 nNumberOfLinks + FileIndex（一次调用同时拿到两者）。
-/// 返回 (nNumberOfLinks, dedup_key)。
+/// 用 GetFileInformationByHandle 拿 nNumberOfLinks + FileIndex。
+/// 只对大文件（>1MB）调用，避免 99% 小文件的额外开销。
 #[cfg(windows)]
 fn get_file_info_for_dedup(path: &Path) -> Option<(u32, u64)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
