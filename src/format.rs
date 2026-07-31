@@ -159,17 +159,13 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 /// - `I` NotContentIndexed(0x1000)
 /// - `X` Encrypted        (0x4000)
 pub fn format_attributes(attrs: u32) -> String {
+    // 和 WinDirStat 一致：只显示 R/H/S/A/C（不显示 D/N/T/I/X）
     let mut s = String::with_capacity(8);
     if attrs & 0x01 != 0 { s.push('R'); }
     if attrs & 0x02 != 0 { s.push('H'); }
     if attrs & 0x04 != 0 { s.push('S'); }
-    if attrs & 0x10 != 0 { s.push('D'); }
     if attrs & 0x20 != 0 { s.push('A'); }
-    if attrs & 0x80 != 0 { s.push('N'); }
-    if attrs & 0x100 != 0 { s.push('T'); }
     if attrs & 0x800 != 0 { s.push('C'); }
-    if attrs & 0x1000 != 0 { s.push('I'); }
-    if attrs & 0x4000 != 0 { s.push('X'); }
     if s.is_empty() {
         "—".into()
     } else {
@@ -255,12 +251,14 @@ mod tests {
 
     #[test]
     fn test_format_attributes_normal() {
-        assert_eq!(format_attributes(0x80), "N");
+        // NORMAL=0x80 不再显示（和 WinDirStat 一致）
+        assert_eq!(format_attributes(0x80), "—");
     }
 
     #[test]
     fn test_format_attributes_directory() {
-        assert_eq!(format_attributes(0x10), "D");
+        // DIRECTORY=0x10 不再显示（和 WinDirStat 一致）
+        assert_eq!(format_attributes(0x10), "—");
     }
 
     #[test]
@@ -276,6 +274,6 @@ mod tests {
         let s = format_attributes(0x16);
         assert!(s.contains('H'));
         assert!(s.contains('S'));
-        assert!(s.contains('D'));
+        // D 不再显示
     }
 }

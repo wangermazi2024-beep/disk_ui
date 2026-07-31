@@ -1,97 +1,88 @@
-//! 把扫描结果（`Node` 树）导出成 CSV，方便和 WizTree 的导出结果做逐行对比，
-//! 定位到底是哪些具体文件/文件夹丢了、或者大小算错了。
+//! CSV 导出 — 和列表列完全一致。
 //!
-//! 格式故意做得跟 WizTree 导出的 CSV 尽量像：一行一个文件/文件夹，带完整路径
-//! 和大小，这样可以直接用 Excel/脚本按路径 VLOOKUP 对比两份表。
+//! 列顺序：路径 | 名称 | 父占比 | 总占比 | 逻辑大小 | 修改时间 | 物理大小 | 创建时间 | 访问时间
+//!         | 项目 | 文件 | 文件夹 | 属性 | 重解析点 | 保留 | 所有者
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::format::{format_attributes, format_filetime_local as format_filetime};
 use crate::model::Node;
 
-/// 手动拼路径字符串，而不是用 `PathBuf::join`。
-///
-/// **关键原因**：`std::path::PathBuf` 在 Windows 下对"以句点/空格结尾"的路径
-/// 分量处理不可靠（这类分量在 Win32 层面本来就是被 `GetFullPathNameW` 之类的
-/// API 特殊对待的边角情况，NTFS 底层允许，但路径库这一层会把结尾的点/空格
-/// 悄悄吃掉）。这份导出只是纯文本 CSV，不需要真的操作文件系统路径语义，
-/// 用字符串拼接可以完整保留原始文件名（比如 `92b.` 这种结尾带点的合法文件名），
-/// 之前用 `PathBuf::join` + `.display()` 时就是在这一步把结尾的 `.` 弄丢的——
-/// 扫描引擎本身拿到的名字和大小其实都是对的，只是导出这步把名字写错了。
 fn join_path(parent: &str, name: &str) -> String {
-    if parent.ends_with('\\') {
-        format!("{parent}{name}")
-    } else {
-        format!("{parent}\\{name}")
-    }
+    if parent.ends_with('\\') { format!("{parent}{name}") } else { format!("{parent}\\{name}") }
 }
 
-/// 导出整棵树到 `out_path`。`root_path` 是这棵树对应的盘符根路径（比如 `"C:\\"`），
-/// 用来拼出每一行的完整路径——`Node` 本身只存相对的子节点名字，不存完整路径。
-///
-/// CSV 格式：`"路径",大小,分配,类型`，其中"分配"是物理分配大小（allocated_length），
-/// 跟在 WizTree 导出的 file_size,allocated 两列格式一致。
-///
-/// 返回 `(导出的文件数, 导出的文件夹数)`，跟 UI 上显示的"总扫描数"对一下账，
-/// 确认导出没有中途漏行。
+/// 导出整棵树到 CSV。返回 (文件数, 文件夹数)。
 pub fn export_tree_csv(root: &Node, root_path: &str, out_path: &Path) -> io::Result<(u64, u64)> {
     let mut f = File::create(out_path)?;
-    // UTF-8 BOM，跟 WizTree 导出的编码一致，Excel 打开中文路径不会乱码。
-    f.write_all(&[0xEF, 0xBB, 0xBF])?;
-    writeln!(f, "路径,大小,分配,类型")?;
+    f.write_all(&[0xEF, 0xBB, 0xBF])?; // UTF-8 BOM
+    writeln!(f, "路径,名称,父占比(%),总占比(%),逻辑大小,修改时间,物理大小,创建时间,访问时间,项目,文件,文件夹,属性,重解析点,保留,所有者")?;
 
     let mut file_count = 0u64;
     let mut folder_count = 0u64;
-    let base = root_path.to_string();
+    let disk_logical = root.logical_size.max(1);
 
-    // 根节点自己也写一行（大小=整个树汇总，方便跟 WizTree CSV 里 "C:\" 那一行对比）。
-    write_row(&mut f, &base, root.size, root.allocated, root.is_folder())?;
-    walk(root, &base, &mut f, &mut file_count, &mut folder_count)?;
-
+    // 根节点
+    write_row(&mut f, root_path, root, 1.0, 1.0, root.logical_size, disk_logical)?;
+    walk(root, root_path, &mut f, &mut file_count, &mut folder_count, disk_logical)?;
     Ok((file_count, folder_count))
 }
 
-fn write_row(f: &mut File, path: &str, size: u64, allocated: u64, is_folder: bool) -> io::Result<()> {
-    let path_str = path.replace('"', "\"\"");
-    let kind = if is_folder { "D" } else { "F" };
-    writeln!(f, "\"{path_str}\",{size},{allocated},{kind}")
+fn write_row(
+    f: &mut File, path: &str, node: &Node,
+    parent_pct: f64, total_pct: f64,
+    _parent_size: u64, _disk_logical: u64,
+) -> io::Result<()> {
+    let kind = if node.is_folder() { "文件夹" } else { "文件" };
+    let items = if node.is_folder() { node.file_count + node.folder_count } else { 0 };
+    let files = if node.is_folder() { node.file_count } else { 0 };
+    let folders = if node.is_folder() { node.folder_count } else { 0 };
+    let modified = if node.modified_ft > 0 { format_filetime(node.modified_ft) } else { String::new() };
+    let created = if node.created_ft > 0 { format_filetime(node.created_ft) } else { String::new() };
+    let accessed = if node.accessed_ft > 0 { format_filetime(node.accessed_ft) } else { String::new() };
+    let reparse = if node.reparse_tag != 0 { format!("0x{:X}", node.reparse_tag) } else { String::new() };
+    let reserved = if node.is_reserved { "是" } else { "" };
+    let owner = &node.owner;
+    let attrs = format_attributes(node.attributes);
+
+    // CSV 转义：含逗号的字段用双引号包裹，内部双引号转义为两个
+    let esc = |s: &str| -> String {
+        if s.contains(',') || s.contains('"') || s.contains('\n') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else { s.to_string() }
+    };
+
+    writeln!(f, "{},{},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{}",
+        esc(path), esc(&node.name),
+        parent_pct * 100.0, total_pct * 100.0,
+        node.logical_size, esc(&modified),
+        node.physical_size, esc(&created), esc(&accessed),
+        items, files, folders,
+        esc(&attrs), esc(&reparse), reserved, esc(owner),
+    )?;
+    let _ = kind;
+    Ok(())
 }
 
 fn walk(
-    node: &Node,
-    cur_path: &str,
-    f: &mut File,
-    file_count: &mut u64,
-    folder_count: &mut u64,
+    node: &Node, cur_path: &str, f: &mut File,
+    file_count: &mut u64, folder_count: &mut u64,
+    disk_logical: u64,
 ) -> io::Result<()> {
+    let parent_size = node.logical_size.max(1);
     for child in &node.children {
         let child_path = join_path(cur_path, &child.name);
-        write_row(f, &child_path, child.size, child.allocated, child.is_folder())?;
+        let parent_pct = if parent_size > 0 { child.logical_size as f64 / parent_size as f64 } else { 0.0 };
+        let total_pct = if disk_logical > 0 { child.logical_size as f64 / disk_logical as f64 } else { 0.0 };
+        write_row(f, &child_path, child, parent_pct, total_pct, parent_size, disk_logical)?;
         if child.is_folder() {
             *folder_count += 1;
-            walk(child, &child_path, f, file_count, folder_count)?;
+            walk(child, &child_path, f, file_count, folder_count, disk_logical)?;
         } else {
             *file_count += 1;
         }
     }
     Ok(())
-}
-
-/// 导出文件默认放的位置：优先桌面（`%USERPROFILE%\Desktop`），拿不到就放当前目录。
-/// 文件名带时间戳，多次导出不会互相覆盖，方便留多份跟不同时间点的 WizTree 导出对比。
-pub fn default_export_path(drive_letter: char) -> PathBuf {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let filename = format!("DiskLens_export_{drive_letter}_{ts}.csv");
-    let desktop = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .map(|p| p.join("Desktop"))
-        .filter(|p| p.is_dir());
-    match desktop {
-        Some(dir) => dir.join(filename),
-        None => PathBuf::from(filename),
-    }
 }
