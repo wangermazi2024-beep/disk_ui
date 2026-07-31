@@ -185,25 +185,47 @@ pub fn scan_volume(
     Ok(root_node)
 }
 
-/// 递归填充 Owner（用 GetNamedSecurityInfo + LookupAccountSid）。
+/// 填充 Owner（用 GetNamedSecurityInfo + LookupAccountSid）。
 /// 只填充可见的（已展开的）节点的直接子项，避免全量遍历太慢。
-fn populate_owners(node: &mut Node, path: &str) {
-    for child in &mut node.children {
-        let child_path = if path.ends_with('\\') {
-            format!("{}{}", path, child.name)
-        } else {
-            format!("{}\\{}", path, child.name)
-        };
-        child.owner = get_owner(&child_path);
-        // 只递归已展开的文件夹
-        if child.is_folder() && child.expanded {
-            populate_owners(child, &child_path);
+///
+/// 这里用**迭代式校队列**实现，不递归——无论展开的目录子树多深，都不会栈溢出。
+///（以前的递归实现遇到几千层展开的目录会炸。）
+pub(crate) fn populate_owners(root: &mut Node, root_path: &str) {
+    // 队列里每个元素：(可变引用路径, 对应的父目录字符串)
+    // 用索引路径代替直接持有 &mut Node，避免借用检查冲突。
+    let mut stack: Vec<(Vec<usize>, String)> = vec![(vec![], root_path.to_string())];
+    while let Some((path_indices, parent_path)) = stack.pop() {
+        // 安全拿可变引用：用 navigate_mut 风格的手动遍历
+        let node = navigate_mut(root, &path_indices);
+        let parent_ends_slash = parent_path.ends_with('\\');
+        for (i, child) in node.children.iter_mut().enumerate() {
+            let child_path = if parent_ends_slash {
+                format!("{}{}", parent_path, child.name)
+            } else {
+                format!("{}\\{}", parent_path, child.name)
+            };
+            child.owner = get_owner(&child_path);
+            // 只递归已展开的文件夹
+            if child.is_folder() && child.expanded {
+                let mut child_path_indices = path_indices.clone();
+                child_path_indices.push(i);
+                stack.push((child_path_indices, child_path));
+            }
         }
     }
 }
 
+/// 手动沿索引路径走可变引用。不用递归。
+fn navigate_mut<'a>(root: &'a mut Node, path: &[usize]) -> &'a mut Node {
+    let mut cur = root;
+    for &i in path {
+        cur = &mut cur.children[i];
+    }
+    cur
+}
+
 /// 用 Win32 API 获取文件所有者名称（和 WinDirStat 的 GetOwner 一致）。
-fn get_owner(path: &str) -> String {
+pub(crate) fn get_owner(path: &str) -> String {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::{
         LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
@@ -229,12 +251,14 @@ fn get_owner(path: &str) -> String {
         return String::new();
     }
 
+    // 先用 260 试一下（常见路径 AD 用户名都不超过这个长度），不够再重试。
+    // 以前固定 260 在超长用户名上会被截断。
     let mut name_buf = [0u16; 260];
     let mut name_len: u32 = 260;
     let mut domain_buf = [0u16; 260];
     let mut domain_len: u32 = 260;
     let mut sid_type: SID_NAME_USE = 0;
-    let ok = unsafe {
+    let mut ok = unsafe {
         LookupAccountSidW(
             std::ptr::null(),
             sid,
@@ -245,6 +269,38 @@ fn get_owner(path: &str) -> String {
             &mut sid_type,
         )
     };
+    // LookupAccountSidW 返回 0 且 name_len 超过初始缓冲区时，重试一次（足够大）。
+    if ok == 0 && name_len as usize > 260 {
+        let mut big_name = vec![0u16; name_len as usize];
+        let mut big_domain = vec![0u16; domain_len as usize];
+        ok = unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid,
+                big_name.as_mut_ptr(),
+                &mut name_len,
+                big_domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut sid_type,
+            )
+        };
+        let result = if ok != 0 && name_len > 0 {
+            let name = String::from_utf16_lossy(&big_name[..name_len as usize]);
+            if domain_len > 0 {
+                let domain = String::from_utf16_lossy(&big_domain[..domain_len as usize]);
+                format!("{}\\{}", domain, name)
+            } else {
+                name
+            }
+        } else {
+            String::new()
+        };
+        unsafe {
+            if !sd.is_null() { LocalFree(sd as *mut _); }
+        }
+        return result;
+    }
+
     let result = if ok != 0 && name_len > 0 {
         let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
         if domain_len > 0 {
@@ -315,7 +371,16 @@ fn load_volume(
         )));
     }
     let bytes_per_cluster = vol_info.BytesPerCluster;
-    let bytes_per_record = vol_info.BytesPerFileRecordSegment.max(1024);
+    let bytes_per_record = if vol_info.BytesPerFileRecordSegment == 0 {
+        // 这里以前是 .max(1024)，会把系统返回异常值静默忽略掉，掩盖问题。
+        // 改成报错：让调用方决定要不要 fallback，而不是假装一切正常。
+        unsafe { CloseHandle(vol_handle); }
+        return Err(MftError(format!(
+            "FSCTL_GET_NTFS_VOLUME_DATA 返回 BytesPerFileRecordSegment=0（卷信息异常）"
+        )));
+    } else {
+        vol_info.BytesPerFileRecordSegment
+    };
     eprintln!(
         "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={}",
         bytes_per_cluster, bytes_per_record, vol_info.MftStartLcn, vol_info.MftValidDataLength

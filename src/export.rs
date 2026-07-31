@@ -66,20 +66,34 @@ fn write_row(
     Ok(())
 }
 
+/// 用迭代式栈代替递归——和 scan.rs 一样的思路，避免目录树过深时栈溢出。
+/// 每个栈元素：(节点引用, 该节点的完整路径, 父目录的 logical_size 用于算父占比)
 fn walk(
-    node: &Node, cur_path: &str, f: &mut File,
+    root: &Node, root_path: &str, f: &mut File,
     file_count: &mut u64, folder_count: &mut u64,
     disk_logical: u64,
 ) -> io::Result<()> {
-    let parent_size = node.logical_size.max(1);
-    for child in &node.children {
-        let child_path = join_path(cur_path, &child.name);
-        let parent_pct = if parent_size > 0 { child.logical_size as f64 / parent_size as f64 } else { 0.0 };
-        let total_pct = if disk_logical > 0 { child.logical_size as f64 / disk_logical as f64 } else { 0.0 };
-        write_row(f, &child_path, child, parent_pct, total_pct, parent_size, disk_logical)?;
-        if child.is_folder() {
+    // 栈元素：(节点, 路径, 父目录 logical)
+    let mut stack: Vec<(&Node, String, u64)> = Vec::new();
+    // 初始：把根的所有直接子项压栈（根节点本身已经在 export_tree_csv 里单独写过）
+    let root_logical = root.logical_size.max(1);
+    for child in &root.children {
+        let child_path = join_path(root_path, &child.name);
+        stack.push((child, child_path, root_logical));
+    }
+
+    while let Some((node, path, parent_size)) = stack.pop() {
+        let parent_pct = if parent_size > 0 { node.logical_size as f64 / parent_size as f64 } else { 0.0 };
+        let total_pct = if disk_logical > 0 { node.logical_size as f64 / disk_logical as f64 } else { 0.0 };
+        write_row(f, &path, node, parent_pct, total_pct, parent_size, disk_logical)?;
+        if node.is_folder() {
             *folder_count += 1;
-            walk(child, &child_path, f, file_count, folder_count, disk_logical)?;
+            // 把子节点压栈（注意顺序：栈是 LIFO，要倒序 push 才能保持原顺序输出）
+            let child_parent_size = node.logical_size.max(1);
+            for child in node.children.iter().rev() {
+                let child_path = join_path(&path, &child.name);
+                stack.push((child, child_path, child_parent_size));
+            }
         } else {
             *file_count += 1;
         }

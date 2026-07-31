@@ -9,38 +9,56 @@ mod ui;
 use app::DiskUiApp;
 
 fn setup_fonts(ctx: &egui::Context) {
-    // 优先用 %SystemRoot% 环境变量拼字体目录，而不是写死 "C:\Windows"——
-    // 系统盘不一定是 C 盘（企业环境、多系统机器上很常见装在别的盘）。
-    // 环境变量拿不到时才退回 C:\Windows 这个绝大多数机器上成立的默认值。
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let dynamic_candidates = [
-        format!(r"{system_root}\Fonts\msyh.ttc"),
-        format!(r"{system_root}\Fonts\msyh.ttf"),
-        format!(r"{system_root}\Fonts\simhei.ttf"),
-        format!(r"{system_root}\Fonts\simsun.ttc"),
-    ];
-    const STATIC_CANDIDATES: &[&str] = &[
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-    ];
-    let found = dynamic_candidates.iter().map(|s| s.as_str())
-        .chain(STATIC_CANDIDATES.iter().copied())
-        .find_map(|p| std::fs::read(p).ok().map(|data| (p, data)));
-    let Some((path, data)) = found else {
-        // 找不到任何中文字体：不能让它在没有任何提示的情况下悄悄退化成方块字。
-        // 换电脑（精简版 Windows / Server Core / 没装东亚语言包）复现"中文显示不出来"的
-        // bug 报告时，这行日志能直接告诉你是不是这个原因。
-        eprintln!("[main] 未找到可用的中文字体，界面中文可能显示为方块（已尝试: {:?} + Linux/macOS 候选路径）", dynamic_candidates);
+    // 以前是写死几个候选路径（C:\Windows\Fonts\msyh.ttc 等），在精简版 Windows / WinPE / Server Core
+    // 上可能路径不一致或字体被精简。现在用 GetWindowsDirectoryW 动态拿系统目录，
+    // 拼出 Fonts 路径，再试几个常见中文字体。找不到不静默退出一一遇零返回，
+    // 至少保留 egui 默认字体（中文会变方块，但不会崩溃，并打日志提醒）。
+    let candidates: Vec<String> = windows_fonts_dir()
+        .into_iter()
+        .flat_map(|dir| {
+            vec![
+                format!("{}\\msyh.ttc", dir),    // 微软雅黑
+                format!("{}\\msyhbd.ttc", dir),   // 微软雅黑粗体
+                format!("{}\\simhei.ttf", dir),  // 黑体
+                format!("{}\\simsun.ttc", dir),  // 宋体
+                format!("{}\\Deng.ttf", dir),    // 等线
+            ]
+        })
+        .chain([
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc".to_string(),
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".to_string(),
+            "/System/Library/Fonts/PingFang.ttc".to_string(),
+        ])
+        .collect();
+
+    let Some(data) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+        eprintln!("[font] 未找到中文字体，中文将显示为方块。尝试过的路径:");
+        for p in &candidates { eprintln!("  - {}", p); }
         return;
     };
-    eprintln!("[main] 使用中文字体: {path}");
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data).into());
     fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "cjk".to_owned());
     fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
     ctx.set_fonts(fonts);
 }
+
+/// 用 GetWindowsDirectoryW 拿 Windows 目录（通常是 C:\Windows），再拼出 Fonts 子目录。
+/// 拿不到就返回空 Vec，上层会退化到写死的候选路径。
+#[cfg(windows)]
+fn windows_fonts_dir() -> Vec<String> {
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+    let mut buf = [0u16; 260];
+    let len = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 || len as usize >= buf.len() {
+        return Vec::new();
+    }
+    let win_dir = String::from_utf16_lossy(&buf[..len as usize]);
+    vec![format!("{}\\Fonts", win_dir)]
+}
+
+#[cfg(not(windows))]
+fn windows_fonts_dir() -> Vec<String> { Vec::new() }
 
 fn main() -> eframe::Result<()> {
     applog::init();

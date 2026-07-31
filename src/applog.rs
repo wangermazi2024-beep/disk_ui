@@ -13,11 +13,34 @@ use std::sync::{Mutex, OnceLock};
 static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 /// 日志文件的完整路径，供 UI 层展示给用户（比如导出成功后提示"日志见 xxx"）。
+///
+/// 优先顺序：
+/// 1. exe 所在目录下的 `disklens_log.txt`（方便跟 exe 一起贴走调试）
+/// 2. %TEMP%\disklens_log.txt（双击运行时 cwd 可能不可写，退化到临时目录）
+/// 以前只退化到 `PathBuf::from("disklens_log.txt")`——cwd 不一致导致找不到日志。
 pub fn log_path() -> PathBuf {
-    std::env::current_exe()
+    // 1. exe 所在目录
+    if let Some(p) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("disklens_log.txt")))
-        .unwrap_or_else(|| PathBuf::from("disklens_log.txt"))
+    {
+        return p;
+    }
+    // 2. %TEMP% （Windows） / /tmp（Unix）
+    #[cfg(windows)]
+    {
+        if let Some(tmp) = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")) {
+            return PathBuf::from(tmp).join("disklens_log.txt");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(tmp) = std::env::var_os("TMPDIR") {
+            return PathBuf::from(tmp).join("disklens_log.txt");
+        }
+    }
+    // 3. 最后兑底：cwd（至少不会崩）
+    PathBuf::from("disklens_log.txt")
 }
 
 /// 程序启动时调用一次。打开日志文件失败也不影响程序正常运行，只是退化成只有

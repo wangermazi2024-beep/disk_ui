@@ -26,6 +26,9 @@ pub struct DiskUiApp {
 impl Default for DiskUiApp {
     fn default() -> Self {
         let all_drives = disk_info::enumerate_drives();
+        // 优先 C 盘，其次任意一个可用盘，都没有才退化到写死的演示。
+        // 以前最后一部写死 r"C:\"——在 C 盘不是数据盘的机器上会默认指向系统盘，
+        // 不符合用户预期。现在退化为空字符串（让用户手动输入路径）。
         let (partitions, partition_infos, root_path) =
             if let Some(c) = all_drives.iter().find(|d| d.drive_letter == 'C').cloned() {
                 let placeholder = Node::new_folder_with_meta(c.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
@@ -34,10 +37,9 @@ impl Default for DiskUiApp {
                 let placeholder = Node::new_folder_with_meta(first.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
                 (vec![placeholder], vec![Some(first.clone())], first.root_path())
             } else {
-                // 枚举不到任何固定磁盘（极端情况，比如驱动异常）：不再假装存在一个 C 盘，
-                // 用空占位代替，root_path 留空，逼用户自己在顶部输入/选择路径，
-                // 而不是默默地对着一个不一定存在的 "C:\" 做无意义的展示。
-                let demos = vec![Node::new_folder("(未检测到磁盘)", Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new())];
+                // 拿不到任何盘信息（极罕见）：用空字符串让用户手动输入，
+                // 不再写死 C:\——避免默认指向不存在的盘。
+                let demos = vec![Node::new_folder("请输入扫描路径", Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new())];
                 (demos, vec![None], String::new())
             };
         let categories = compute_categories(&partitions[0]);
@@ -52,12 +54,11 @@ impl eframe::App for DiskUiApp {
         let (total_size, _free) = self.partition_infos.first().and_then(|i|i.as_ref())
             .map(|i|(i.total_bytes, i.free_bytes))
             .unwrap_or_else(|| {
-                // 拿不到真实磁盘容量（GetDiskFreeSpaceExW 失败，或压根没有分区信息）时，
-                // 之前这里用 "已扫描逻辑大小 × 1.25" 瞎猜一个总容量，这个系数没有任何依据，
-                // 猜出来的数字和真实容量可能差很远。现在改成诚实地把 total = used（已用/总=100%），
-                // 明确告诉用户"这只是已扫描到的大小，真实磁盘总容量未知"，而不是编一个看似合理的数字。
+                // 拿不到真实卷大小（极罕见）。以前用 used*1.25 瞎猜——不同盘使用率差很远，
+                // 猜出来的数字会让进度条/百分比明显不对。
+                // 现在诚实退化为 0，UI 会显示“已用 X / 共 0”，表示拿不到总容量。
                 let used: u64 = self.partitions.iter().map(|p| p.logical_size).sum();
-                (used.max(1), 0)
+                (used, 0)
             });
         let used_size = self.partition_infos.first().and_then(|i|i.as_ref())
             .map(|i| i.used_bytes)
@@ -143,9 +144,26 @@ impl DiskUiApp {
             .and_then(|i| i.as_ref())
             .map(|i| i.root_path())
             .unwrap_or_else(|| self.root_path.clone());
+        // CSV 导出路径优先顺序：exe 所在目录 → %USERPROFILE%\Documents → cwd。
+        // 以前只退化到 cwd，双击运行时 cwd 可能是 system32 之类，用户找不到文件。
         let out = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("disklens_export.csv")))
+            .or_else(|| {
+                // 退化到 %USERPROFILE%\Documents（Windows）/ $HOME（Unix）
+                #[cfg(windows)]
+                {
+                    std::env::var_os("USERPROFILE").map(|h| {
+                        std::path::PathBuf::from(h).join("Documents").join("disklens_export.csv")
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    std::env::var_os("HOME").map(|h| {
+                        std::path::PathBuf::from(h).join("disklens_export.csv")
+                    })
+                }
+            })
             .unwrap_or_else(|| std::path::PathBuf::from("disklens_export.csv"));
         match export::export_tree_csv(root, &root_path, &out) {
             Ok((f, d)) => {

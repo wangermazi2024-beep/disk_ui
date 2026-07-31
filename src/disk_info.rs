@@ -1,5 +1,7 @@
 //! 磁盘分区枚举（Windows: GetLogicalDriveStringsW + GetVolumeInformationW + GetDiskFreeSpaceExW）。
 
+use std::path::Path;
+
 #[derive(Clone, Debug, Default)]
 pub struct DiskInfo {
     pub drive_letter: char,
@@ -38,8 +40,12 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
         let wide: Vec<u16> = drive_str.encode_utf16().chain(std::iter::once(0)).collect();
         if unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_FIXED {
             if let Some(info) = query_disk_info(drive_letter) {
-                eprintln!("[disk_info] {}: 总={} 已用={} {} \"{}\"",
-                    drive_str, crate::format::human_size(info.total_bytes), crate::format::human_size(info.used_bytes),
+                // 口径和 format::human_size 保持一致：1GB = 1024³ 字节（不是 1e9）。
+                // 以前用 /1e9 会让日志数字跟 UI 显示差 ~7.4%，调试时容易被误导。
+                eprintln!("[disk_info] {}: 总={:.2}GB 已用={:.2}GB {} \"{}\"",
+                    drive_str,
+                    info.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                    info.used_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
                     info.file_system, info.volume_label);
                 result.push(info);
             }
@@ -68,6 +74,51 @@ pub fn query_disk_info(drive_letter: char) -> Option<DiskInfo> {
     } else { (String::new(), String::new()) };
     Some(DiskInfo { drive_letter, volume_label: label_s, file_system: fs_s, total_bytes: total, free_bytes: free, used_bytes: total.saturating_sub(free) })
 }
+
+/// 获取指定路径所在卷的簇大小（BytesPerCluster = SectorsPerCluster × BytesPerSector）。
+///
+/// 用于扫描 fallback 路径计算普通文件的物理大小（簇对齐）。NTFS 簇大小可以是
+/// 512B/1K/2K/4K/8K/16K/32K/64K，**不能写死 4096**——格式化时由用户选择，
+/// 不同盘、不同电脑可能不一样，写死会导致物理大小算错。
+#[cfg(windows)]
+pub fn get_cluster_size(path: &Path) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
+
+    // 拿根路径 "C:\\"
+    let drive_root: Vec<u16> = if let Some(parent) = path.ancestors().last() {
+        // path 已经是绝对路径，最后一个 ancestor 就是根（如 "C:\\"）
+        std::os::windows::ffi::OsStrExt::encode_wide(parent.as_os_str())
+            .chain(std::iter::once(0)).collect()
+    } else {
+        // 兜底：用 path 本身
+        std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+            .chain(std::iter::once(0)).collect()
+    };
+
+    let mut sectors_per_cluster: u32 = 0;
+    let mut bytes_per_sector: u32 = 0;
+    let mut free_clusters: u32 = 0;
+    let mut total_clusters: u32 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            drive_root.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if ok != 0 && sectors_per_cluster > 0 && bytes_per_sector > 0 {
+        (sectors_per_cluster as u64) * (bytes_per_sector as u64)
+    } else {
+        // 极少见：API 失败。退回 4096（NTFS 最常见默认值），并打日志提醒。
+        eprintln!("[disk_info] GetDiskFreeSpaceW 失败，簇大小退回 4096 (path={})", path.display());
+        4096
+    }
+}
+
+#[cfg(not(windows))]
+pub fn get_cluster_size(_path: &std::path::Path) -> u64 { 4096 }
 
 #[cfg(not(windows))]
 pub fn enumerate_drives() -> Vec<DiskInfo> { Vec::new() }
