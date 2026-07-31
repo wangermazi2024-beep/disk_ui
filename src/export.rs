@@ -35,6 +35,7 @@ fn write_row(
     parent_pct: f64, total_pct: f64,
     _parent_size: u64, _disk_logical: u64,
 ) -> io::Result<()> {
+    let kind = if node.is_folder() { "文件夹" } else { "文件" };
     let items = if node.is_folder() { node.file_count + node.folder_count } else { 0 };
     let files = if node.is_folder() { node.file_count } else { 0 };
     let folders = if node.is_folder() { node.folder_count } else { 0 };
@@ -61,6 +62,7 @@ fn write_row(
         items, files, folders,
         esc(&attrs), esc(&reparse), reserved, esc(owner),
     )?;
+    let _ = kind;
     Ok(())
 }
 
