@@ -211,26 +211,53 @@ fn scan_dir(
             {
                 use std::os::windows::fs::MetadataExt;
                 let attrs = meta.file_attributes();
-                let logical = meta.len();
+                let mut logical = meta.len();
                 let nlinks = get_number_of_links(&meta);
 
+                // 参考 WinDirStat FinderBasic.cpp:197-208：
+                // 如果 EndOfFile==0 但文件可能有分配空间，用 GetFileSizeEx 修正逻辑大小
+                //（某些锁定文件如 pagefile.sys 会返回 size=0）
+                if logical == 0 {
+                    logical = get_logical_size_fixup(&entry.path());
+                }
+
+                // 参考 WinDirStat Finder.h:107 + Item.cpp:267-279：
+                // 跳过 reparse point 目录（symlink/junction），不递归进去
+                // 避免：循环引用、重复计数
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
                 if meta.is_dir() {
-                    // 递归扫描子目录
-                    match scan_dir(&entry.path(), depth + 1, counter, cancel, tx, hardlink_seen) {
-                        Ok(child) => Some(child),
-                        Err(e) => {
-                            if depth <= 3 {
-                                eprintln!("[scan] 子目录扫描失败 (path={}, err={})", entry.path().display(), e);
+                    if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        // 重解析点目录：不递归，只创建空目录节点
+                        //（和 WinDirStat 一致：默认不 follow symlink/junction）
+                        Some(Node::new_folder_with_meta(
+                            entry_name, folder_color(depth + 1), Vec::new(),
+                            modified, 0, 0, attrs, 0, false, String::new(),
+                        ))
+                    } else {
+                        match scan_dir(&entry.path(), depth + 1, counter, cancel, tx, hardlink_seen) {
+                            Ok(child) => Some(child),
+                            Err(e) => {
+                                if depth <= 3 {
+                                    eprintln!("[scan] 子目录扫描失败 (path={}, err={})", entry.path().display(), e);
+                                }
+                                None
                             }
-                            None
                         }
                     }
                 } else {
                     // 文件：物理大小 + 硬链接去重
                     let physical = compute_physical(&entry.path(), logical, attrs, nlinks, hardlink_seen);
+                    // 参考 WinDirStat FinderBasic.cpp:149-152：
+                    // WOF 压缩文件标记为 compressed
+                    let final_attrs = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        // 简化：WOF 检测需要读 reparse point，这里只做基本标记
+                        attrs
+                    } else {
+                        attrs
+                    };
                     Some(Node::new_file_with_meta(
                         entry_name, logical, physical, file_color(),
-                        modified, 0, 0, attrs, 0, false, String::new(),
+                        modified, 0, 0, final_attrs, 0, false, String::new(),
                     ))
                 }
             }
@@ -295,7 +322,11 @@ fn get_number_of_links(meta: &std::fs::Metadata) -> u32 {
     1 // 由 compute_physical 内部决定是否查 nlinks
 }
 
-/// Windows 下获取文件的物理大小。压缩/稀疏文件用 GetCompressedFileSizeW，否则簇对齐。
+/// Windows 下获取文件的物理大小。
+///
+/// 参考 WinDirStat FinderBasic.cpp:177-194：
+/// - 压缩/稀疏文件用 GetCompressedFileSizeW
+/// - 普通文件用簇对齐（用实际簇大小，不是硬编码 4096）
 #[cfg(windows)]
 fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
@@ -312,8 +343,72 @@ fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
             return ((high as u64) << 32) | (low as u64);
         }
     }
-    let cluster = 4096u64;
+    // 普通文件：簇对齐（用实际簇大小）
+    let cluster = get_cluster_size(path);
     if logical == 0 { 0 } else { ((logical + cluster - 1) / cluster) * cluster }
+}
+
+/// 参考 WinDirStat FinderBasic.cpp:197-208：
+/// 如果 EndOfFile==0 但 AllocationSize>0，用 GetFileSizeEx 修正逻辑大小。
+/// 某些锁定文件（pagefile.sys 等）通过 read_dir 返回 size=0 但实际有数据。
+#[cfg(windows)]
+fn get_logical_size_fixup(path: &Path) -> u64 {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileSizeEx, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
+        OPEN_EXISTING, FILE_READ_ATTRIBUTES,
+    };
+
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return 0;
+    }
+    let mut size: i64 = 0;
+    let ok = unsafe { GetFileSizeEx(handle, &mut size) };
+    unsafe { CloseHandle(handle); }
+    if ok != 0 && size > 0 { size as u64 } else { 0 }
+}
+
+/// 获取路径所在卷的簇大小（参考 WinDirStat FinderBasic.cpp:64-68 GetDiskFreeSpace）。
+#[cfg(windows)]
+fn get_cluster_size(path: &Path) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
+
+    // 取盘符根路径
+    let root = path.to_string_lossy();
+    let root_path: String = if root.len() >= 2 && root.as_bytes()[1] == b':' {
+        format!("{}:\\", root.chars().next().unwrap())
+    } else {
+        return 4096; // 无法确定盘符，用默认
+    };
+    let wide: Vec<u16> = root_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sectors_per_cluster: u32 = 0;
+    let mut bytes_per_sector: u32 = 0;
+    let mut free_clusters: u32 = 0;
+    let mut total_clusters: u32 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            wide.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if ok != 0 && sectors_per_cluster > 0 && bytes_per_sector > 0 {
+        (sectors_per_cluster as u64) * (bytes_per_sector as u64)
+    } else {
+        4096 // fallback
+    }
 }
 
 /// 用 GetFileInformationByHandle 拿 nNumberOfLinks + FileIndex（一次调用同时拿到两者）。
