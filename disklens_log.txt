@@ -1361,3 +1361,11 @@
 [scan] 标准遍历完成: files=797129, folders=168815, size=103.78 GB
 [scan] 扫描总耗时: 7.4s
 [app] 扫描完成，已更新 partitions[0]
+==== DiskLens 启动 (unix_ts=1785479686) ====
+[app] 初始化：枚举磁盘分区...
+[app] 枚举到 4 个分区
+[app] 默认显示 C 盘: 本地磁盘 (C:)
+==== DiskLens 启动 (unix_ts=1785479971) ====
+[app] 用户请求以管理员身份重启
+==== DiskLens 启动 (unix_ts=1785480011) ====
+==== DiskLens 启动 (unix_ts=1785480043) ====
