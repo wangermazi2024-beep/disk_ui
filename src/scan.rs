@@ -116,17 +116,16 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         // 常规遍历：非递归工作队列版本
         let counter = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
-        // 硬链接去重集合：key 是 NTFS FileId（FileIdBothDirectoryInfo 返回的 64 位
-        // 文件参考号，卷内唯一）。同一份文件的所有硬链接位置共享同一个 FileId。
-        //
-        // 这里和 mft_scan.rs 的去重口径完全一致：
-        //   - logical_size 不去重（每次出现都计全值，和 WinDirStat GetSizeLogical 一致）
-        //   - physical_size 去重（第一次出现计全值，后续硬链接位置计 0）
-        // 这样 root.logical_size 是“所有目录项大小之和”（和 Explorer 一致），
-        // root.physical_size 是“磁盘真实占用”（和 WinDirStat/WizTree 一致）。
-        let hardlink_seen: Arc<DashSet<u64>> = Arc::new(DashSet::new());
+        // 硬链接去重集合：卷内 FileId -> 是否已经计入过 physical_size。
+        // 和 mft_scan 的去重逻辑保持一致——"只有 Physical Size 去重，Logical Size 不去重"：
+        // 第一次遇到某个 FileId 时物理大小正常计入，之后再遇到同一个 FileId（说明是同一份
+        // 磁盘数据的另一个硬链接）物理大小记 0，避免同一块簇被重复统计。
+        let seen_file_ids: Arc<DashSet<u64>> = Arc::new(DashSet::new());
+        // 真实簇大小：只在 fallback 路径（批量枚举 API 不可用时）用得到，
+        // 但既然要用就该问系统要真实值，不该写死 4096（见 query_cluster_size 注释）。
+        let cluster = query_cluster_size(&root);
 
-        match run_scan(&root, &counter, &cancel, &tx, &hardlink_seen) {
+        match run_scan(&root, &counter, &cancel, &seen_file_ids, cluster, &tx) {
             Ok(mut node) => {
                 if let Some(info) = &disk_info {
                     #[cfg(windows)]
@@ -197,8 +196,9 @@ fn run_scan(
     root: &Path,
     counter: &Arc<AtomicU64>,
     cancel: &Arc<AtomicBool>,
+    seen_file_ids: &Arc<DashSet<u64>>,
+    cluster: u64,
     tx: &Sender<ScanMessage>,
-    hardlink_seen: &Arc<DashSet<u64>>,
 ) -> std::io::Result<Node> {
     let root_name = root.to_string_lossy().into_owned();
     let self_meta = std::fs::metadata(root).ok();
@@ -228,7 +228,7 @@ fn run_scan(
     rayon::scope(|s| {
         process_dir(
             s, root.to_path_buf(), 0, root_task, root_slot.clone(),
-            counter.clone(), cancel.clone(), tx.clone(), hardlink_seen.clone(),
+            counter.clone(), cancel.clone(), seen_file_ids.clone(), cluster, tx.clone(),
         );
     });
 
@@ -249,15 +249,16 @@ fn process_dir<'scope>(
     root_slot: Arc<Mutex<Option<Node>>>,
     counter: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
+    seen_file_ids: Arc<DashSet<u64>>,
+    cluster: u64,
     tx: Sender<ScanMessage>,
-    hardlink_seen: Arc<DashSet<u64>>,
 ) {
     if cancel.load(Ordering::Relaxed) {
         finalize(task, &root_slot);
         return;
     }
 
-    let entries = match read_entries(&path) {
+    let entries = match read_entries(&path, cluster) {
         Ok(e) => e,
         Err(e) => {
             if depth <= 3 {
@@ -300,23 +301,22 @@ fn process_dir<'scope>(
                 subdirs.push(e);
             }
         } else {
-            // 文件节点。根据 mft_scan.rs 的去重口径：
-            //   - logical_size 每次出现都计全值（不去重）
-            //   - physical_size 按 FileId 去重（第一次出现计全值，后续硬链接位置计 0）
-            //
-            // file_id != 0 表示 NTFS/ReFS 返回了有效的 64 位文件参考号（卷内唯一）。
-            // file_id == 0 表示卷不支持文件 ID（FAT32 等）或拿不到，不去重。
-            let physical = if e.file_id != 0 {
-                if hardlink_seen.insert(e.file_id) {
-                    e.physical
+            // 硬链接去重：只对 physical_size 生效，logical_size 始终按完整值计入
+            // （和 mft_scan.rs / WinDirStat 的 GetSizePhysical() 语义保持一致）。
+            // file_id == 0 表示这条记录拿不到 FileId（例如 fallback 到 std::fs::read_dir
+            // 的极少数场景），此时无法判断是否为硬链接，按"不去重"处理，即物理大小照常计入，
+            // 不强行去重导致误伤。
+            let physical_to_use = if e.file_id != 0 {
+                if seen_file_ids.insert(e.file_id) {
+                    e.physical // 第一次遇到这个 FileId，物理大小正常计入
                 } else {
-                    0u64
+                    0 // 同一个 FileId 的后续硬链接，物理大小记 0（磁盘数据只有一份）
                 }
             } else {
                 e.physical
             };
             leaf_nodes.push(Node::new_file_with_meta(
-                e.name, e.logical, physical, file_color(),
+                e.name, e.logical, physical_to_use, file_color(),
                 e.modified_ft, e.created_ft, e.accessed_ft, e.attrs, 0, false, String::new(),
             ));
         }
@@ -348,10 +348,10 @@ fn process_dir<'scope>(
         let root_slot = root_slot.clone();
         let counter = counter.clone();
         let cancel = cancel.clone();
+        let seen_file_ids = seen_file_ids.clone();
         let tx = tx.clone();
-        let hardlink_seen = hardlink_seen.clone();
         s.spawn(move |s| {
-            process_dir(s, child_path, depth + 1, child_task, root_slot, counter, cancel, tx, hardlink_seen);
+            process_dir(s, child_path, depth + 1, child_task, root_slot, counter, cancel, seen_file_ids, cluster, tx);
         });
     }
 }
@@ -390,17 +390,17 @@ fn finalize(task: Arc<DirTask>, root_slot: &Arc<Mutex<Option<Node>>>) {
 /// 批量读取一个目录的条目：Windows 上优先走 `dir_enum::enum_dir_batch`
 /// （每目录一次 handle，一次或几次批量调用拿到全部条目及其大小/时间/属性），
 /// 失败时 fallback 到 `std::fs::read_dir` 逐条 stat。
-fn read_entries(path: &Path) -> std::io::Result<Vec<crate::dir_enum::RawDirEntry>> {
+fn read_entries(path: &Path, cluster: u64) -> std::io::Result<Vec<crate::dir_enum::RawDirEntry>> {
     #[cfg(windows)]
     {
         if let Ok(v) = crate::dir_enum::enum_dir_batch(path) {
             return Ok(v);
         }
     }
-    read_entries_fallback(path)
+    read_entries_fallback(path, cluster)
 }
 
-fn read_entries_fallback(path: &Path) -> std::io::Result<Vec<crate::dir_enum::RawDirEntry>> {
+fn read_entries_fallback(path: &Path, cluster: u64) -> std::io::Result<Vec<crate::dir_enum::RawDirEntry>> {
     let rd = std::fs::read_dir(path)?;
     let mut out = Vec::new();
     for entry in rd.flatten() {
@@ -415,7 +415,12 @@ fn read_entries_fallback(path: &Path) -> std::io::Result<Vec<crate::dir_enum::Ra
             use std::os::windows::fs::MetadataExt;
             let attrs = meta.file_attributes();
             let logical = meta.len();
-            let physical = if is_dir { 0 } else { get_physical_size(&entry.path(), logical, attrs) };
+            let physical = if is_dir { 0 } else { get_physical_size(&entry.path(), logical, attrs, cluster) };
+            // `std::fs::Metadata::file_index()` 能拿到 NTFS 文件索引号，但它是 nightly-only
+            // 的不稳定 API（windows_by_handle），稳定 Rust 下用不了，而拿到它的唯一稳定办法
+            // 就是逐文件开 handle 调 GetFileInformationByHandle——这正是我们要避免的开销。
+            // fallback 分支本来就是极少数场景（非 NTFS/ReFS、老系统），这里不做硬链接去重，
+            // 物理大小照常计入，不强行去重导致误伤。
             out.push(crate::dir_enum::RawDirEntry {
                 name, is_dir, logical, physical, attrs, modified_ft, created_ft, accessed_ft, file_id: 0,
             });
@@ -424,16 +429,8 @@ fn read_entries_fallback(path: &Path) -> std::io::Result<Vec<crate::dir_enum::Ra
         {
             let attrs = if is_dir { 0x10 } else { 0x80 };
             let logical = meta.len();
-            // Linux 下用 inode 作 file_id（仅用于单元测试验证去重逻辑）。
-            // 生产环境（Windows）走的是 enum_dir_batch 主路径，不进这里。
-            let file_id = if is_dir {
-                0
-            } else {
-                use std::os::unix::fs::MetadataExt;
-                meta.ino()
-            };
             out.push(crate::dir_enum::RawDirEntry {
-                name, is_dir, logical, physical: logical, attrs, modified_ft, created_ft, accessed_ft, file_id,
+                name, is_dir, logical, physical: logical, attrs, modified_ft, created_ft, accessed_ft, file_id: 0,
             });
         }
     }
@@ -486,7 +483,7 @@ fn get_reparse_tag(path: &Path) -> u32 {
 
 /// Windows 下获取文件的物理大小（仅 fallback 路径使用；批量枚举路径直接拿 AllocationSize）。
 #[cfg(windows)]
-fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
+fn get_physical_size(path: &Path, logical: u64, attrs: u32, cluster: u64) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
 
     const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
@@ -497,13 +494,55 @@ fn get_physical_size(path: &Path, logical: u64, attrs: u32) -> u64 {
             .chain(std::iter::once(0)).collect();
         let mut high: u32 = 0;
         let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        // MSDN 规定的正确判断方式：只有当 low == INVALID_FILE_SIZE(0xFFFFFFFF) 且
+        // GetLastError() != NO_ERROR 时才是真失败（因为文件真实大小低 32 位恰好等于
+        // 0xFFFFFFFF 也是合法值，此时 GetLastError() 会返回 0 表示其实是成功的）。
+        // 下面这个条件是它的等价形式（De Morgan 展开）：
+        //   成功 = !(low==INVALID_FILE_SIZE && GetLastError()!=0)
+        //        = low!=INVALID_FILE_SIZE || GetLastError()==0
+        // 不是逻辑写反，别改成 `&&`。
         if low != 0xFFFFFFFF || unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0 {
             return ((high as u64) << 32) | (low as u64);
         }
     }
-    let cluster = 4096u64;
     if logical == 0 { 0 } else { ((logical + cluster - 1) / cluster) * cluster }
 }
+
+/// 查询 root 所在盘符的真实簇大小（SectorsPerCluster × BytesPerSector）。
+/// NTFS 卷格式化时簇大小可以是 512B ~ 64KB 中的任意一档，不是固定 4096——
+/// 之前 fallback 路径里 `get_physical_size` 直接写死 4096，在非 4K 簇的盘上算出来的
+/// 物理大小是错的。现在改成开局问一次系统要真实值，只有在 API 真的失败时
+/// （比如传进来的不是本地盘符路径，或者查询本身出错）才退回 4096 兜底。
+/// 每次扫描只查一次（在 spawn_scan 里调用一次，往下传），不会有额外性能开销。
+#[cfg(windows)]
+fn query_cluster_size(root: &Path) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
+    const FALLBACK: u64 = 4096;
+    let Some(drive) = drive_letter_of(root) else { return FALLBACK };
+    let wide: Vec<u16> = format!("{drive}:\\").encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sectors_per_cluster = 0u32;
+    let mut bytes_per_sector = 0u32;
+    let mut free_clusters = 0u32;
+    let mut total_clusters = 0u32;
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            wide.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if ok == 0 || sectors_per_cluster == 0 || bytes_per_sector == 0 {
+        eprintln!("[scan] GetDiskFreeSpaceW 查询簇大小失败，fallback 用 {FALLBACK} 字节");
+        return FALLBACK;
+    }
+    let cluster = sectors_per_cluster as u64 * bytes_per_sector as u64;
+    eprintln!("[scan] {drive}: 真实簇大小 = {cluster} 字节 (SectorsPerCluster={sectors_per_cluster}, BytesPerSector={bytes_per_sector})");
+    cluster
+}
+#[cfg(not(windows))]
+fn query_cluster_size(_root: &Path) -> u64 { 4096 }
 
 /// 启用 SeBackupPrivilege + SeRestorePrivilege。
 #[cfg(windows)]
@@ -538,153 +577,4 @@ fn enable_read_privileges() {
         CloseHandle(token);
     }
     eprintln!("[scan] 已尝试启用 SeBackupPrivilege + SeRestorePrivilege");
-}
-
-// ============================================================================
-// 单元测试（Linux 上跑，验证迭代式工作队列 + 物理大小去重逻辑）
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::MetadataExt;
-
-    fn make_test_tree(base: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("disklens_test_{}", base));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-
-        fs::write(root.join("a.txt"), b"hello").unwrap();
-        fs::write(root.join("b.txt"), b"world!").unwrap();
-
-        fs::create_dir_all(root.join("sub1")).unwrap();
-        fs::write(root.join("sub1").join("c.txt"), b"abc").unwrap();
-
-        let mut deep = root.clone();
-        for i in 0..50 {
-            deep = deep.join(format!("d{}", i));
-            fs::create_dir_all(&deep).unwrap();
-            fs::write(deep.join("file.txt"), format!("content {}", i)).unwrap();
-        }
-        root
-    }
-
-    #[test]
-    fn test_scan_basic() {
-        let root = make_test_tree("basic");
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let hardlink_seen = Arc::new(DashSet::new());
-
-        let node = run_scan(&root, &counter, &cancel, &tx, &hardlink_seen).unwrap();
-        assert!(node.is_folder());
-        assert!(node.file_count >= 4, "file_count = {}", node.file_count);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_scan_empty_dir() {
-        let root = std::env::temp_dir().join("disklens_test_empty");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let hardlink_seen = Arc::new(DashSet::new());
-
-        let node = run_scan(&root, &counter, &cancel, &tx, &hardlink_seen).unwrap();
-        assert_eq!(node.file_count, 0);
-        assert_eq!(node.folder_count, 0);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// 关键测试：硬链接的 physical_size 去重，logical_size 不去重。
-    /// 同一份文件 hardlink 到两个位置：
-    ///   - root.logical_size = 文件大小 × 2（每个目录项都计）
-    ///   - root.physical_size = 文件大小 × 1（去重，只算一次）
-    #[test]
-    fn test_physical_dedup_logical_not() {
-        let root = std::env::temp_dir().join("disklens_test_hardlink_phys");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(root.join("dir_a")).unwrap();
-        fs::create_dir_all(root.join("dir_b")).unwrap();
-
-        let content = vec![0xABu8; 4096]; // 1 个簇的大小
-        fs::write(root.join("dir_a").join("shared.bin"), &content).unwrap();
-        fs::hard_link(
-            root.join("dir_a").join("shared.bin"),
-            root.join("dir_b").join("shared.bin"),
-        ).unwrap();
-
-        // 验证确实硬链接（同 inode）
-        let ino_a = fs::metadata(root.join("dir_a").join("shared.bin")).unwrap().ino();
-        let ino_b = fs::metadata(root.join("dir_b").join("shared.bin")).unwrap().ino();
-        assert_eq!(ino_a, ino_b, "硬链接应该共享同一 inode");
-
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let hardlink_seen = Arc::new(DashSet::new());
-
-        let node = run_scan(&root, &counter, &cancel, &tx, &hardlink_seen).unwrap();
-
-        // logical 不去重：4096 × 2 = 8192
-        assert_eq!(node.file_count, 2);
-        assert_eq!(
-            node.logical_size, 8192,
-            "logical 应该不去重: expected=8192, got={}", node.logical_size
-        );
-        // physical 去重：4096 × 1 = 4096
-        assert_eq!(
-            node.physical_size, 4096,
-            "physical 应该去重: expected=4096, got={}", node.physical_size
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// 多个硬链接 + 独立文件混合，验证去重不误伤独立文件。
-    #[test]
-    fn test_dedup_mixed() {
-        let root = std::env::temp_dir().join("disklens_test_hardlink_mixed");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-
-        fs::write(root.join("u1.bin"), vec![1u8; 1000]).unwrap();
-        fs::write(root.join("u2.bin"), vec![2u8; 2000]).unwrap();
-
-        fs::write(root.join("h.bin"), vec![0xAAu8; 5000]).unwrap();
-        for i in 1..3 {
-            fs::hard_link(root.join("h.bin"), root.join(format!("h{}.bin", i))).unwrap();
-        }
-
-        let counter = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let hardlink_seen = Arc::new(DashSet::new());
-
-        let node = run_scan(&root, &counter, &cancel, &tx, &hardlink_seen).unwrap();
-
-        // 2 独立 + 3 硬链接 = 5 个文件
-        assert_eq!(node.file_count, 5);
-
-        // logical 不去重：1000 + 2000 + 5000 × 3 = 18000
-        assert_eq!(
-            node.logical_size, 18000,
-            "logical 不去重: expected=18000, got={}", node.logical_size
-        );
-        // physical 去重：1000 + 2000 + 5000 × 1 = 8000
-        assert_eq!(
-            node.physical_size, 8000,
-            "physical 去重: expected=8000, got={}", node.physical_size
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
 }

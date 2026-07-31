@@ -34,8 +34,11 @@ impl Default for DiskUiApp {
                 let placeholder = Node::new_folder_with_meta(first.display_name(), Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new(), 0, 0, 0, 0x10, 0, false, String::new());
                 (vec![placeholder], vec![Some(first.clone())], first.root_path())
             } else {
-                let demos = vec![Node::new_folder("本地磁盘 (C:)", Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new())];
-                (demos, vec![None], r"C:\".into())
+                // 枚举不到任何固定磁盘（极端情况，比如驱动异常）：不再假装存在一个 C 盘，
+                // 用空占位代替，root_path 留空，逼用户自己在顶部输入/选择路径，
+                // 而不是默默地对着一个不一定存在的 "C:\" 做无意义的展示。
+                let demos = vec![Node::new_folder("(未检测到磁盘)", Color32::from_rgb(0x4C,0x8B,0xF5), Vec::new())];
+                (demos, vec![None], String::new())
             };
         let categories = compute_categories(&partitions[0]);
         Self { root_path, partitions, partition_infos, selected: None, categories, scanning: false, scanned_count: 0, scan_error: None, scan_rx: None }
@@ -49,8 +52,12 @@ impl eframe::App for DiskUiApp {
         let (total_size, _free) = self.partition_infos.first().and_then(|i|i.as_ref())
             .map(|i|(i.total_bytes, i.free_bytes))
             .unwrap_or_else(|| {
+                // 拿不到真实磁盘容量（GetDiskFreeSpaceExW 失败，或压根没有分区信息）时，
+                // 之前这里用 "已扫描逻辑大小 × 1.25" 瞎猜一个总容量，这个系数没有任何依据，
+                // 猜出来的数字和真实容量可能差很远。现在改成诚实地把 total = used（已用/总=100%），
+                // 明确告诉用户"这只是已扫描到的大小，真实磁盘总容量未知"，而不是编一个看似合理的数字。
                 let used: u64 = self.partitions.iter().map(|p| p.logical_size).sum();
-                (((used as f64)*1.25).max(1.0) as u64, 0)
+                (used.max(1), 0)
             });
         let used_size = self.partition_infos.first().and_then(|i|i.as_ref())
             .map(|i| i.used_bytes)

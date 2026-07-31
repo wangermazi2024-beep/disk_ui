@@ -38,8 +38,8 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
         let wide: Vec<u16> = drive_str.encode_utf16().chain(std::iter::once(0)).collect();
         if unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_FIXED {
             if let Some(info) = query_disk_info(drive_letter) {
-                eprintln!("[disk_info] {}: 总={:.2}GB 已用={:.2}GB {} \"{}\"",
-                    drive_str, info.total_bytes as f64/1e9, info.used_bytes as f64/1e9,
+                eprintln!("[disk_info] {}: 总={} 已用={} {} \"{}\"",
+                    drive_str, crate::format::human_size(info.total_bytes), crate::format::human_size(info.used_bytes),
                     info.file_system, info.volume_label);
                 result.push(info);
             }
