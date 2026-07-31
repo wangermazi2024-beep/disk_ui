@@ -1,18 +1,19 @@
-//! 目录扫描入口 + 常规遍历（rayon 并行 + 硬链接去重 + 权限优化）。
+//! 目录扫描入口 + 常规遍历（rayon 并行 + 工作队列非递归 + 硬链接去重）。
 //!
 //! 参考 WinDirStat FinderBasic + 现代 Rust 并行实践：
 //! - rayon 并行处理子目录（I/O bound，线程数 = CPU*2）
+//! - 非递归工作队列（避免栈溢出 + 减少 rayon 递归调度开销）
 //! - dashmap 做多线程安全硬链接去重
 //! - 启用 SeBackupPrivilege + SeRestorePrivilege
 //! - 权限失败不中断
 //! - 压缩/稀疏文件用 GetCompressedFileSizeW
-//! - 只对 GetFileInformationByHandle 返回 nLinkCount>1 的文件做去重
-//! - 合并系统调用：一次 CreateFileW 同时拿 nLinkCount + FileIndex + 分配大小
+//! - 只对大文件（>1MB）查 FileIndex 做硬链接去重
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashSet;
@@ -92,7 +93,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let hardlink_seen: Arc<DashSet<u64>> = Arc::new(DashSet::new());
 
-        match scan_dir(&root, 0, None, &counter, &cancel, &tx, &hardlink_seen) {
+        match scan_root(&root, &counter, &cancel, &tx, &hardlink_seen) {
             Ok(mut node) => {
                 if let Some(info) = &disk_info {
                     #[cfg(windows)]
@@ -140,140 +141,201 @@ fn system_time_to_filetime(t: Option<SystemTime>) -> u64 {
     }
 }
 
-/// 并行递归扫描目录。
+// ─────────────────────────────────────────────────────────────────────────
+// 非递归工作队列扫描（参考 WinDirStat ScanItems 的 BlockingQueue 模式）
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 扫描根目录，返回建好的树。
 ///
-/// 关键优化：
-/// - parent_meta: 父级已经 stat 过的 metadata 传下来复用，避免重复 stat
-/// - 硬链接去重：一次 CreateFileW + GetFileInformationByHandle 同时拿 nLinkCount + FileIndex
-///   只对 nLinkCount>1 的文件做去重（99% 文件是单链接，零额外开销）
-fn scan_dir(
-    path: &Path, depth: usize, parent_meta: Option<std::fs::Metadata>,
-    counter: &Arc<AtomicU64>, cancel: &Arc<AtomicBool>,
+/// 用 BFS 工作队列模式：先扫描根目录的子项，然后把子目录推入队列，
+/// 再从队列取出继续扫描。用 rayon 并行处理同一层级的多个目录。
+/// 这样不依赖递归调用栈，不会栈溢出，且 rayon 调度更高效（减少递归嵌套）。
+fn scan_root(
+    root: &Path,
+    counter: &Arc<AtomicU64>,
+    cancel: &Arc<AtomicBool>,
     tx: &Sender<ScanMessage>,
     hardlink_seen: &Arc<DashSet<u64>>,
 ) -> std::io::Result<Node> {
-    const MAX_DEPTH: usize = 256;
-    if depth > MAX_DEPTH {
-        eprintln!("[scan] 超过最大递归深度 {} (path={})", MAX_DEPTH, path.display());
-        return Ok(Node::new_folder(
-            path.file_name().map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-            folder_color(depth), Vec::new(),
-        ));
-    }
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(Node::new_folder(
-            path.file_name().map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-            folder_color(depth), Vec::new(),
-        ));
-    }
-
-    let name = if depth == 0 {
-        path.to_string_lossy().into_owned()
-    } else {
-        path.file_name().map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned())
-    };
-
-    // 复用父级传下来的 metadata（避免重复 stat）
-    let self_meta = parent_meta.or_else(|| std::fs::metadata(path).ok());
-    let self_modified = system_time_to_filetime(self_meta.as_ref().and_then(|m| m.modified().ok()));
+    // 第一层：扫描根目录
+    let root_meta = std::fs::metadata(root).ok();
+    let root_modified = system_time_to_filetime(root_meta.as_ref().and_then(|m| m.modified().ok()));
     #[cfg(windows)]
-    let self_attrs = self_meta.as_ref().map(|m| {
+    let root_attrs = root_meta.as_ref().map(|m| {
         use std::os::windows::fs::MetadataExt;
         m.file_attributes()
     }).unwrap_or(0x10);
     #[cfg(not(windows))]
-    let self_attrs: u32 = 0x10;
+    let root_attrs: u32 = 0x10;
 
-    let entries: Vec<_> = match std::fs::read_dir(path) {
-        Ok(e) => e.flatten().collect(),
+    let root_name = root.to_string_lossy().into_owned();
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e.flatten().collect::<Vec<_>>(),
         Err(e) => {
-            if depth <= 3 {
-                eprintln!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, path.display(), e);
-            }
-            return Ok(Node::new_folder_with_meta(name, folder_color(depth), Vec::new(), self_modified, 0, 0, self_attrs, 0, false, String::new()));
+            eprintln!("[scan] read_dir 失败 (root={}, err={})", root.display(), e);
+            return Ok(Node::new_folder_with_meta(root_name, folder_color(0), Vec::new(), root_modified, 0, 0, root_attrs, 0, false, String::new()));
         }
     };
 
-    let children: Vec<Node> = entries
-        .par_iter()
-        .filter_map(|entry| {
-            let n = counter.fetch_add(1, Ordering::Relaxed);
-            if n % 5000 == 0 { let _ = tx.send(ScanMessage::Progress(n)); }
+    // 并行处理根目录的子项
+    let mut children: Vec<Node> = Vec::with_capacity(entries.len());
+    let mut pending_dirs: Vec<(PathBuf, usize, std::fs::Metadata, String, u64, u32)> = Vec::new();
 
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => return None,
-            };
-            let entry_name = entry.file_name().to_string_lossy().into_owned();
-            let modified = system_time_to_filetime(meta.modified().ok());
-            let child_path = entry.path();
+    for entry in &entries {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        if n % 5000 == 0 { let _ = tx.send(ScanMessage::Progress(n)); }
 
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                let attrs = meta.file_attributes();
-                let mut logical = meta.len();
+        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        let modified = system_time_to_filetime(meta.modified().ok());
+        let child_path = entry.path();
 
-                // 逻辑大小修正（参考 WinDirStat FinderBasic.cpp:197-208）
-                if logical == 0 {
-                    logical = get_logical_size_fixup(&child_path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = meta.file_attributes();
+            let mut logical = meta.len();
+            if logical == 0 { logical = get_logical_size_fixup(&child_path); }
+
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            if meta.is_dir() {
+                if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    children.push(Node::new_folder_with_meta(
+                        entry_name, folder_color(1), Vec::new(),
+                        modified, 0, 0, attrs, 0, false, String::new(),
+                    ));
+                } else {
+                    // 推入工作队列，稍后处理
+                    pending_dirs.push((child_path, 1, meta, entry_name, modified, attrs));
+                }
+            } else {
+                let physical = compute_physical(&child_path, logical, attrs, hardlink_seen);
+                children.push(Node::new_file_with_meta(
+                    entry_name, logical, physical, file_color(),
+                    modified, 0, 0, attrs, 0, false, String::new(),
+                ));
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let (attrs, logical, physical) = (if meta.is_dir() { 0x10 } else { 0x80 }, meta.len(), meta.len());
+            if meta.is_dir() {
+                pending_dirs.push((child_path, 1, meta, entry_name, modified, attrs));
+            } else {
+                children.push(Node::new_file_with_meta(entry_name, logical, physical, file_color(), modified, 0, 0, attrs, 0, false, String::new()));
+            }
+        }
+    }
+
+    // BFS 工作队列：并行处理待扫描目录
+    // 用 Vec 作为队列（不需要 crossbeam，rayon par_iter 已经足够并行）
+    while !pending_dirs.is_empty() {
+        let current_batch = std::mem::take(&mut pending_dirs);
+
+        // 并行处理这一批目录
+        let results: Vec<Option<(String, usize, u64, u32, Vec<Node>, Vec<(PathBuf, usize, std::fs::Metadata, String, u64, u32)>)>> =
+            current_batch.par_iter().map(|(dir_path, depth, dir_meta, dir_name, dir_modified, dir_attrs)| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
                 }
 
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                if meta.is_dir() {
-                    if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                        // 重解析点目录：不递归
-                        Some(Node::new_folder_with_meta(
-                            entry_name, folder_color(depth + 1), Vec::new(),
-                            modified, 0, 0, attrs, 0, false, String::new(),
-                        ))
-                    } else {
-                        // 把已拿到的 meta 传下去，子级不用再 stat 一次
-                        match scan_dir(&child_path, depth + 1, Some(meta), counter, cancel, tx, hardlink_seen) {
-                            Ok(child) => Some(child),
-                            Err(e) => {
-                                if depth <= 3 {
-                                    eprintln!("[scan] 子目录扫描失败 (path={}, err={})", child_path.display(), e);
-                                }
-                                None
+                let entries = match std::fs::read_dir(dir_path) {
+                    Ok(e) => e.flatten().collect::<Vec<_>>(),
+                    Err(e) => {
+                        if *depth <= 3 {
+                            eprintln!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, dir_path.display(), e);
+                        }
+                        return Some((dir_name.clone(), *depth, *dir_modified, *dir_attrs, Vec::new(), Vec::new()));
+                    }
+                };
+
+                let mut children = Vec::with_capacity(entries.len());
+                let mut new_dirs = Vec::new();
+
+                for entry in &entries {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    if n % 5000 == 0 { let _ = tx.send(ScanMessage::Progress(n)); }
+
+                    let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+                    let entry_name = entry.file_name().to_string_lossy().into_owned();
+                    let modified = system_time_to_filetime(meta.modified().ok());
+                    let child_path = entry.path();
+
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::MetadataExt;
+                        let attrs = meta.file_attributes();
+                        let mut logical = meta.len();
+                        if logical == 0 { logical = get_logical_size_fixup(&child_path); }
+
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                        if meta.is_dir() {
+                            if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                                children.push(Node::new_folder_with_meta(
+                                    entry_name, folder_color(*depth + 1), Vec::new(),
+                                    modified, 0, 0, attrs, 0, false, String::new(),
+                                ));
+                            } else {
+                                new_dirs.push((child_path, *depth + 1, meta, entry_name, modified, attrs));
                             }
+                        } else {
+                            let physical = compute_physical(&child_path, logical, attrs, hardlink_seen);
+                            children.push(Node::new_file_with_meta(
+                                entry_name, logical, physical, file_color(),
+                                modified, 0, 0, attrs, 0, false, String::new(),
+                            ));
                         }
                     }
-                } else {
-                    // 文件：物理大小 + 硬链接去重（合并到一次系统调用）
-                    let physical = compute_physical(&child_path, logical, attrs, hardlink_seen);
-                    Some(Node::new_file_with_meta(
-                        entry_name, logical, physical, file_color(),
-                        modified, 0, 0, attrs, 0, false, String::new(),
-                    ))
-                }
-            }
 
-            #[cfg(not(windows))]
-            {
-                let (attrs, logical, physical) = (if meta.is_dir() { 0x10 } else { 0x80 }, meta.len(), meta.len());
-                if meta.is_dir() {
-                    match scan_dir(&child_path, depth + 1, Some(meta), counter, cancel, tx, hardlink_seen) {
-                        Ok(child) => Some(child),
-                        Err(_) => None,
+                    #[cfg(not(windows))]
+                    {
+                        let (attrs, logical, physical) = (if meta.is_dir() { 0x10 } else { 0x80 }, meta.len(), meta.len());
+                        if meta.is_dir() {
+                            new_dirs.push((child_path, *depth + 1, meta, entry_name, modified, attrs));
+                        } else {
+                            children.push(Node::new_file_with_meta(entry_name, logical, physical, file_color(), modified, 0, 0, attrs, 0, false, String::new()));
+                        }
                     }
-                } else {
-                    Some(Node::new_file_with_meta(entry_name, logical, physical, file_color(), modified, 0, 0, attrs, 0, false, String::new()))
                 }
-            }
-        })
-        .collect();
 
-    Ok(Node::new_folder_with_meta(name, folder_color(depth), children, self_modified, 0, 0, self_attrs, 0, false, String::new()))
+                Some((dir_name.clone(), *depth, *dir_modified, *dir_attrs, children, new_dirs))
+            }).collect();
+
+        // 收集结果
+        for result in results {
+            if let Some((name, depth, modified, attrs, mut dir_children, new_dirs)) = result {
+                // 排序子项（和 new_folder_with_meta 一样）
+                dir_children.sort_by(|a, b| {
+                    b.logical_size.cmp(&a.logical_size)
+                        .then_with(|| b.is_folder().cmp(&a.is_folder()))
+                });
+
+                let node = Node::new_folder_with_meta(
+                    name, folder_color(depth), dir_children,
+                    modified, 0, 0, attrs, 0, false, String::new(),
+                );
+                children.push(node);
+                pending_dirs.extend(new_dirs);
+            }
+        }
+    }
+
+    // 排序根目录子项
+    children.sort_by(|a, b| {
+        b.logical_size.cmp(&a.logical_size)
+            .then_with(|| b.is_folder().cmp(&a.is_folder()))
+    });
+
+    Ok(Node::new_folder_with_meta(root_name, folder_color(0), children, root_modified, 0, 0, root_attrs, 0, false, String::new()))
 }
 
 /// 计算文件物理大小 + 硬链接去重。
 ///
-/// 关键优化：只对需要去重的文件（压缩/稀疏 或 可能硬链接）才打开句柄。
-/// 普通文件用簇对齐估算，零额外系统调用。
+/// 优化：
+/// - 普通文件用簇对齐估算（零额外系统调用）
+/// - 压缩/稀疏文件用 GetCompressedFileSizeW
+/// - 只对大文件（>1MB）查 FileIndex 做硬链接去重
 #[cfg(windows)]
 fn compute_physical(
     path: &Path, logical: u64, attrs: u32,
@@ -282,13 +344,10 @@ fn compute_physical(
     const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
     const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
 
-    // 压缩/稀疏文件：必须用 GetCompressedFileSizeW（需要路径，但只对少数文件）
+    // 压缩/稀疏文件：用 GetCompressedFileSizeW
     if attrs & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
         let phys = get_compressed_size(path);
-        if phys > 0 {
-            // 压缩文件也可能有硬链接，但概率极低，跳过去重避免额外开销
-            return phys;
-        }
+        if phys > 0 { return phys; }
     }
 
     // 普通文件：簇对齐估算（零系统调用）
@@ -297,19 +356,11 @@ fn compute_physical(
     if physical == 0 { return 0; }
 
     // 硬链接去重：只对大文件（>1MB）才查 FileIndex
-    // 小文件硬链接去重收益极低，但 CreateFileW 开销固定
-    if logical < 1_048_576 {
-        return physical; // 小文件跳过去重
-    }
+    if logical < 1_048_576 { return physical; }
 
-    // 一次 CreateFileW + GetFileInformationByHandle 拿 nLinkCount + FileIndex
     if let Some((nlinks, key)) = get_file_info_for_dedup(path) {
         if nlinks > 1 {
-            if hardlink_seen.insert(key) {
-                physical
-            } else {
-                0
-            }
+            if hardlink_seen.insert(key) { physical } else { 0 }
         } else {
             physical
         }
@@ -318,7 +369,6 @@ fn compute_physical(
     }
 }
 
-/// 用 GetCompressedFileSizeW 获取压缩/稀疏文件的真实占用。
 #[cfg(windows)]
 fn get_compressed_size(path: &Path) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
@@ -328,13 +378,9 @@ fn get_compressed_size(path: &Path) -> u64 {
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
     if low != 0xFFFFFFFF || unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0 {
         ((high as u64) << 32) | (low as u64)
-    } else {
-        0
-    }
+    } else { 0 }
 }
 
-/// 参考 WinDirStat FinderBasic.cpp:197-208：
-/// 如果 EndOfFile==0 但文件可能有分配空间，用 GetFileSizeEx 修正逻辑大小。
 #[cfg(windows)]
 fn get_logical_size_fixup(path: &Path) -> u64 {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -343,15 +389,12 @@ fn get_logical_size_fixup(path: &Path) -> u64 {
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE,
         OPEN_EXISTING, FILE_READ_ATTRIBUTES,
     };
-
     let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
         .chain(std::iter::once(0)).collect();
     let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(), FILE_READ_ATTRIBUTES,
+        CreateFileW(wide.as_ptr(), FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut(),
-        )
+            std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut())
     };
     if handle == INVALID_HANDLE_VALUE { return 0; }
     let mut size: i64 = 0;
@@ -360,34 +403,19 @@ fn get_logical_size_fixup(path: &Path) -> u64 {
     if ok != 0 && size > 0 { size as u64 } else { 0 }
 }
 
-/// 获取路径所在卷的簇大小（参考 WinDirStat FinderBasic.cpp:64-68）。
 #[cfg(windows)]
 fn get_cluster_size(path: &Path) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
     let root = path.to_string_lossy();
     let root_path: String = if root.len() >= 2 && root.as_bytes()[1] == b':' {
         format!("{}:\\", root.chars().next().unwrap())
-    } else {
-        return 4096;
-    };
+    } else { return 4096; };
     let wide: Vec<u16> = root_path.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut sectors_per_cluster: u32 = 0;
-    let mut bytes_per_sector: u32 = 0;
-    let mut free_clusters: u32 = 0;
-    let mut total_clusters: u32 = 0;
-    let ok = unsafe {
-        GetDiskFreeSpaceW(wide.as_ptr(), &mut sectors_per_cluster, &mut bytes_per_sector,
-            &mut free_clusters, &mut total_clusters)
-    };
-    if ok != 0 && sectors_per_cluster > 0 && bytes_per_sector > 0 {
-        (sectors_per_cluster as u64) * (bytes_per_sector as u64)
-    } else {
-        4096
-    }
+    let mut spc: u32 = 0; let mut bps: u32 = 0; let mut fc: u32 = 0; let mut tc: u32 = 0;
+    let ok = unsafe { GetDiskFreeSpaceW(wide.as_ptr(), &mut spc, &mut bps, &mut fc, &mut tc) };
+    if ok != 0 && spc > 0 && bps > 0 { (spc as u64) * (bps as u64) } else { 4096 }
 }
 
-/// 用 GetFileInformationByHandle 拿 nNumberOfLinks + FileIndex。
-/// 只对大文件（>1MB）调用，避免 99% 小文件的额外开销。
 #[cfg(windows)]
 fn get_file_info_for_dedup(path: &Path) -> Option<(u32, u64)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -396,31 +424,24 @@ fn get_file_info_for_dedup(path: &Path) -> Option<(u32, u64)> {
         FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         OPEN_EXISTING, FILE_READ_ATTRIBUTES,
     };
-
     let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
         .chain(std::iter::once(0)).collect();
     let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(), FILE_READ_ATTRIBUTES,
+        CreateFileW(wide.as_ptr(), FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut(),
-        )
+            std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, std::ptr::null_mut())
     };
     if handle == INVALID_HANDLE_VALUE { return None; }
-
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
     unsafe { CloseHandle(handle); }
-
     if ok == 0 { return None; }
-
     let nlinks = info.nNumberOfLinks;
     let file_index = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
     let key = ((info.dwVolumeSerialNumber as u64) << 32) | (file_index & 0xFFFFFFFF);
     Some((nlinks, key))
 }
 
-/// 启用 SeBackupPrivilege + SeRestorePrivilege。
 #[cfg(windows)]
 fn enable_read_privileges() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
@@ -431,12 +452,9 @@ fn enable_read_privileges() {
         SE_BACKUP_NAME, SE_RESTORE_NAME,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
-            return;
-        }
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 { return; }
         for priv_name in [SE_BACKUP_NAME, SE_RESTORE_NAME] {
             let mut luid = LUID { LowPart: 0, HighPart: 0 };
             if LookupPrivilegeValueW(std::ptr::null(), priv_name, &mut luid) == 0 { continue; }
@@ -444,11 +462,9 @@ fn enable_read_privileges() {
                 PrivilegeCount: 1,
                 Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
             };
-            AdjustTokenPrivileges(
-                token, 0, &tp as *const _ as *const TOKEN_PRIVILEGES,
+            AdjustTokenPrivileges(token, 0, &tp as *const _ as *const TOKEN_PRIVILEGES,
                 std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
-                std::ptr::null_mut(), std::ptr::null_mut(),
-            );
+                std::ptr::null_mut(), std::ptr::null_mut());
         }
         CloseHandle(token);
     }
