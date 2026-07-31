@@ -234,7 +234,6 @@ pub fn show(
                         }
                     }
                 }
-                let _ = &mut final_action;
                 action_cell.set(final_action);
             });
     });

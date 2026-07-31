@@ -156,6 +156,16 @@ fn scan_dir(
     tx: &Sender<ScanMessage>,
     hardlink_seen: &Arc<DashSet<u64>>,
 ) -> std::io::Result<Node> {
+    // 递归深度保护（防止恶意构造的深层目录栈溢出，WinDirStat 用工作队列无此问题）
+    const MAX_DEPTH: usize = 256;
+    if depth > MAX_DEPTH {
+        eprintln!("[scan] 超过最大递归深度 {} (path={})", MAX_DEPTH, path.display());
+        return Ok(Node::new_folder(
+            path.file_name().map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            folder_color(depth), Vec::new(),
+        ));
+    }
     if cancel.load(Ordering::Relaxed) {
         return Ok(Node::new_folder(
             path.file_name().map(|n| n.to_string_lossy().into_owned())
@@ -212,7 +222,6 @@ fn scan_dir(
                 use std::os::windows::fs::MetadataExt;
                 let attrs = meta.file_attributes();
                 let mut logical = meta.len();
-                let nlinks = get_number_of_links(&meta);
 
                 // 参考 WinDirStat FinderBasic.cpp:197-208：
                 // 如果 EndOfFile==0 但文件可能有分配空间，用 GetFileSizeEx 修正逻辑大小
@@ -228,7 +237,6 @@ fn scan_dir(
                 if meta.is_dir() {
                     if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                         // 重解析点目录：不递归，只创建空目录节点
-                        //（和 WinDirStat 一致：默认不 follow symlink/junction）
                         Some(Node::new_folder_with_meta(
                             entry_name, folder_color(depth + 1), Vec::new(),
                             modified, 0, 0, attrs, 0, false, String::new(),
@@ -246,18 +254,10 @@ fn scan_dir(
                     }
                 } else {
                     // 文件：物理大小 + 硬链接去重
-                    let physical = compute_physical(&entry.path(), logical, attrs, nlinks, hardlink_seen);
-                    // 参考 WinDirStat FinderBasic.cpp:149-152：
-                    // WOF 压缩文件标记为 compressed
-                    let final_attrs = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                        // 简化：WOF 检测需要读 reparse point，这里只做基本标记
-                        attrs
-                    } else {
-                        attrs
-                    };
+                    let physical = compute_physical(&entry.path(), logical, attrs, hardlink_seen);
                     Some(Node::new_file_with_meta(
                         entry_name, logical, physical, file_color(),
-                        modified, 0, 0, final_attrs, 0, false, String::new(),
+                        modified, 0, 0, attrs, 0, false, String::new(),
                     ))
                 }
             }
@@ -285,7 +285,7 @@ fn scan_dir(
 /// 只对 nLinkCount>1 的文件查 FileIndex（99% 的文件是单链接，不需要额外系统调用）。
 #[cfg(windows)]
 fn compute_physical(
-    path: &Path, logical: u64, attrs: u32, _nlinks: u32,
+    path: &Path, logical: u64, attrs: u32,
     hardlink_seen: &Arc<DashSet<u64>>,
 ) -> u64 {
     let physical = get_physical_size(path, logical, attrs);
@@ -306,20 +306,6 @@ fn compute_physical(
     } else {
         physical
     }
-}
-
-/// 用 GetFileAttributesExW 拿 nNumberOfLinks（避免不稳定的 std::fs::Metadata::number_of_links）。
-#[cfg(windows)]
-fn get_number_of_links(meta: &std::fs::Metadata) -> u32 {
-    use std::os::windows::fs::MetadataExt;
-    // file_attributes() 总是可用；nNumberOfLinks 通过 BY_HANDLE_FILE_INFORMATION 才有
-    // 但那需要 CreateFile+GetFileInformationByHandle，太重
-    // 用 std 的 nlinks_size / number_of_links 是 unstable，所以我们只检查 attributes
-    // 如果不是硬链接就不需要去重，直接返回 1
-    // 对于常规遍历，我们用 GetFileInformationByHandle 只在需要时调用
-    // 这里简化：对所有文件都查 FileIndex（在 compute_physical 里做）
-    // 所以这里返回一个占位值
-    1 // 由 compute_physical 内部决定是否查 nlinks
 }
 
 /// Windows 下获取文件的物理大小。

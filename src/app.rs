@@ -81,7 +81,10 @@ impl eframe::App for DiskUiApp {
 
         let action = self.show_central(ui);
         self.apply_action(action);
-        ui.ctx().request_repaint();
+        // 扫描中需要持续刷新；空闲时不 request_repaint 节省 CPU
+        if self.scanning {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
