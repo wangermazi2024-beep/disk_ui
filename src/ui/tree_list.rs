@@ -29,31 +29,42 @@ struct FlatRow {
     kind: RowKind,
 }
 
-/// 递归收集子行。children 已在构建时排序。
+/// 收集子行（含所有已展开的更深层级）。children 已在构建时排序。
+/// 迭代版本：用显式栈代替原生递归，栈里存"待处理节点 + 它的相对路径/深度/父 logical_size"，
+/// 子节点按倒序入栈，保证出栈顺序（先序、从左到右）和原来的递归版完全一致。
 fn collect_rows(
     node: &Node, pi: usize, rel_path: &mut Vec<usize>, depth: u32,
     parent_logical: u64, rows: &mut Vec<FlatRow>,
 ) {
-    for (i, child) in node.children.iter().enumerate() {
-        rel_path.push(i);
+    struct Item<'a> { node: &'a Node, rel_path: Vec<usize>, depth: u32, parent_logical: u64 }
+    let mut stack: Vec<Item> = node.children.iter().enumerate().rev().map(|(i, child)| {
+        let mut rp = rel_path.clone();
+        rp.push(i);
+        Item { node: child, rel_path: rp, depth, parent_logical }
+    }).collect();
+    while let Some(item) = stack.pop() {
         let mut abs_path = vec![pi];
-        abs_path.extend_from_slice(rel_path);
-        let indent = (depth + 1) as f32 * 16.0 + 2.0;
+        abs_path.extend_from_slice(&item.rel_path);
+        let indent = (item.depth + 1) as f32 * 16.0 + 2.0;
         rows.push(FlatRow {
             height: ROW_H,
             kind: RowKind::Child {
                 pi,
-                node: child as *const Node,
+                node: item.node as *const Node,
                 abs_path,
                 indent,
-                depth,
-                parent_logical,
+                depth: item.depth,
+                parent_logical: item.parent_logical,
             },
         });
-        if child.is_folder() && child.expanded {
-            collect_rows(child, pi, rel_path, depth + 1, child.logical_size.max(1), rows);
+        if item.node.is_folder() && item.node.expanded {
+            let child_parent_logical = item.node.logical_size.max(1);
+            for (i, gc) in item.node.children.iter().enumerate().rev() {
+                let mut rp = item.rel_path.clone();
+                rp.push(i);
+                stack.push(Item { node: gc, rel_path: rp, depth: item.depth + 1, parent_logical: child_parent_logical });
+            }
         }
-        rel_path.pop();
     }
 }
 

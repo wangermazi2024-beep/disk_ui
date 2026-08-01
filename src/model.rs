@@ -163,9 +163,17 @@ impl Node {
     }
 
     pub fn collapse_all(&mut self) {
-        self.expanded = false;
-        for c in &mut self.children {
-            c.collapse_all();
+        // 迭代版本：和 mft_scan.rs 的 populate_owners 用同一套写法——栈里存相对 NodePath，
+        // 每次用 navigate_mut 重新定位，不持有多个 &mut Node 引用，也不用原生递归。
+        let mut stack: Vec<Vec<usize>> = vec![Vec::new()];
+        while let Some(rel) = stack.pop() {
+            let Some(cur) = (if rel.is_empty() { Some(&mut *self) } else { self.navigate_mut(&rel) }) else { continue };
+            cur.expanded = false;
+            for i in 0..cur.children.len() {
+                let mut child_rel = rel.clone();
+                child_rel.push(i);
+                stack.push(child_rel);
+            }
         }
     }
 
@@ -173,26 +181,27 @@ impl Node {
         if path.is_empty() {
             return false;
         }
-        if path.len() == 1 {
-            let target_idx = path[0];
-            let was_expanded = self.children.get(target_idx).map(|n| n.expanded).unwrap_or(false);
-            for child in &mut self.children {
-                child.collapse_all();
+        // 迭代地走到 path 指向的父节点（除最后一段外都只是导航，和原递归版
+        // "path.len()>1 时只是往下一层再调自己"完全等价，只是不再用调用栈）。
+        let mut cur = self;
+        for &i in &path[..path.len() - 1] {
+            match cur.children.get_mut(i) {
+                Some(next) => cur = next,
+                None => return false,
             }
-            if !was_expanded {
-                if let Some(target) = self.children.get_mut(target_idx) {
-                    target.expanded = true;
-                    return true;
-                }
+        }
+        let target_idx = path[path.len() - 1];
+        let was_expanded = cur.children.get(target_idx).map(|n| n.expanded).unwrap_or(false);
+        for child in &mut cur.children {
+            child.collapse_all();
+        }
+        if !was_expanded {
+            if let Some(target) = cur.children.get_mut(target_idx) {
+                target.expanded = true;
+                return true;
             }
-            return false;
         }
-        let next = path[0];
-        if let Some(child) = self.children.get_mut(next) {
-            child.exclusive_toggle(&path[1..])
-        } else {
-            false
-        }
+        false
     }
 }
 

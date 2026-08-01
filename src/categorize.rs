@@ -23,9 +23,13 @@ fn classify(name: &str) -> usize {
 }
 
 fn accumulate(node: &Node, totals: &mut [u64; 6]) {
-    match node.kind {
-        NodeKind::File => totals[classify(&node.name)] += node.logical_size,
-        NodeKind::Folder => for c in &node.children { accumulate(c, totals); }
+    // 迭代版本：用显式栈代替原生递归，不管扫描到的目录树多深，都不会有栈溢出的可能性。
+    let mut stack: Vec<&Node> = vec![node];
+    while let Some(cur) = stack.pop() {
+        match cur.kind {
+            NodeKind::File => totals[classify(&cur.name)] += cur.logical_size,
+            NodeKind::Folder => stack.extend(cur.children.iter()),
+        }
     }
 }
 

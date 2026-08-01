@@ -35,7 +35,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, ReadFile, SetFilePointerEx, FILE_BEGIN,
+    CreateFileW, ReadFile, SetFilePointerEx, FILE_BEGIN,
     FILE_FLAG_NO_BUFFERING, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -188,16 +188,27 @@ pub fn scan_volume(
 /// 递归填充 Owner（用 GetNamedSecurityInfo + LookupAccountSid）。
 /// 只填充可见的（已展开的）节点的直接子项，避免全量遍历太慢。
 fn populate_owners(node: &mut Node, path: &str) {
-    for child in &mut node.children {
-        let child_path = if path.ends_with('\\') {
-            format!("{}{}", path, child.name)
-        } else {
-            format!("{}\\{}", path, child.name)
-        };
-        child.owner = get_owner(&child_path);
-        // 只递归已展开的文件夹
-        if child.is_folder() && child.expanded {
-            populate_owners(child, &child_path);
+    // 迭代版本：栈里存 (相对 node 的 NodePath, 对应的完整文件系统路径)，
+    // 每次用 Node::navigate_mut 重新定位到那个节点，不用原生递归也不用裸指针。
+    // 目前唯一的调用点在扫描刚结束、所有节点 expanded 都还是 false 时，所以这个函数
+    // 实际只会处理 node 的直接子项；写成迭代版是为了彻底消除"以后万一有地方在展开更深
+    // 层级后又调用这个函数"时的递归深度风险，而不是依赖"现在用不到所以没关系"。
+    let mut stack: Vec<(Vec<usize>, String)> = vec![(Vec::new(), path.to_string())];
+    while let Some((rel_path, cur_path)) = stack.pop() {
+        let Some(cur) = (if rel_path.is_empty() { Some(&mut *node) } else { node.navigate_mut(&rel_path) }) else { continue };
+        for (i, child) in cur.children.iter_mut().enumerate() {
+            let child_path = if cur_path.ends_with('\\') {
+                format!("{}{}", cur_path, child.name)
+            } else {
+                format!("{}\\{}", cur_path, child.name)
+            };
+            child.owner = get_owner(&child_path);
+            // 只处理已展开的文件夹
+            if child.is_folder() && child.expanded {
+                let mut child_rel = rel_path.clone();
+                child_rel.push(i);
+                stack.push((child_rel, child_path));
+            }
         }
     }
 }
@@ -729,7 +740,22 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
     }
 }
 
-/// 第二阶段：从指定 record 递归建树。
+/// 第二阶段：从指定 record 建树。
+///
+/// 用显式栈做迭代式后序遍历，不再依赖原生递归调用栈：
+/// 目录里嵌套多深，都只占用堆上的 Vec<Frame>，不会有任何栈溢出的可能性
+/// （之前用"给扫描线程分配 64MB 大栈"来兜底，但那终究只是把风险发生的概率
+/// 压得很低，不是消除风险；这里换成完全迭代，风险从"极低概率"变成"不存在"）。
+///
+/// 算法：每个目录对应一个 Frame，Frame 记录"这个目录还有哪些子项没处理"和
+/// "已经处理完、可以挂到这个目录节点下的子 Node 列表"。主循环每次只看栈顶 Frame：
+/// - 如果它还有没处理的子项：文件就直接原地构造成 Node 塞进 built_children；
+///   子目录就再压一个新 Frame 到栈顶，让下一轮循环先去处理这个子目录（对应递归下钻）。
+/// - 如果它的子项已经全部处理完：出栈，用它攒好的 built_children 组装出这个目录的
+///   Node，再塞进新栈顶（也就是它的父目录）的 built_children 里（对应递归返回）。
+/// 因为"先把子项都处理完才把自己塞进父项"，子节点在父节点之前构造完成，
+/// 和原来的递归版本（先递归子节点、拿到结果再组装父节点）语义完全一致，
+/// 兄弟节点之间的先后顺序也和原版一样（不会因为改成迭代就打乱显示顺序）。
 fn build_tree(
     ctx: &NtfsContext,
     record: u64,
@@ -737,98 +763,99 @@ fn build_tree(
     depth: usize,
     size_counted: &mut std::collections::HashSet<u64>,
 ) -> Node {
-    let is_reserved = record < NTFS_RESERVED_MAX;
-    let base = ctx.base_file_records.get(&record);
-    let (logical, physical, modified_ft, created_ft, accessed_ft, attributes, reparse_tag) = match base {
-        Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.created_ft, b.accessed_ft, b.attributes, b.reparse_tag),
-        None => (0, 0, 0, 0, 0, FILE_ATTRIBUTE_DIRECTORY, 0),
-    };
-    let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    struct Frame<'a> {
+        display_name: String,
+        depth: usize,
+        modified_ft: u64,
+        created_ft: u64,
+        accessed_ft: u64,
+        attributes: u32,
+        reparse_tag: u32,
+        is_reserved: bool,
+        child_names: Option<&'a [FileRecordName]>,
+        next_child_idx: usize,
+        built_children: Vec<Node>,
+    }
 
-    // 硬链接处理：只有 Physical Size 去重，Logical Size 不去重
-    //（和 WinDirStat 一致：GetSizePhysical() 对硬链接返回 0，GetSizeLogical() 总是返回完整值）
-    let physical_to_use = if is_dir {
-        physical // 目录不去重
-    } else if size_counted.insert(record) {
-        physical // 第一次遇到这个文件，physical 计入
-    } else {
-        0u64 // 硬链接的后续实例，physical=0（logical 仍然计入）
+    // 给定 record，取出它自身的元数据（和原递归版开头那段 match 逻辑一样）。
+    let record_meta = |ctx: &NtfsContext, record: u64| -> (bool, u64, u64, u64, u64, u64, u32, u32) {
+        let base = ctx.base_file_records.get(&record);
+        let (logical, physical, modified_ft, created_ft, accessed_ft, attributes, reparse_tag) = match base {
+            Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.created_ft, b.accessed_ft, b.attributes, b.reparse_tag),
+            None => (0, 0, 0, 0, 0, FILE_ATTRIBUTE_DIRECTORY, 0),
+        };
+        let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        (is_dir, logical, physical, modified_ft, created_ft, accessed_ft, attributes, reparse_tag)
     };
 
-    let mut children = Vec::new();
-    if let Some(child_names) = ctx.parent_to_children.get(&record) {
-        for cn in child_names {
-            let child_base = ctx.base_file_records.get(&cn.base_record);
-            let (c_logical, c_physical, c_modified, c_created, c_accessed, c_attrs, c_reparse) = match child_base {
-                Some(b) => (b.logical_size, b.physical_size, b.last_modified_ft, b.created_ft, b.accessed_ft, b.attributes, b.reparse_tag),
-                None => (0, 0, 0, 0, 0, 0, 0),
-            };
-            let c_is_dir = c_attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let (root_is_dir, root_logical, root_physical, root_mod, root_created, root_accessed, root_attrs, root_reparse) =
+        record_meta(ctx, record);
+    let root_is_reserved = record < NTFS_RESERVED_MAX;
+
+    if !root_is_dir {
+        // 极端情况：传进来的顶层 record 本身不是目录（正常 NTFS 根目录一定是目录，
+        // 这里只是为了和原递归版行为完全一致而保留这个分支）。
+        let physical_to_use = if size_counted.insert(record) { root_physical } else { 0 };
+        return Node::new_file_with_meta(
+            display_name.to_string(), root_logical, physical_to_use, file_color(),
+            root_mod, root_created, root_accessed, root_attrs, root_reparse, root_is_reserved, String::new(),
+        );
+    }
+
+    let mut stack: Vec<Frame> = vec![Frame {
+        display_name: display_name.to_string(),
+        depth,
+        modified_ft: root_mod, created_ft: root_created, accessed_ft: root_accessed,
+        attributes: root_attrs, reparse_tag: root_reparse, is_reserved: root_is_reserved,
+        child_names: ctx.parent_to_children.get(&record).map(|v| v.as_slice()),
+        next_child_idx: 0,
+        built_children: Vec::new(),
+    }];
+
+    loop {
+        let top = stack.last_mut().expect("build_tree: 栈不应为空");
+        let children = top.child_names.unwrap_or(&[]);
+        if top.next_child_idx < children.len() {
+            let cn = &children[top.next_child_idx];
+            top.next_child_idx += 1;
+            let (c_is_dir, c_logical, c_physical, c_mod, c_created, c_accessed, c_attrs, c_reparse) =
+                record_meta(ctx, cn.base_record);
             let c_is_reserved = cn.base_record < NTFS_RESERVED_MAX;
             if c_is_dir {
-                let child_node = build_tree(ctx, cn.base_record, &cn.name, depth + 1, size_counted);
-                children.push(child_node);
+                // 子目录：压一个新 Frame，下一轮循环先处理它（等价于原来的递归下钻）。
+                stack.push(Frame {
+                    display_name: cn.name.clone(),
+                    depth: top.depth + 1,
+                    modified_ft: c_mod, created_ft: c_created, accessed_ft: c_accessed,
+                    attributes: c_attrs, reparse_tag: c_reparse, is_reserved: c_is_reserved,
+                    child_names: ctx.parent_to_children.get(&cn.base_record).map(|v| v.as_slice()),
+                    next_child_idx: 0,
+                    built_children: Vec::new(),
+                });
             } else {
                 // 硬链接去重：只有 physical 去重，logical 不去重
-                let cp = if size_counted.insert(cn.base_record) {
-                    c_physical
-                } else {
-                    0u64
-                };
-                children.push(Node::new_file_with_meta(
-                    cn.name.clone(),
-                    c_logical,  // logical 总是完整值
-                    cp,         // physical 只第一次计入
-                    file_color(),
-                    c_modified,
-                    c_created,
-                    c_accessed,
-                    c_attrs,
-                    c_reparse,
-                    c_is_reserved,
-                    String::new(),
+                //（和 WinDirStat 一致：GetSizePhysical() 对硬链接返回 0，GetSizeLogical() 总是返回完整值）
+                let cp = if size_counted.insert(cn.base_record) { c_physical } else { 0u64 };
+                top.built_children.push(Node::new_file_with_meta(
+                    cn.name.clone(), c_logical, cp, file_color(),
+                    c_mod, c_created, c_accessed, c_attrs, c_reparse, c_is_reserved, String::new(),
                 ));
             }
+        } else {
+            // 这个目录的子项全处理完了：出栈，组装成 Node。
+            let finished = stack.pop().expect("build_tree: 栈不应为空");
+            let node = Node::new_folder_with_meta(
+                finished.display_name,
+                folder_color(finished.depth),
+                finished.built_children,
+                finished.modified_ft, finished.created_ft, finished.accessed_ft,
+                finished.attributes, finished.reparse_tag, finished.is_reserved,
+                String::new(),
+            );
+            match stack.last_mut() {
+                Some(parent) => parent.built_children.push(node), // 挂到父目录下，继续处理父目录剩余子项
+                None => return node, // 栈空了，这就是最外层（root）的结果
+            }
         }
-    }
-
-    if is_dir {
-        Node::new_folder_with_meta(
-            display_name,
-            folder_color(depth),
-            children,
-            modified_ft,
-            created_ft,
-            accessed_ft,
-            attributes,
-            reparse_tag,
-            is_reserved,
-            String::new(),
-        )
-    } else {
-        Node::new_file_with_meta(
-            display_name.to_string(),
-            logical,         // logical 总是完整值
-            physical_to_use, // physical 只第一次计入
-            file_color(),
-            modified_ft,
-            created_ft,
-            accessed_ft,
-            attributes,
-            reparse_tag,
-            is_reserved,
-            String::new(),
-        )
-    }
-}
-
-/// 系统报告的磁盘空间（GetDiskFreeSpaceExW）。
-pub fn get_disk_space(drive_letter: char) -> Option<(u64, u64)> {
-    let path = wide(&format!("{drive_letter}:\\"));
-    unsafe {
-        let mut free_bytes = 0u64;
-        let mut total_bytes = 0u64;
-        let ok = GetDiskFreeSpaceExW(path.as_ptr(), null_mut(), &mut total_bytes, &mut free_bytes);
-        if ok == 0 { None } else { Some((total_bytes, free_bytes)) }
     }
 }

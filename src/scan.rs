@@ -3,18 +3,23 @@
 //! ## 这一版解决了两个真实问题（不是打补丁，是换算法）：
 //!
 //! ### 1) 递归深度导致崩溃
-//! 旧实现里，`scan_dir` 在 `rayon par_iter` 的闭包里**直接递归调用自己**处理子目录。
-//! 这意味着"目录树有多深，原生调用栈就要压多深"——rayon 的并行分裂并不会打破这条调用链，
-//! 因为 `join`/`par_iter` 本质上是"父调用等待子调用返回"，子目录的 `scan_dir` 帧
-//! 始终摞在父目录 `scan_dir` 帧上面。遇到几千层深的目录（node_modules、备份软件的
-//! 版本链、压缩包解压产物等）就会栈溢出崩溃，而且不能靠"调大栈"根治，只是往后拖问题。
+//! 最早的实现里，处理目录的函数在闭包里**直接递归调用自己**处理子目录：目录树有多深，
+//! 原生调用栈就要压多深，遇到几千层深的目录（node_modules、备份软件的版本链、
+//! 压缩包解压产物等）就会栈溢出崩溃。中间版本换成了 `rayon::Scope::spawn`，但严格来说
+//! rayon 的 `scope`/`spawn` 组合并不是在任何用法下都能 100% 保证原生栈深度和调用层数无关——
+//! rayon 自己的 issue tracker 里有真实的栈溢出报告（比如 rayon-rs/rayon#854、#751），
+//! 起因是空闲 worker 线程在等待时会"帮忙"就地执行其它任务，这个过程在某些嵌套模式下
+//! 会在同一个原生调用栈上累积。
 //!
-//! 真正的修法：**把"递归调用"换成"任务队列 + 显式的父子完成通知"**，用 `rayon::Scope::spawn`
-//! 代替直接函数递归——`spawn` 只是把任务丢进工作窃取队列，调用它的函数立刻返回，
-//! 不会在原生栈上累积帧。子目录处理完之后，通过一个共享的 `DirTask`（parent 指针 + 剩余
+//! 真正彻底的修法：**完全不用任何会自己调自己（或者调用某个可能反过来调用自己的框架 API）
+//! 的函数结构**，改成"显式共享队列 + 固定数量 worker 线程"——每个 worker 就是一个纯 `loop`，
+//! 从队列里取一个目录任务、处理、把新发现的子目录塞回同一个队列，再取下一个。
+//! 没有任何函数在自己的调用帧里触发同一个函数（或者可能间接绕回来的框架调度逻辑）的执行，
+//! 所以原生调用栈深度是一个和目录树深度、并发层数都无关的恒定小常数，这是可以证明的，
+//! 不是"概率很低"。子目录处理完之后，通过一个共享的 `DirTask`（parent 指针 + 剩余
 //! 未完成子目录计数）**用循环而不是递归**一路往上通知父目录："我这个子任务做完了"，
-//! 计数归零就把父目录也定型、再往上传播。全程没有一次函数对函数的递归调用，
-//! 原生栈深度和目录树深度完全解耦，理论上可以扫任意深的目录树。
+//! 计数归零就把父目录也定型、再往上传播；工作队列本身用一个原子计数器
+//! （"全局还有多少目录任务没处理完"）+ `Condvar` 做终止检测。
 //!
 //! ### 2) 比 WinDirStat 慢（17s vs 10s）
 //! 旧实现用 `std::fs::read_dir` 拿目录项（不慢），但对**每一个文件**都额外调用一次
@@ -24,13 +29,11 @@
 //!
 //! 真正的修法：改用 `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`，**每个目录只开
 //! 一次 handle**，用一个 64KB 缓冲区循环把该目录下所有条目一次性批量读出——名字、逻辑大小、
-//! 物理/占用大小（AllocationSize，压缩稀疏文件同样准确）、属性、三个时间戳全都在这一次调用里，
-//! 不再需要逐文件开 handle，也不再需要单独查压缩大小。详见 `dir_enum.rs`。
-//!
-//! 代价：不再对硬链接做去重（该 API 不返回 nNumberOfLinks，要拿到它必须逐文件开 handle，
-//! 这正是我们要去掉的开销）。硬链接在普通用户目录里极少见（主要出现在 WinSxS 这类系统目录），
-//! 影响可忽略；如果之后要精确处理，应该做成"可选的深度模式"，而不是让所有文件都为小概率
-//! 场景付出逐文件开 handle 的代价。
+//! 物理/占用大小（AllocationSize，压缩稀疏文件同样准确）、属性、三个时间戳、以及卷内唯一的
+//! FileId 全都在这一次调用里拿到，不再需要逐文件开 handle，也不再需要单独查压缩大小。
+//! FileId 顺带用来做硬链接去重（见下方 `seen_file_ids`：物理大小只在第一次遇到某个 FileId
+//! 时计入，同一份磁盘数据的其余硬链接记 0，逻辑大小则每个实例都完整计入）。
+//! 详见 `dir_enum.rs`。
 //!
 //! 批量枚举 API 不可用时（极少见：非 NTFS/ReFS、老系统），自动 fallback 到
 //! `std::fs::read_dir`，保证兼容性不倒退。
@@ -83,14 +86,6 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
 
         #[cfg(windows)]
         {
-            // 配置 rayon 线程池：I/O bound，线程数 = CPU*2，但下限从"不管多少核都至少 4"
-            // 改成"至少 2"——单核机器上硬凑 4 线程只有更多上下文切换开销，没有实际收益。
-            let num_threads = num_cpus_get().saturating_mul(2).max(2);
-            let _ = rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build_global();
-            eprintln!("[scan] rayon 线程池: {} 线程", num_threads);
-
             enable_read_privileges();
 
             if let Some(drive) = as_drive_root(&root) {
@@ -215,6 +210,13 @@ struct DirTask {
     children: Mutex<Vec<Node>>,
 }
 
+/// 一个待处理的目录任务：路径 + 深度 + 它在结果树里对应的 DirTask 节点。
+struct WorkItem {
+    path: PathBuf,
+    depth: usize,
+    task: Arc<DirTask>,
+}
+
 fn run_scan(
     root: &Path,
     counter: &Arc<AtomicU64>,
@@ -248,11 +250,69 @@ fn run_scan(
 
     let root_slot: Arc<Mutex<Option<Node>>> = Arc::new(Mutex::new(None));
 
-    rayon::scope(|s| {
-        process_dir(
-            s, root.to_path_buf(), 0, root_task, root_slot.clone(),
-            counter.clone(), cancel.clone(), seen_file_ids.clone(), cluster, tx.clone(),
-        );
+    // 显式共享队列 + 固定数量 worker 线程，代替 rayon::scope/spawn。
+    // 每个 worker 是一个纯 while 循环：从队列取一个目录任务、处理、把新发现的子目录
+    // 塞回同一个队列，再继续循环取下一个——没有任何"函数在自己的调用帧里再触发
+    // 同一个函数执行"的结构，所以原生调用栈深度和目录树深度、并发层数完全无关，
+    // 不管目录嵌套多少万层，每个线程的栈深度都是一个恒定的小常数。用一个原子计数器
+    // `outstanding`（"还没彻底处理完的目录任务数"）+ Condvar 做终止检测：
+    // 计数归零且队列为空时，所有 worker 才会退出。
+    let queue: Arc<Mutex<std::collections::VecDeque<WorkItem>>> = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let cvar = Arc::new(std::sync::Condvar::new());
+    let outstanding = Arc::new(AtomicUsize::new(1)); // 根目录这一个任务
+
+    queue.lock().unwrap().push_back(WorkItem { path: root.to_path_buf(), depth: 0, task: root_task });
+
+    let num_threads = num_cpus_get().saturating_mul(2).max(2);
+    eprintln!("[scan] 工作线程: {} 个", num_threads);
+
+    std::thread::scope(|scope| {
+        for _ in 0..num_threads {
+            let queue = queue.clone();
+            let cvar = cvar.clone();
+            let outstanding = outstanding.clone();
+            let root_slot = root_slot.clone();
+            let counter = counter.clone();
+            let cancel = cancel.clone();
+            let seen_file_ids = seen_file_ids.clone();
+            let tx = tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let item = {
+                        let mut q = queue.lock().unwrap();
+                        loop {
+                            if let Some(item) = q.pop_front() {
+                                break Some(item);
+                            }
+                            if outstanding.load(Ordering::Acquire) == 0 {
+                                break None;
+                            }
+                            // 队列暂时空但还有别的线程正在处理目录、之后可能会塞回新任务：
+                            // 睡眠等待被唤醒，而不是空转轮询。Condvar::wait 会原子地
+                            // "释放锁+挂起"，不会漏掉在这之后立刻发来的 notify。
+                            q = cvar.wait(q).unwrap();
+                        }
+                    };
+                    let Some(WorkItem { path, depth, task }) = item else { break };
+                    let new_items = process_one_dir(
+                        &path, depth, &task, &root_slot, &counter, &cancel, &seen_file_ids, cluster, &tx,
+                    );
+                    let mut q = queue.lock().unwrap();
+                    let n_new = new_items.len();
+                    for it in new_items {
+                        q.push_back(it);
+                    }
+                    // 先加新任务、再减掉刚完成的这一个，顺序不能反：
+                    // 否则可能出现 outstanding 中途"假性归零"，让其他 worker 提前退出。
+                    if n_new > 0 {
+                        outstanding.fetch_add(n_new, Ordering::AcqRel);
+                    }
+                    outstanding.fetch_sub(1, Ordering::AcqRel);
+                    drop(q);
+                    cvar.notify_all();
+                }
+            });
+        }
     });
 
     match root_slot.lock().unwrap().take() {
@@ -262,34 +322,34 @@ fn run_scan(
 }
 
 /// 处理单个目录：批量枚举它的条目，文件直接算完塞进 task.children，
-/// 子目录各自 spawn 一个新任务（不是递归调用，只是把工作丢进 rayon 的队列）。
+/// 子目录打包成 WorkItem 返回给调用方塞回工作队列（不在这里发起任何新的函数调用/线程/任务，
+/// 纯粹是"数据进、数据出"，这样这个函数本身不可能成为递归/嵌套调用链的一环）。
 #[allow(clippy::too_many_arguments)]
-fn process_dir<'scope>(
-    s: &rayon::Scope<'scope>,
-    path: PathBuf,
+fn process_one_dir(
+    path: &Path,
     depth: usize,
-    task: Arc<DirTask>,
-    root_slot: Arc<Mutex<Option<Node>>>,
-    counter: Arc<AtomicU64>,
-    cancel: Arc<AtomicBool>,
-    seen_file_ids: Arc<DashSet<u64>>,
+    task: &Arc<DirTask>,
+    root_slot: &Arc<Mutex<Option<Node>>>,
+    counter: &Arc<AtomicU64>,
+    cancel: &Arc<AtomicBool>,
+    seen_file_ids: &Arc<DashSet<u64>>,
     cluster: u64,
-    tx: Sender<ScanMessage>,
-) {
+    tx: &Sender<ScanMessage>,
+) -> Vec<WorkItem> {
     if cancel.load(Ordering::Relaxed) {
-        finalize(task, &root_slot);
-        return;
+        finalize(task.clone(), root_slot);
+        return Vec::new();
     }
 
-    let entries = match read_entries(&path, cluster) {
+    let entries = match read_entries(path, cluster) {
         Ok(e) => e,
         Err(e) => {
             if depth <= 3 {
                 eprintln!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, path.display(), e);
             }
             // 目录打不开不算致命错误：这个目录当空目录处理，继续扫别的。
-            finalize(task, &root_slot);
-            return;
+            finalize(task.clone(), root_slot);
+            return Vec::new();
         }
     };
 
@@ -349,12 +409,13 @@ fn process_dir<'scope>(
     }
 
     if subdirs.is_empty() {
-        finalize(task, &root_slot);
-        return;
+        finalize(task.clone(), root_slot);
+        return Vec::new();
     }
 
     task.pending.store(subdirs.len(), Ordering::Release);
 
+    let mut new_items = Vec::with_capacity(subdirs.len());
     for sub in subdirs {
         let child_path = path.join(&sub.name);
         let child_task = Arc::new(DirTask {
@@ -368,15 +429,9 @@ fn process_dir<'scope>(
             pending: AtomicUsize::new(0),
             children: Mutex::new(Vec::new()),
         });
-        let root_slot = root_slot.clone();
-        let counter = counter.clone();
-        let cancel = cancel.clone();
-        let seen_file_ids = seen_file_ids.clone();
-        let tx = tx.clone();
-        s.spawn(move |s| {
-            process_dir(s, child_path, depth + 1, child_task, root_slot, counter, cancel, seen_file_ids, cluster, tx);
-        });
+        new_items.push(WorkItem { path: child_path, depth: depth + 1, task: child_task });
     }
+    new_items
 }
 
 /// 把当前任务定型成 `Node`，并沿着 parent 链**用循环**往上传播完成通知。
