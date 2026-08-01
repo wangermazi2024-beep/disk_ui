@@ -75,6 +75,8 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         .name("disklens-scan".into())
         .stack_size(64 * 1024 * 1024); // 64MB：给 MFT 树构建的原生递归留足深度余量，见下方说明
     let spawn_result = builder.spawn(move || {
+        let panic_tx = tx.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let start = SystemTime::now();
         let disk_info = drive_letter_of(&root).and_then(crate::disk_info::query_disk_info);
         eprintln!("[scan] 启动: root={}", root.display());
@@ -148,6 +150,18 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                 eprintln!("[scan] 失败: {e}");
                 let _ = tx.send(ScanMessage::Error(format!("扫描失败: {e}")));
             }
+        }
+        }));
+        if let Err(payload) = result {
+            // 扫描线程内部 panic 了（原生递归/裸指针解析等地方理论上可能出问题）：
+            // 不能让它就这么悄无声息地把线程带走、UI 那边的"正在扫描…"转圈永远转下去。
+            // 用 catch_unwind 兜住，把 panic 信息发给 UI（同时 install_panic_logger 那边
+            // 也会把同样的信息写进日志文件，方便事后排查）。
+            let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知内部错误".to_string());
+            eprintln!("[scan] 扫描线程 panic: {msg}");
+            let _ = panic_tx.send(ScanMessage::Error(format!("扫描过程中发生内部错误（已记录日志）: {msg}")));
         }
     });
     if let Err(e) = spawn_result {

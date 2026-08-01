@@ -336,6 +336,16 @@ fn load_volume(
         )));
     }
     let bytes_per_cluster = vol_info.BytesPerCluster;
+    if bytes_per_cluster == 0 {
+        // 正常 NTFS 卷不会出现这个值，但万一某些虚拟盘/过滤驱动返回了 0，
+        // 后面 MftValidDataLength / bytes_per_cluster 会直接除零 panic，
+        // 这里提前拦截，转成一个可以被上层 fallback 到常规扫描的错误，而不是让整个程序崩溃。
+        unsafe { CloseHandle(vol_handle); }
+        return Err(MftError(format!(
+            "FSCTL_GET_NTFS_VOLUME_DATA 返回的 BytesPerCluster 为 0（{} 卷信息异常）",
+            drive_letter
+        )));
+    }
     let bytes_per_record = vol_info.BytesPerFileRecordSegment.max(1024);
     eprintln!(
         "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={}",
@@ -368,6 +378,7 @@ fn load_volume(
         // 用 FSCTL_GET_RETRIEVAL_POINTERS
         let mut input = STARTING_VCN_INPUT_BUFFER { StartingVcn: 0 };
         let mut buf_size = std::mem::size_of::<RETRIEVAL_POINTERS_BUFFER>() + 32 * 16;
+        const MAX_RETRIEVAL_BUF: usize = 64 * 1024 * 1024; // 64MB 上限，防止极端情况下无限增长耗尽内存
         let mut buf = vec![0u8; buf_size];
         let mut ok;
         loop {
@@ -388,6 +399,10 @@ fn load_volume(
             }
             if unsafe { windows_sys::Win32::Foundation::GetLastError() } != 234 {
                 // ERROR_MORE_DATA = 234
+                break;
+            }
+            if buf_size >= MAX_RETRIEVAL_BUF {
+                eprintln!("[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 缓冲区超过 64MB 上限，放弃增长");
                 break;
             }
             buf_size *= 2;
@@ -569,7 +584,7 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
         // let name_offset = u16::from_le_bytes([rec[off + 10], rec[off + 11]]) as usize;
         let attr_flags = u16::from_le_bytes([rec[off + 12], rec[off + 13]]);
 
-        if attr_type == ATTR_STANDARD_INFORMATION && !non_resident {
+        if attr_type == ATTR_STANDARD_INFORMATION && !non_resident && off + 22 <= rec.len() {
             // $STANDARD_INFORMATION（resident）
             let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
             let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as usize;
@@ -595,7 +610,7 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
                     base_entry.attributes = FILE_ATTRIBUTE_NORMAL;
                 }
             }
-        } else if attr_type == ATTR_FILE_NAME && !non_resident {
+        } else if attr_type == ATTR_FILE_NAME && !non_resident && off + 22 <= rec.len() {
             // $FILE_NAME（resident）
             let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
             let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as usize;
@@ -645,13 +660,16 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
                     let stream_name = String::from_utf16_lossy(&stream_u16);
                     if stream_name == "WofCompressedData" {
                         if !non_resident {
-                            // resident WofCompressedData
-                            let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as u64;
-                            base_entry.physical_size = (value_len + 7) & !7;
-                        } else {
+                            // resident WofCompressedData：value_len 在 off+16..off+20，
+                            // 循环头只保证 off+16<=len，这里要单独再查一次
+                            if off + 20 <= rec.len() {
+                                let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as u64;
+                                base_entry.physical_size = (value_len + 7) & !7;
+                            }
+                        } else if off + 24 <= rec.len() {
                             // non-resident WofCompressedData：检查 LowestVcn==0
                             let lowest_vcn = u64::from_le_bytes(rec[off + 16..off + 24].try_into().unwrap());
-                            if lowest_vcn == 0 {
+                            if lowest_vcn == 0 && off + 0x30 <= rec.len() {
                                 let alloc_len = u64::from_le_bytes(rec[off + 0x28..off + 0x30].try_into().unwrap());
                                 base_entry.physical_size = alloc_len;
                             }
@@ -664,13 +682,15 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
             // 未命名 $DATA
             if !non_resident {
                 // resident：ValueLength = logical size，physical = (len+7)&~7
-                let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as u64;
-                base_entry.logical_size = value_len;
-                base_entry.physical_size = (value_len + 7) & !7;
-            } else {
+                if off + 20 <= rec.len() {
+                    let value_len = u32::from_le_bytes([rec[off + 16], rec[off + 17], rec[off + 18], rec[off + 19]]) as u64;
+                    base_entry.logical_size = value_len;
+                    base_entry.physical_size = (value_len + 7) & !7;
+                }
+            } else if off + 24 <= rec.len() {
                 // non-resident：只在 LowestVcn==0 时有效
                 let lowest_vcn = u64::from_le_bytes(rec[off + 16..off + 24].try_into().unwrap());
-                if lowest_vcn == 0 {
+                if lowest_vcn == 0 && off + 0x38 <= rec.len() {
                     let file_size = u64::from_le_bytes(rec[off + 0x30..off + 0x38].try_into().unwrap());
                     base_entry.logical_size = file_size;
                     // physical size：压缩/稀疏用 Compressed(0x40)，否则 AllocatedLength(0x28)
@@ -682,8 +702,10 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
                         } else {
                             0
                         }
-                    } else {
+                    } else if off + 0x30 <= rec.len() {
                         u64::from_le_bytes(rec[off + 0x28..off + 0x30].try_into().unwrap())
+                    } else {
+                        0
                     };
                     if phys > 0 {
                         base_entry.physical_size = phys;
@@ -692,12 +714,14 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
             }
         } else if attr_type == ATTR_REPARSE_POINT && !non_resident {
             // $REPARSE_POINT（resident）
-            let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
-            let content = off + value_off;
-            if content + 4 <= rec.len() {
-                base_entry.reparse_tag = u32::from_le_bytes(rec[content..content + 4].try_into().unwrap());
-                if base_entry.reparse_tag == IO_REPARSE_TAG_WOF {
-                    base_entry.attributes |= FILE_ATTRIBUTE_COMPRESSED;
+            if off + 22 <= rec.len() {
+                let value_off = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+                let content = off + value_off;
+                if content + 4 <= rec.len() {
+                    base_entry.reparse_tag = u32::from_le_bytes(rec[content..content + 4].try_into().unwrap());
+                    if base_entry.reparse_tag == IO_REPARSE_TAG_WOF {
+                        base_entry.attributes |= FILE_ATTRIBUTE_COMPRESSED;
+                    }
                 }
             }
         }

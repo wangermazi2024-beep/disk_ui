@@ -42,8 +42,30 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 崩溃兜底：GUI 程序双击启动时没有控制台，一旦 panic，用户只会看到窗口消失，
+/// 什么线索都留不下——这对"换台电脑就崩"这类问题完全没法排查。这里在 `main()`
+/// 最开始装一个 panic hook，把 panic 信息（消息、发生位置、线程名）连同标准的
+/// panic 打印一起写进 disklens_log.txt，下次崩溃时日志里就能直接看到原因。
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() { s.to_string() }
+            else if let Some(s) = payload.downcast_ref::<String>() { s.clone() }
+            else { "<non-string panic payload>".to_string() };
+        applog::log(&format!("==== PANIC [线程 {thread_name}] {location}: {msg} ===="));
+        // 仍然调用默认 hook，保留控制台/调试器下原本就有的行为（比如打印到 stderr）。
+        default_hook(info);
+    }));
+}
+
 fn main() -> eframe::Result<()> {
     applog::init();
+    install_panic_logger();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 750.0]),
         ..Default::default()

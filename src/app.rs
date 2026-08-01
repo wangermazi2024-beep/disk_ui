@@ -103,7 +103,12 @@ impl DiskUiApp {
         });
     }
     fn start_scan(&mut self) {
-        let path = PathBuf::from(self.root_path.trim());
+        let trimmed = self.root_path.trim();
+        if trimmed.is_empty() {
+            self.scan_error = Some("请先输入或选择要扫描的路径".into());
+            return;
+        }
+        let path = PathBuf::from(trimmed);
         let (tx, rx) = mpsc::channel();
         scan::spawn_scan(path, tx);
         self.scan_rx = Some(rx); self.scanning = true; self.scanned_count = 0; self.scan_error = None;
