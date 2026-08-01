@@ -31,10 +31,10 @@ fn setup_fonts(ctx: &egui::Context) {
         // 找不到任何中文字体：不能让它在没有任何提示的情况下悄悄退化成方块字。
         // 换电脑（精简版 Windows / Server Core / 没装东亚语言包）复现"中文显示不出来"的
         // bug 报告时，这行日志能直接告诉你是不是这个原因。
-        eprintln!("[main] 未找到可用的中文字体，界面中文可能显示为方块（已尝试: {:?} + Linux/macOS 候选路径）", dynamic_candidates);
+        applog::log(&format!("[main] 未找到可用的中文字体，界面中文可能显示为方块（已尝试: {:?} + Linux/macOS 候选路径）", dynamic_candidates));
         return;
     };
-    eprintln!("[main] 使用中文字体: {path}");
+    applog::log(&format!("[main] 使用中文字体: {path}"));
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(data).into());
     fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "cjk".to_owned());

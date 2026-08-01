@@ -82,7 +82,7 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let start = SystemTime::now();
         let disk_info = drive_letter_of(&root).and_then(crate::disk_info::query_disk_info);
-        eprintln!("[scan] 启动: root={}", root.display());
+        crate::dlog!("[scan] 启动: root={}", root.display());
 
         #[cfg(windows)]
         {
@@ -90,27 +90,27 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
 
             if let Some(drive) = as_drive_root(&root) {
                 if crate::mft_scan::is_elevated() {
-                    eprintln!("[scan] 走 MFT 直读: drive={}", drive);
+                    crate::dlog!("[scan] 走 MFT 直读: drive={}", drive);
                     match crate::mft_scan::scan_volume(drive, &tx) {
                         Ok(mut node) => {
                             if let Some(info) = &disk_info { node.name = info.display_name(); }
-                            eprintln!("[scan] MFT 完成: files={}, folders={}, logical={}, physical={}, 耗时 {:.1}s",
+                            crate::dlog!("[scan] MFT 完成: files={}, folders={}, logical={}, physical={}, 耗时 {:.1}s",
                                 node.file_count, node.folder_count,
                                 crate::format::human_size(node.logical_size),
                                 crate::format::human_size(node.physical_size),
                                 start.elapsed().unwrap_or_default().as_secs_f64());
                             if let Some(info) = &disk_info {
                                 let ratio = if info.used_bytes > 0 { node.physical_size as f64 / info.used_bytes as f64 * 100.0 } else { 0.0 };
-                                eprintln!("[scan] 一致性检查: physical={}, 系统已用={}, 比例={:.1}%",
+                                crate::dlog!("[scan] 一致性检查: physical={}, 系统已用={}, 比例={:.1}%",
                                     crate::format::human_size(node.physical_size), crate::format::human_size(info.used_bytes), ratio);
                             }
                             let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
                             return;
                         }
-                        Err(e) => eprintln!("[scan] MFT 失败，回退常规遍历: {e}"),
+                        Err(e) => crate::dlog!("[scan] MFT 失败，回退常规遍历: {e}"),
                     }
                 } else {
-                    eprintln!("[scan] 非管理员，走常规遍历: drive={}", drive);
+                    crate::dlog!("[scan] 非管理员，走常规遍历: drive={}", drive);
                 }
             }
         }
@@ -135,14 +135,14 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
                     #[cfg(not(windows))]
                     { node.name = info.display_name(); }
                 }
-                eprintln!("[scan] 常规遍历完成: files={}, folders={}, logical={}, 耗时 {:.1}s",
+                crate::dlog!("[scan] 常规遍历完成: files={}, folders={}, logical={}, 耗时 {:.1}s",
                     node.file_count, node.folder_count,
                     crate::format::human_size(node.logical_size),
                     start.elapsed().unwrap_or_default().as_secs_f64());
                 let _ = tx.send(ScanMessage::Done(Box::new(node), disk_info));
             }
             Err(e) => {
-                eprintln!("[scan] 失败: {e}");
+                crate::dlog!("[scan] 失败: {e}");
                 let _ = tx.send(ScanMessage::Error(format!("扫描失败: {e}")));
             }
         }
@@ -155,12 +155,12 @@ pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
             let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "未知内部错误".to_string());
-            eprintln!("[scan] 扫描线程 panic: {msg}");
+            crate::dlog!("[scan] 扫描线程 panic: {msg}");
             let _ = panic_tx.send(ScanMessage::Error(format!("扫描过程中发生内部错误（已记录日志）: {msg}")));
         }
     });
     if let Err(e) = spawn_result {
-        eprintln!("[scan] 无法创建扫描线程: {e}");
+        crate::dlog!("[scan] 无法创建扫描线程: {e}");
         let _ = err_tx.send(ScanMessage::Error(format!("无法启动扫描线程: {e}")));
     }
 }
@@ -264,7 +264,7 @@ fn run_scan(
     queue.lock().unwrap().push_back(WorkItem { path: root.to_path_buf(), depth: 0, task: root_task });
 
     let num_threads = num_cpus_get().saturating_mul(2).max(2);
-    eprintln!("[scan] 工作线程: {} 个", num_threads);
+    crate::dlog!("[scan] 工作线程: {} 个", num_threads);
 
     std::thread::scope(|scope| {
         for _ in 0..num_threads {
@@ -345,7 +345,7 @@ fn process_one_dir(
         Ok(e) => e,
         Err(e) => {
             if depth <= 3 {
-                eprintln!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, path.display(), e);
+                crate::dlog!("[scan] read_dir 失败 (depth={}, path={}, err={})", depth, path.display(), e);
             }
             // 目录打不开不算致命错误：这个目录当空目录处理，继续扫别的。
             finalize(task.clone(), root_slot);
@@ -612,11 +612,11 @@ fn query_cluster_size(root: &Path) -> u64 {
         )
     };
     if ok == 0 || sectors_per_cluster == 0 || bytes_per_sector == 0 {
-        eprintln!("[scan] GetDiskFreeSpaceW 查询簇大小失败，fallback 用 {FALLBACK} 字节");
+        crate::dlog!("[scan] GetDiskFreeSpaceW 查询簇大小失败，fallback 用 {FALLBACK} 字节");
         return FALLBACK;
     }
     let cluster = sectors_per_cluster as u64 * bytes_per_sector as u64;
-    eprintln!("[scan] {drive}: 真实簇大小 = {cluster} 字节 (SectorsPerCluster={sectors_per_cluster}, BytesPerSector={bytes_per_sector})");
+    crate::dlog!("[scan] {drive}: 真实簇大小 = {cluster} 字节 (SectorsPerCluster={sectors_per_cluster}, BytesPerSector={bytes_per_sector})");
     cluster
 }
 #[cfg(not(windows))]
@@ -654,5 +654,5 @@ fn enable_read_privileges() {
         }
         CloseHandle(token);
     }
-    eprintln!("[scan] 已尝试启用 SeBackupPrivilege + SeRestorePrivilege");
+    crate::dlog!("[scan] 已尝试启用 SeBackupPrivilege + SeRestorePrivilege");
 }

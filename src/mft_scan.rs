@@ -85,6 +85,7 @@ impl std::fmt::Display for MftError {
         write!(f, "{}", self.0)
     }
 }
+impl std::error::Error for MftError {}
 
 /// 一个文件的聚合属性（来自 base record + 所有扩展记录）。
 #[derive(Clone, Debug, Default)]
@@ -158,9 +159,9 @@ pub fn scan_volume(
     drive_letter: char,
     tx: &Sender<crate::scan::ScanMessage>,
 ) -> Result<Node, MftError> {
-    eprintln!("[mft_scan] 开始扫描 drive={}", drive_letter);
+    crate::dlog!("[mft_scan] 开始扫描 drive={}", drive_letter);
     let ctx = load_volume(drive_letter, tx)?;
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] MFT 加载完成: {} 个文件记录, {} 个父目录",
         ctx.base_file_records.len(),
         ctx.parent_to_children.len()
@@ -169,7 +170,7 @@ pub fn scan_volume(
     let root_name = format!("{}:\\", drive_letter);
     let mut size_counted: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut root_node = build_tree(&ctx, NTFS_ROOT_RECORD, &root_name, 0, &mut size_counted);
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 树构建完成: logical={}, physical={}, files={}, folders={}",
         crate::format::human_size(root_node.logical_size),
         crate::format::human_size(root_node.physical_size),
@@ -180,7 +181,7 @@ pub fn scan_volume(
     // 填充根级子项的 Owner（和 WinDirStat 一样用 GetNamedSecurityInfo）
     let root_path = format!("{}:\\", drive_letter);
     populate_owners(&mut root_node, &root_path);
-    eprintln!("[mft_scan] Owner 填充完成");
+    crate::dlog!("[mft_scan] Owner 填充完成");
 
     Ok(root_node)
 }
@@ -322,7 +323,7 @@ fn load_volume(
         }
         h
     };
-    eprintln!("[mft_scan] 卷设备已打开: \\\\.\\{drive_letter}:");
+    crate::dlog!("[mft_scan] 卷设备已打开: \\\\.\\{drive_letter}:");
 
     // 拿卷信息
     let mut vol_info: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
@@ -358,7 +359,7 @@ fn load_volume(
         )));
     }
     let bytes_per_record = vol_info.BytesPerFileRecordSegment.max(1024);
-    eprintln!(
+    crate::dlog!(
         "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={}",
         bytes_per_cluster, bytes_per_record, vol_info.MftStartLcn, vol_info.MftValidDataLength
     );
@@ -377,7 +378,7 @@ fn load_volume(
         );
         if h == INVALID_HANDLE_VALUE {
             // fallback: 不打开 $MFT 文件，直接用 MftStartLcn 做单 run
-            eprintln!("[mft_scan] 打开 $MFT::$DATA 失败，用 MftStartLcn 单 run");
+            crate::dlog!("[mft_scan] 打开 $MFT::$DATA 失败，用 MftStartLcn 单 run");
             INVALID_HANDLE_VALUE
         } else {
             h
@@ -413,7 +414,7 @@ fn load_volume(
                 break;
             }
             if buf_size >= MAX_RETRIEVAL_BUF {
-                eprintln!("[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 缓冲区超过 64MB 上限，放弃增长");
+                crate::dlog!("[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 缓冲区超过 64MB 上限，放弃增长");
                 break;
             }
             buf_size *= 2;
@@ -421,7 +422,7 @@ fn load_volume(
         }
         unsafe { CloseHandle(mft_handle); }
         if ok == 0 {
-            eprintln!("[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 失败，用 MftStartLcn 单 run");
+            crate::dlog!("[mft_scan] FSCTL_GET_RETRIEVAL_POINTERS 失败，用 MftStartLcn 单 run");
             let total_clusters = vol_info.MftValidDataLength as u64 / bytes_per_cluster as u64;
             vec![(0, vol_info.MftStartLcn, total_clusters)]
         } else {
@@ -432,7 +433,7 @@ fn load_volume(
         let total_clusters = vol_info.MftValidDataLength as u64 / bytes_per_cluster as u64;
         vec![(0, vol_info.MftStartLcn, total_clusters)]
     };
-    eprintln!("[mft_scan] MFT 有 {} 个物理 run", mft_runs.len());
+    crate::dlog!("[mft_scan] MFT 有 {} 个物理 run", mft_runs.len());
 
     let mut ctx = NtfsContext {
         base_file_records: HashMap::new(),
@@ -456,7 +457,7 @@ fn load_volume(
         let mut bytes_read_from_run: u64 = 0;
         let mut bytes_to_read = run_bytes;
 
-        eprintln!(
+        crate::dlog!(
             "[mft_scan] run[{}]: VCN={}, LCN={}, {}MB",
             run_idx, run_vcn_start, cluster_start, run_bytes as f64 / 1e6
         );
@@ -468,7 +469,7 @@ fn load_volume(
                 SetFilePointerEx(vol_handle, file_offset, &mut new_pos, FILE_BEGIN)
             };
             if ok == 0 {
-                eprintln!("[mft_scan] SetFilePointerEx 失败");
+                crate::dlog!("[mft_scan] SetFilePointerEx 失败");
                 break;
             }
             let mut bytes_returned: u32 = 0;
@@ -476,7 +477,7 @@ fn load_volume(
                 ReadFile(vol_handle, chunk_buf.as_mut_ptr(), bytes_this as u32, &mut bytes_returned, null_mut())
             };
             if ok == 0 || bytes_returned == 0 {
-                eprintln!("[mft_scan] ReadFile 结束: bytes={}", bytes_returned);
+                crate::dlog!("[mft_scan] ReadFile 结束: bytes={}", bytes_returned);
                 break;
             }
             let bytes_read = bytes_returned as usize;
@@ -501,7 +502,7 @@ fn load_volume(
     }
     unsafe { CloseHandle(vol_handle); }
 
-    eprintln!("[mft_scan] 共处理 {} 条 MFT 记录", records_processed);
+    crate::dlog!("[mft_scan] 共处理 {} 条 MFT 记录", records_processed);
     Ok(ctx)
 }
 

@@ -38,7 +38,7 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
         let wide: Vec<u16> = drive_str.encode_utf16().chain(std::iter::once(0)).collect();
         if unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_FIXED {
             if let Some(info) = query_disk_info(drive_letter) {
-                eprintln!("[disk_info] {}: 总={} 已用={} {} \"{}\"",
+                crate::dlog!("[disk_info] {}: 总={} 已用={} {} \"{}\"",
                     drive_str, crate::format::human_size(info.total_bytes), crate::format::human_size(info.used_bytes),
                     info.file_system, info.volume_label);
                 result.push(info);
@@ -46,7 +46,7 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
         }
         start = end + 1;
     }
-    eprintln!("[disk_info] 枚举到 {} 个分区", result.len());
+    crate::dlog!("[disk_info] 枚举到 {} 个分区", result.len());
     result
 }
 

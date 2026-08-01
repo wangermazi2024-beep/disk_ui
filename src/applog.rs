@@ -2,8 +2,8 @@
 //! `dlog!` 宏在保留 `eprintln!` 行为的同时，把同样的内容追加写进一个日志文件，
 //! 这样不方便编译 `verify_mft.exe` 单独调试的时候，也能从这个文件里拿到诊断信息。
 //!
-//! 日志文件固定放在 exe 所在目录下的 `disklens_log.txt`，每次启动追加（不清空），
-//! 方便跨多次运行做前后对比。
+//! 日志文件固定放在 exe 所在目录下的 `disklens_log.txt`，正常情况下每次启动追加
+//! （方便跨多次运行做前后对比），但超过 5MB 会重新开始，避免无限增长。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -30,9 +30,15 @@ pub fn log_path() -> PathBuf {
 /// `eprintln!`（比如日志文件所在目录只读的极端情况）。
 pub fn init() {
     let path = log_path();
-    let file = OpenOptions::new().create(true).append(true).open(&path).ok();
+    // 简单的日志轮转：不这样做的话，`disklens_log.txt` 会随着每次启动、每次扫描
+    // 无限增长下去（尤其是现在 scan.rs/mft_scan.rs 里的诊断信息也都会写进来）。
+    // 超过 5MB 就重新开一个空文件，而不是无限 append。5MB 纯文本日志已经够看
+    // 好几十次启动+扫描的历史了，没必要留着更早的。
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    let truncate = std::fs::metadata(&path).map(|m| m.len() >= MAX_LOG_BYTES).unwrap_or(false);
+    let file = OpenOptions::new().create(true).append(!truncate).write(truncate).truncate(truncate).open(&path).ok();
     match &file {
-        Some(_) => eprintln!("[applog] 诊断日志会写到: {}", path.display()),
+        Some(_) => eprintln!("[applog] 诊断日志会写到: {}{}", path.display(), if truncate { "（已超过 5MB，重新开始）" } else { "" }),
         None => eprintln!("[applog] 打开日志文件失败（仅控制台可见诊断信息）: {}", path.display()),
     }
     let _ = LOG_FILE.set(Mutex::new(file));
