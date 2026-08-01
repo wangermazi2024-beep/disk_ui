@@ -33,7 +33,3 @@ windows-sys = { version = "0.59", features = [
 name = "disk_ui"
 path = "src/main.rs"
 required-features = ["gui"]
-
-[[bin]]
-name = "verify_mft"
-path = "src/bin/verify_mft.rs"
