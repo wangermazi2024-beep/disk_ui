@@ -129,11 +129,9 @@ pub fn enum_dir_batch(path: &Path) -> std::io::Result<Vec<RawDirEntry>> {
             if name != "." && name != ".." {
                 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
                 let is_dir = entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-                let file_id = unsafe {
-                    // FileId 是一个 128 位的 LARGE_INTEGER 风格联合体在部分绑定里，
-                    // windows-sys 里 FILE_ID_BOTH_DIR_INFO.FileId 是 i64。
-                    entry.FileId as u64
-                };
+                // FileId 是一个 128 位的 LARGE_INTEGER 风格联合体在部分绑定里，
+                // windows-sys 里 FILE_ID_BOTH_DIR_INFO.FileId 是 i64，这里只是普通整数转换。
+                let file_id = entry.FileId as u64;
                 out.push(RawDirEntry {
                     name,
                     is_dir,

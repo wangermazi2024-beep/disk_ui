@@ -819,6 +819,7 @@ fn build_tree(
         if top.next_child_idx < children.len() {
             let cn = &children[top.next_child_idx];
             top.next_child_idx += 1;
+            let child_depth = top.depth + 1; // 先取出来，避免下面 stack.push(...) 里还借用着 top
             let (c_is_dir, c_logical, c_physical, c_mod, c_created, c_accessed, c_attrs, c_reparse) =
                 record_meta(ctx, cn.base_record);
             let c_is_reserved = cn.base_record < NTFS_RESERVED_MAX;
@@ -826,7 +827,7 @@ fn build_tree(
                 // 子目录：压一个新 Frame，下一轮循环先处理它（等价于原来的递归下钻）。
                 stack.push(Frame {
                     display_name: cn.name.clone(),
-                    depth: top.depth + 1,
+                    depth: child_depth,
                     modified_ft: c_mod, created_ft: c_created, accessed_ft: c_accessed,
                     attributes: c_attrs, reparse_tag: c_reparse, is_reserved: c_is_reserved,
                     child_names: ctx.parent_to_children.get(&cn.base_record).map(|v| v.as_slice()),
