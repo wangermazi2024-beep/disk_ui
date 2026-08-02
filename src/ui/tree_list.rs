@@ -30,18 +30,22 @@ struct FlatRow {
 }
 
 /// 收集子行（含所有已展开的更深层级）。children 已在构建时排序。
+/// `show_reserved`：为 false 时跳过 NTFS 保留的元数据文件（is_reserved，如 $MFT/$LogFile），
+/// 对应"视图 > 显示全部信息"关闭的情况。
 /// 迭代版本：用显式栈代替原生递归，栈里存"待处理节点 + 它的相对路径/深度/父 logical_size"，
 /// 子节点按倒序入栈，保证出栈顺序（先序、从左到右）和原来的递归版完全一致。
 fn collect_rows(
     node: &Node, pi: usize, rel_path: &mut Vec<usize>, depth: u32,
-    parent_logical: u64, rows: &mut Vec<FlatRow>,
+    parent_logical: u64, show_reserved: bool, rows: &mut Vec<FlatRow>,
 ) {
     struct Item<'a> { node: &'a Node, rel_path: Vec<usize>, depth: u32, parent_logical: u64 }
-    let mut stack: Vec<Item> = node.children.iter().enumerate().rev().map(|(i, child)| {
-        let mut rp = rel_path.clone();
-        rp.push(i);
-        Item { node: child, rel_path: rp, depth, parent_logical }
-    }).collect();
+    let mut stack: Vec<Item> = node.children.iter().enumerate().rev()
+        .filter(|(_, c)| show_reserved || !c.is_reserved)
+        .map(|(i, child)| {
+            let mut rp = rel_path.clone();
+            rp.push(i);
+            Item { node: child, rel_path: rp, depth, parent_logical }
+        }).collect();
     while let Some(item) = stack.pop() {
         let mut abs_path = vec![pi];
         abs_path.extend_from_slice(&item.rel_path);
@@ -59,7 +63,9 @@ fn collect_rows(
         });
         if item.node.is_folder() && item.node.expanded {
             let child_parent_logical = item.node.logical_size.max(1);
-            for (i, gc) in item.node.children.iter().enumerate().rev() {
+            for (i, gc) in item.node.children.iter().enumerate().rev()
+                .filter(|(_, c)| show_reserved || !c.is_reserved)
+            {
                 let mut rp = item.rel_path.clone();
                 rp.push(i);
                 stack.push(Item { node: gc, rel_path: rp, depth: item.depth + 1, parent_logical: child_parent_logical });
@@ -73,8 +79,15 @@ pub fn show(
     partitions: &[Node],
     partition_infos: &[Option<DiskInfo>],
     selected: &Option<NodePath>,
+    show_all: bool,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
+    // "关键列"始终保持正常宽度；非关键列在 show_all=false 时收缩到 0 宽度
+    // （而不是真的减少 .column()/col() 调用次数）。egui_extras::TableBuilder 要求
+    // 表头、每一行声明的列数必须严格一致，三处手写的列数只要有一处漏改就会在运行时
+    // 出错/错位，且这里没有编译器能提前发现这种不匹配。用"宽度收缩到 0"来实现
+    // "非关键列隐藏"，可以保证列数在任何开关状态下都完全不变，从根上排除这类风险。
+    let extra_w = |normal: f32| if show_all { normal } else { 0.0 };
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         let mut builder = egui_extras::TableBuilder::new(ui)
             .striped(true)
@@ -86,20 +99,21 @@ pub fn show(
             .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))   // 逻辑大小
             .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))  // 修改时间
             .column(egui_extras::Column::initial(85.0).clip(true).resizable(true))   // 物理大小
-            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))  // 创建时间
-            .column(egui_extras::Column::initial(120.0).clip(true).resizable(true))  // 访问时间
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 项目
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 文件
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 文件夹
-            .column(egui_extras::Column::initial(50.0).clip(true).resizable(true))   // 属性
-            .column(egui_extras::Column::initial(55.0).clip(true).resizable(true))   // 重解析点
-            .column(egui_extras::Column::initial(40.0).clip(true).resizable(true))   // 保留
-            .column(egui_extras::Column::initial(80.0).clip(true).resizable(true).at_least(50.0)); // 所有者
+            .column(egui_extras::Column::initial(extra_w(120.0)).clip(true).resizable(show_all))  // 创建时间
+            .column(egui_extras::Column::initial(extra_w(120.0)).clip(true).resizable(show_all))  // 访问时间
+            .column(egui_extras::Column::initial(extra_w(55.0)).clip(true).resizable(show_all))   // 项目
+            .column(egui_extras::Column::initial(extra_w(55.0)).clip(true).resizable(show_all))   // 文件
+            .column(egui_extras::Column::initial(extra_w(55.0)).clip(true).resizable(show_all))   // 文件夹
+            .column(egui_extras::Column::initial(extra_w(50.0)).clip(true).resizable(show_all))   // 属性
+            .column(egui_extras::Column::initial(extra_w(55.0)).clip(true).resizable(show_all))   // 重解析点
+            .column(egui_extras::Column::initial(extra_w(40.0)).clip(true).resizable(show_all))   // 保留
+            .column(egui_extras::Column::initial(extra_w(80.0)).clip(true).resizable(show_all).at_least(0.0)); // 所有者
 
         builder = builder.sense(egui::Sense::click());
         builder
             .header(ROW_H, |mut h| {
-                let cols = ["名称", "父占比", "总占比", "逻辑大小", "修改时间", "物理大小", "创建时间", "访问时间", "项目", "文件", "文件夹", "属性", "重解析点", "保留", "所有者"];
+                let cols = ["名称", "父占比", "总占比", "逻辑大小", "修改时间", "物理大小",
+                    "创建时间", "访问时间", "项目", "文件", "文件夹", "属性", "重解析点", "保留", "所有者"];
                 for c in cols { h.col(|ui| { ui.label(egui::RichText::new(c).strong().size(12.0).color(Color32::WHITE)); }); }
             })
             .body(|body| {
@@ -110,7 +124,7 @@ pub fn show(
                     flat_rows.push(FlatRow { height: DISK_ROW_H, kind: RowKind::Disk { pi } });
                     if partition.expanded {
                         let mut rel_path: NodePath = Vec::new();
-                        collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), &mut flat_rows);
+                        collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, &mut flat_rows);
                     }
                 }
 
@@ -192,8 +206,14 @@ pub fn show(
                                 let p = ui.painter();
                                 if is_folder { p.text(Pos2::new(rect.min.x+indent,rect.center().y),egui::Align2::LEFT_CENTER,if c.expanded{"▼"}else{"▶"},egui::FontId::proportional(10.0),Color32::from_rgb(0xAA,0xCC,0xFF)); }
                                 let icon = if is_folder {"📁"} else {"📄"};
-                                let tc = if is_selected {Color32::from_rgb(0xFF,0xFF,0x80)} else if is_folder {Color32::WHITE} else {Color32::from_rgb(0xCC,0xCC,0xCC)};
-                                p.text(Pos2::new(rect.min.x+indent+16.0,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);
+                                // 隐藏/系统属性：和资源管理器的做法一致——淡化显示（半透明），而不是直接不显示，
+                                // 让用户能一眼看出"这是隐藏项"，同时不丢失任何数据。
+                                let hidden = c.is_hidden_or_system();
+                                let tc = if is_selected {Color32::from_rgb(0xFF,0xFF,0x80)}
+                                    else if hidden { Color32::from_rgba_unmultiplied(if is_folder {0xFF} else {0xCC}, if is_folder {0xFF} else {0xCC}, if is_folder {0xFF} else {0xCC}, 0x80) }
+                                    else if is_folder {Color32::WHITE} else {Color32::from_rgb(0xCC,0xCC,0xCC)};
+                                let label = if hidden { format!("{icon} {} (隐藏)", c.name) } else { format!("{icon} {}", c.name) };
+                                p.text(Pos2::new(rect.min.x+indent+16.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(13.0),tc);
                                 if resp.clicked(){clicked_row.set(row_idx);}
                             });
                             // 父占比

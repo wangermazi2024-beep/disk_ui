@@ -1,4 +1,4 @@
-//! DiskLens 入口（v2 WinDirStat 风格重构）。
+//! DiskForge WMS 入口。
 
 pub use disk_ui::{applog, categorize, disk_info, export, format, model, scan};
 #[cfg(windows)]
@@ -70,7 +70,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 750.0]),
         ..Default::default()
     };
-    eframe::run_native("DiskLens v2 (WinDirStat 风格)", options, Box::new(|cc| {
+    eframe::run_native("DiskForge WMS", options, Box::new(|cc| {
         setup_fonts(&cc.egui_ctx);
         Ok(Box::new(DiskUiApp::default()))
     }))

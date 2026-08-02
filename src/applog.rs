@@ -2,7 +2,7 @@
 //! `dlog!` 宏在保留 `eprintln!` 行为的同时，把同样的内容追加写进一个日志文件，
 //! 这样不方便编译 `verify_mft.exe` 单独调试的时候，也能从这个文件里拿到诊断信息。
 //!
-//! 日志文件固定放在 exe 所在目录下的 `disklens_log.txt`，正常情况下每次启动追加
+//! 日志文件固定放在 exe 所在目录下的 `diskforge_log.txt`，正常情况下每次启动追加
 //! （方便跨多次运行做前后对比），但超过 5MB 会重新开始，避免无限增长。
 
 use std::fs::{File, OpenOptions};
@@ -16,13 +16,13 @@ static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 pub fn log_path() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("disklens_log.txt")))
+        .and_then(|p| p.parent().map(|d| d.join("diskforge_log.txt")))
         .unwrap_or_else(|| {
             // current_exe() 失败是极端情况，但原来这里退到"当前工作目录"，
             // 而 cwd 会随启动方式变化（双击 vs 快捷方式的"起始位置" vs 命令行 cd 到哪），
             // 同一个程序不同启动方式日志文件会出现在不同地方，不好找。
             // 退到系统临时目录是一个固定、几乎总是可写的位置，行为更一致。
-            std::env::temp_dir().join("disklens_log.txt")
+            std::env::temp_dir().join("diskforge_log.txt")
         })
 }
 
@@ -30,7 +30,7 @@ pub fn log_path() -> PathBuf {
 /// `eprintln!`（比如日志文件所在目录只读的极端情况）。
 pub fn init() {
     let path = log_path();
-    // 简单的日志轮转：不这样做的话，`disklens_log.txt` 会随着每次启动、每次扫描
+    // 简单的日志轮转：不这样做的话，`diskforge_log.txt` 会随着每次启动、每次扫描
     // 无限增长下去（尤其是现在 scan.rs/mft_scan.rs 里的诊断信息也都会写进来）。
     // 超过 5MB 就重新开一个空文件，而不是无限 append。5MB 纯文本日志已经够看
     // 好几十次启动+扫描的历史了，没必要留着更早的。
@@ -43,7 +43,7 @@ pub fn init() {
     }
     let _ = LOG_FILE.set(Mutex::new(file));
     log(&format!(
-        "==== DiskLens 启动 (unix_ts={}) ====",
+        "==== DiskForge WMS 启动 (unix_ts={}) ====",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

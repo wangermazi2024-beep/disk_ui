@@ -21,8 +21,12 @@ impl DiskInfo {
     pub fn root_path(&self) -> String { format!("{}:\\", self.drive_letter) }
 }
 
+/// 只列出固定磁盘的盘符，不查询任何容量/卷标信息（不调用 GetDiskFreeSpaceExW /
+/// GetVolumeInformationW）。给启动时的"选择分区"界面用：用户还没点"开始扫描"之前，
+/// 程序不应该主动去查任何一个分区的实际数据——所有数据都应该是扫描之后才产生的，
+/// 而不是一启动就默默地把每个分区的大小都算一遍。
 #[cfg(windows)]
-pub fn enumerate_drives() -> Vec<DiskInfo> {
+pub fn list_fixed_drive_letters() -> Vec<char> {
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
     const DRIVE_FIXED: u32 = 3;
     let mut result = Vec::new();
@@ -37,18 +41,14 @@ pub fn enumerate_drives() -> Vec<DiskInfo> {
         let drive_letter = drive_str.chars().next().unwrap_or('?').to_ascii_uppercase();
         let wide: Vec<u16> = drive_str.encode_utf16().chain(std::iter::once(0)).collect();
         if unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_FIXED {
-            if let Some(info) = query_disk_info(drive_letter) {
-                crate::dlog!("[disk_info] {}: 总={} 已用={} {} \"{}\"",
-                    drive_str, crate::format::human_size(info.total_bytes), crate::format::human_size(info.used_bytes),
-                    info.file_system, info.volume_label);
-                result.push(info);
-            }
+            result.push(drive_letter);
         }
         start = end + 1;
     }
-    crate::dlog!("[disk_info] 枚举到 {} 个分区", result.len());
     result
 }
+#[cfg(not(windows))]
+pub fn list_fixed_drive_letters() -> Vec<char> { Vec::new() }
 
 #[cfg(windows)]
 pub fn query_disk_info(drive_letter: char) -> Option<DiskInfo> {
@@ -66,10 +66,16 @@ pub fn query_disk_info(drive_letter: char) -> Option<DiskInfo> {
         let fl = fs.iter().position(|&c| c == 0).unwrap_or(0);
         (String::from_utf16_lossy(&label[..ll]), String::from_utf16_lossy(&fs[..fl]))
     } else { (String::new(), String::new()) };
-    Some(DiskInfo { drive_letter, volume_label: label_s, file_system: fs_s, total_bytes: total, free_bytes: free, used_bytes: total.saturating_sub(free) })
+    let info = Some(DiskInfo { drive_letter, volume_label: label_s, file_system: fs_s, total_bytes: total, free_bytes: free, used_bytes: total.saturating_sub(free) });
+    if let Some(i) = &info {
+        crate::dlog!("[disk_info] {}: 总={} 已用={} {} \"{}\"",
+            drive_letter, crate::format::human_size(i.total_bytes), crate::format::human_size(i.used_bytes),
+            i.file_system, i.volume_label);
+    }
+    info
 }
 
 #[cfg(not(windows))]
-pub fn enumerate_drives() -> Vec<DiskInfo> { Vec::new() }
+pub fn list_fixed_drive_letters() -> Vec<char> { Vec::new() }
 #[cfg(not(windows))]
 pub fn query_disk_info(_: char) -> Option<DiskInfo> { None }

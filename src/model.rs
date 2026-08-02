@@ -142,6 +142,16 @@ impl Node {
         matches!(self.kind, NodeKind::Folder)
     }
 
+    /// 是否带有"隐藏"或"系统"属性（FILE_ATTRIBUTE_HIDDEN=0x02 / FILE_ATTRIBUTE_SYSTEM=0x04）。
+    /// Windows 资源管理器对这类项目的做法是图标和文字都做半透明/淡化处理，用来提示"这是隐藏项"，
+    /// 而不是直接不显示——我们扫描器本来就没有 Explorer 那个"隐藏文件"开关的过滤逻辑，
+    /// 所有文件都会显示，所以用同样的"淡化"视觉提示替代"完全不显示"。
+    pub fn is_hidden_or_system(&self) -> bool {
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
+        self.attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+    }
+
     pub fn is_file(&self) -> bool {
         matches!(self.kind, NodeKind::File)
     }

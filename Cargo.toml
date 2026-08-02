@@ -2,17 +2,19 @@
 name = "disk_ui"
 version = "0.2.0"
 edition = "2024"
+description = "DiskForge WMS — NTFS 磁盘空间分析器"
+authors = ["WMS"]
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:egui_extras"]
+gui = ["dep:eframe", "dep:egui_extras", "dep:rfd"]
 
 [dependencies]
 egui = "0.35"
 egui_extras = { version = "0.35", optional = true }
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"], optional = true }
-rayon = "1"
 dashmap = "6"
+rfd = { version = "0.17", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

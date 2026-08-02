@@ -75,7 +75,7 @@ fn drive_letter_of(path: &Path) -> Option<char> {
 pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
     let err_tx = tx.clone();
     let builder = std::thread::Builder::new()
-        .name("disklens-scan".into())
+        .name("diskforge-scan".into())
         .stack_size(64 * 1024 * 1024); // 64MB：给 MFT 树构建的原生递归留足深度余量，见下方说明
     let spawn_result = builder.spawn(move || {
         let panic_tx = tx.clone();
