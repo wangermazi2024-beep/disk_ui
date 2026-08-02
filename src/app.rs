@@ -287,7 +287,7 @@ impl DiskUiApp {
         if (result as isize) > 32 {
             std::process::exit(0);
         } else {
-            crate::applog::log(&format!("[app] 以管理员身份重启失败 (ShellExecuteW={result})"));
+            crate::applog::log(&format!("[app] 以管理员身份重启失败 (ShellExecuteW={result:?})"));
             self.scan_error = Some("以管理员身份重启失败，请手动以管理员运行".to_string());
         }
     }

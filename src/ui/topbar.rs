@@ -32,12 +32,12 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                 ui.menu_button("文件", |ui| {
                     if ui.button("添加扫描…").clicked() {
                         action = TopbarAction::AddScan;
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.add_enabled_ui(state.has_result, |ui| {
                         if ui.button("导出 CSV…").clicked() {
                             action = TopbarAction::ExportCsv;
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 });
@@ -46,7 +46,7 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                     let mut show_all = state.show_all_details;
                     if ui.checkbox(&mut show_all, "显示全部信息（含元数据文件）").changed() {
                         action = TopbarAction::ToggleShowAll;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -55,7 +55,7 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                     ui.menu_button("工具", |ui| {
                         if ui.button("⚡ 以管理员身份重启").clicked() {
                             action = TopbarAction::RestartAsAdmin;
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 }
