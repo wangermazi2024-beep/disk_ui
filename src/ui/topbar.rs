@@ -1,5 +1,5 @@
-//! 顶部菜单栏：文件 / 视图 / 工具 / 帮助。
-//! 品牌标题不放在这里——挪到窗口左下角的状态条了（见 app.rs）。
+//! 顶部菜单栏：文件 / 视图 / 分析 / 帮助，管理员按钮常驻在菜单右边（不是菜单里的一项，
+//! 一直看得见点得到），品牌标题在窗口左下角的状态条（见 app.rs）。
 
 use egui::{Color32, RichText};
 
@@ -8,6 +8,9 @@ pub enum TopbarAction {
     AddScan,
     ExportCsv,
     ToggleShowAll,
+    /// 占位功能，先给个入口，暂时只弹提示，不做实际扫描。
+    ShowExtensionBreakdown,
+    ShowDuplicateFinder,
     #[cfg(windows)]
     RestartAsAdmin,
 }
@@ -50,20 +53,34 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                     }
                 });
 
-                #[cfg(windows)]
-                if !state.is_admin {
-                    ui.menu_button("工具", |ui| {
-                        if ui.button("⚡ 以管理员身份重启").clicked() {
-                            action = TopbarAction::RestartAsAdmin;
-                            ui.close();
-                        }
-                    });
-                }
+                ui.menu_button("分析", |ui| {
+                    if ui.button("🗂 文件扩展名分类…").clicked() {
+                        action = TopbarAction::ShowExtensionBreakdown;
+                        ui.close();
+                    }
+                    if ui.button("🧬 查找重复文件…").clicked() {
+                        action = TopbarAction::ShowDuplicateFinder;
+                        ui.close();
+                    }
+                });
 
                 ui.menu_button("帮助", |ui| {
                     ui.label(RichText::new("DiskForge WMS").strong());
                     ui.label(RichText::new("由 WMS 开发").size(11.0).color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
                 });
+
+                ui.separator();
+
+                // 管理员按钮常驻在菜单右边，不藏进下拉菜单里——这是一个状态提示 +
+                // 一键操作，不是"菜单类"功能，放在菜单里反而不容易被注意到。
+                #[cfg(windows)]
+                if !state.is_admin {
+                    let btn = egui::Button::new(RichText::new("⚡ 以管理员身份运行").color(Color32::WHITE))
+                        .fill(Color32::from_rgb(0x9C, 0x6A, 0xDE));
+                    if ui.add(btn).on_hover_text("以管理员权限重启后可以用 MFT 直读，扫描速度快很多").clicked() {
+                        action = TopbarAction::RestartAsAdmin;
+                    }
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if state.scanning {

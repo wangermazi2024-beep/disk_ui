@@ -4,5 +4,6 @@ disk_ui*.z01
 disk_ui.exe
 disklens_log.txt
 disklens_export.csv
+diskforge_log.txt
 .hermes/
 *.log

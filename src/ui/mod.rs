@@ -1,3 +1,4 @@
+pub mod sidebar;
 pub mod startup;
 pub mod topbar;
 pub mod tree_list;
