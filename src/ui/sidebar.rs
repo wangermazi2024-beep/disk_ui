@@ -23,7 +23,7 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>) 
     match (focused, info) {
         (Some(node), Some(info)) if info.total_bytes > 0 => {
             let used_pct = info.used_bytes as f32 / info.total_bytes as f32;
-            draw_ring(ui, used_pct);
+            ui.vertical_centered(|ui| draw_ring(ui, used_pct));
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(&node.name).size(12.5).strong());

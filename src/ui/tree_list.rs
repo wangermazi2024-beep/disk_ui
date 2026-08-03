@@ -160,6 +160,7 @@ pub fn show(
                                     ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+36.0), egui::Align2::LEFT_TOP, format!("扫描: 逻辑={}  物理={}", human_size_compact(p.logical_size), human_size_compact(p.physical_size)), egui::FontId::proportional(10.0), Color32::from_rgb(0xA0,0xA0,0xA0));
                                 }
                                 if resp.clicked() { clicked_row.set(row_idx); }
+                                resp.context_menu(|ui| context_menu_placeholder_disk(ui));
                             });
                             // 父占比
                             row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); draw_bar(ui.painter(),r,1.0,Color32::from_rgb(0xFF,0xD7,0x00)); if resp.clicked(){clicked_row.set(row_idx);} });
@@ -202,19 +203,41 @@ pub fn show(
                             row.col(|ui| {
                                 let rect = ui.available_rect_before_wrap();
                                 let resp = ui.allocate_rect(rect, Sense::click());
+                                let hidden = c.is_hidden_or_system();
+                                if hidden {
+                                    // 隐藏/系统项：整个名称格淡橙色打底，一眼就能扫到，不需要盯着看图标
+                                    ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0xF5, 0xA6, 0x23, 0x1C));
+                                }
                                 if is_selected { ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }
+                                // 缩进参考线：每一层级画一条竖线贯穿整行，展开层级多的时候
+                                // 能顺着线看清楚某一项到底属于哪一层，而不是只能数缩进空格数。
+                                let guide_color = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x14);
+                                for lvl in 0..=*depth {
+                                    let x = rect.min.x + lvl as f32 * 16.0 + 10.0;
+                                    ui.painter().line_segment(
+                                        [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
+                                        egui::Stroke::new(1.0, guide_color),
+                                    );
+                                }
                                 let p = ui.painter();
                                 if is_folder { p.text(Pos2::new(rect.min.x+indent,rect.center().y),egui::Align2::LEFT_CENTER,if c.expanded{"▼"}else{"▶"},egui::FontId::proportional(10.0),Color32::from_rgb(0xAA,0xCC,0xFF)); }
                                 let icon = if is_folder {"📁"} else {"📄"};
-                                // 隐藏/系统属性：和资源管理器的做法一致——淡化显示（半透明），而不是直接不显示，
-                                // 让用户能一眼看出"这是隐藏项"，同时不丢失任何数据。
-                                let hidden = c.is_hidden_or_system();
+                                // 名称文字颜色不再因为"隐藏"而整体淡化——那样会把文件夹（白）和
+                                // 文件（浅灰）的区别也一起冲淡，反而更难分辨谁是谁。现在文字颜色
+                                // 只由"是文件夹还是文件"决定，"隐藏"改用独立的橙色 H 徽标 + 上面
+                                // 的行底色来标记，两条视觉线索互不干扰。
                                 let tc = if is_selected {Color32::from_rgb(0xFF,0xFF,0x80)}
-                                    else if hidden { Color32::from_rgba_unmultiplied(if is_folder {0xFF} else {0xCC}, if is_folder {0xFF} else {0xCC}, if is_folder {0xFF} else {0xCC}, 0x80) }
                                     else if is_folder {Color32::WHITE} else {Color32::from_rgb(0xCC,0xCC,0xCC)};
-                                let label = if hidden { format!("{icon} {} (隐藏)", c.name) } else { format!("{icon} {}", c.name) };
-                                p.text(Pos2::new(rect.min.x+indent+16.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(13.0),tc);
+                                let mut text_x = rect.min.x + indent + 16.0;
+                                if hidden {
+                                    let badge = Rect::from_min_size(Pos2::new(text_x, rect.center().y - 7.0), Vec2::new(14.0, 14.0));
+                                    p.rect_filled(badge, 3.0, Color32::from_rgb(0xF5, 0xA6, 0x23));
+                                    p.text(badge.center(), egui::Align2::CENTER_CENTER, "H", egui::FontId::proportional(9.5), Color32::from_rgb(0x2A,0x2A,0x2E));
+                                    text_x += 18.0;
+                                }
+                                p.text(Pos2::new(text_x,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);
                                 if resp.clicked(){clicked_row.set(row_idx);}
+                                resp.context_menu(|ui| context_menu_placeholder(ui, is_folder));
                             });
                             // 父占比
                             row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());draw_bar(ui.painter(),r,pct,bar_color);if resp.clicked(){clicked_row.set(row_idx);}});
@@ -286,4 +309,39 @@ fn depth_color(depth: u32, is_folder: bool) -> Color32 {
     if !is_folder { return Color32::from_rgb(0x6C,0x75,0x7D); }
     const PAL: [Color32;6] = [Color32::from_rgb(0x4C,0x8B,0xF5),Color32::from_rgb(0x34,0xC7,0x59),Color32::from_rgb(0xF5,0xA6,0x23),Color32::from_rgb(0xE0,0x55,0x5B),Color32::from_rgb(0x9C,0x6A,0xDE),Color32::from_rgb(0x2E,0xC4,0xB6)];
     PAL[depth as usize % PAL.len()]
+}
+
+/// 文件/文件夹右键菜单——目前只是占位，条目本身是禁用的，不接任何实际操作。
+/// 先把入口和菜单结构留好，以后要实现"打开所在位置"/"删除"这些功能时，
+/// 直接把 `add_enabled_ui(false, ..)` 换成真正的处理逻辑即可，不用再改调用点。
+fn context_menu_placeholder(ui: &mut egui::Ui, is_folder: bool) {
+    ui.set_min_width(170.0);
+    ui.add_enabled_ui(false, |ui| {
+        if is_folder {
+            let _ = ui.button("📂 在资源管理器中打开");
+            let _ = ui.button("🔍 在此文件夹内搜索");
+        } else {
+            let _ = ui.button("📂 打开所在文件夹");
+        }
+        let _ = ui.button("📋 复制路径");
+        let _ = ui.button("📋 复制名称");
+        ui.separator();
+        let _ = ui.button("🗑 删除");
+        let _ = ui.button("ℹ 属性");
+    });
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("右键菜单占位，功能开发中").size(10.0).color(Color32::from_rgb(0x90, 0x90, 0x90)));
+}
+
+/// 磁盘/根目录行的右键菜单占位。
+fn context_menu_placeholder_disk(ui: &mut egui::Ui) {
+    ui.set_min_width(170.0);
+    ui.add_enabled_ui(false, |ui| {
+        let _ = ui.button("🔄 重新扫描");
+        let _ = ui.button("📂 在资源管理器中打开");
+        ui.separator();
+        let _ = ui.button("✖ 从列表移除");
+    });
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("右键菜单占位，功能开发中").size(10.0).color(Color32::from_rgb(0x90, 0x90, 0x90)));
 }

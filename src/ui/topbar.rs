@@ -75,8 +75,8 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                 // 一键操作，不是"菜单类"功能，放在菜单里反而不容易被注意到。
                 #[cfg(windows)]
                 if !state.is_admin {
-                    let btn = egui::Button::new(RichText::new("⚡ 以管理员身份运行").color(Color32::WHITE))
-                        .fill(Color32::from_rgb(0x9C, 0x6A, 0xDE));
+                    let btn = egui::Button::new(RichText::new("⚡ 以管理员身份运行").color(Color32::from_rgb(0x2A, 0x2A, 0x2E)).strong())
+                        .fill(Color32::from_rgb(0xF5, 0xC5, 0x18));
                     if ui.add(btn).on_hover_text("以管理员权限重启后可以用 MFT 直读，扫描速度快很多").clicked() {
                         action = TopbarAction::RestartAsAdmin;
                     }
