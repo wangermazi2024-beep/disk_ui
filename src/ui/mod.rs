@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod sidebar;
 pub mod startup;
 pub mod topbar;

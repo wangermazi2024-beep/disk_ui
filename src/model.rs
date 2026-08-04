@@ -221,3 +221,19 @@ pub struct CategoryStat {
     pub size: u64,
     pub color: Color32,
 }
+
+/// 按扩展名统计的一行：扩展名（不带点，小写；没有扩展名的文件归到"（无扩展名）"）、
+/// 总大小、文件数。
+pub struct ExtensionStat {
+    pub ext: String,
+    pub size: u64,
+    pub count: u64,
+}
+
+/// 一组"候选重复文件"：文件大小完全一样的一批文件。
+/// 注意：这只是按大小分组，不是按内容哈希比对——大小相同不代表内容一定相同，
+/// 只是最快能算出来的一个初筛信号，界面上会明确标注"候选"，不是"确认重复"。
+pub struct DuplicateGroup {
+    pub size: u64,
+    pub paths: Vec<String>,
+}

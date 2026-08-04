@@ -78,6 +78,7 @@ pub fn show(
     ui: &mut egui::Ui,
     partitions: &[Node],
     partition_infos: &[Option<DiskInfo>],
+    root_paths: &[String],
     selected: &Option<NodePath>,
     show_all: bool,
 ) -> TreeAction {
@@ -160,7 +161,8 @@ pub fn show(
                                     ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+36.0), egui::Align2::LEFT_TOP, format!("扫描: 逻辑={}  物理={}", human_size_compact(p.logical_size), human_size_compact(p.physical_size)), egui::FontId::proportional(10.0), Color32::from_rgb(0xA0,0xA0,0xA0));
                                 }
                                 if resp.clicked() { clicked_row.set(row_idx); }
-                                resp.context_menu(|ui| context_menu_placeholder_disk(ui));
+                                let root_path = root_paths.get(*pi).cloned().unwrap_or_default();
+                                resp.context_menu(|ui| context_menu_placeholder_disk(ui, &root_path));
                             });
                             // 父占比
                             row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); draw_bar(ui.painter(),r,1.0,Color32::from_rgb(0xFF,0xD7,0x00)); if resp.clicked(){clicked_row.set(row_idx);} });
@@ -237,7 +239,8 @@ pub fn show(
                                 }
                                 p.text(Pos2::new(text_x,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);
                                 if resp.clicked(){clicked_row.set(row_idx);}
-                                resp.context_menu(|ui| context_menu_placeholder(ui, is_folder));
+                                let full_path = build_full_path(partitions, root_paths, abs_path);
+                                resp.context_menu(|ui| context_menu_placeholder(ui, is_folder, &c.name, &full_path));
                             });
                             // 父占比
                             row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click());draw_bar(ui.painter(),r,pct,bar_color);if resp.clicked(){clicked_row.set(row_idx);}});
@@ -311,37 +314,77 @@ fn depth_color(depth: u32, is_folder: bool) -> Color32 {
     PAL[depth as usize % PAL.len()]
 }
 
-/// 文件/文件夹右键菜单——目前只是占位，条目本身是禁用的，不接任何实际操作。
-/// 先把入口和菜单结构留好，以后要实现"打开所在位置"/"删除"这些功能时，
-/// 直接把 `add_enabled_ui(false, ..)` 换成真正的处理逻辑即可，不用再改调用点。
-fn context_menu_placeholder(ui: &mut egui::Ui, is_folder: bool) {
-    ui.set_min_width(170.0);
-    ui.add_enabled_ui(false, |ui| {
-        if is_folder {
-            let _ = ui.button("📂 在资源管理器中打开");
-            let _ = ui.button("🔍 在此文件夹内搜索");
-        } else {
-            let _ = ui.button("📂 打开所在文件夹");
-        }
-        let _ = ui.button("📋 复制路径");
-        let _ = ui.button("📋 复制名称");
-        ui.separator();
-        let _ = ui.button("🗑 删除");
-        let _ = ui.button("ℹ 属性");
-    });
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new("右键菜单占位，功能开发中").size(10.0).color(Color32::from_rgb(0x90, 0x90, 0x90)));
+/// 从 abs_path（第一个元素是分区下标，后面是逐层子节点下标）拼出完整文件系统路径。
+/// 只在右键菜单打开的那一刻才调用（不是每帧都算），开销可以忽略。
+fn build_full_path(partitions: &[Node], root_paths: &[String], abs_path: &[usize]) -> String {
+    let Some(&pi) = abs_path.first() else { return String::new() };
+    let mut path = root_paths.get(pi).cloned().unwrap_or_default().trim_end_matches('\\').to_string();
+    let Some(mut cur) = partitions.get(pi) else { return path };
+    for &i in &abs_path[1..] {
+        let Some(n) = cur.children.get(i) else { break };
+        cur = n;
+        if path.is_empty() { path = cur.name.clone(); } else { path.push('\\'); path.push_str(&cur.name); }
+    }
+    path
 }
 
-/// 磁盘/根目录行的右键菜单占位。
-fn context_menu_placeholder_disk(ui: &mut egui::Ui) {
-    ui.set_min_width(170.0);
+/// Windows 下打开资源管理器并选中某个文件/文件夹；`select_self` 为 true 时定位到这一项本身，
+/// 否则是"打开这个文件夹"（用于文件的"打开所在文件夹"——选中文件本身，而不是钻进它内部，
+/// 因为文件打不开"进入"）。
+#[cfg(windows)]
+fn open_in_explorer(path: &str, select_self: bool) {
+    if path.is_empty() { return; }
+    let result = if select_self {
+        std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn()
+    } else {
+        std::process::Command::new("explorer").arg(path).spawn()
+    };
+    if let Err(e) = result {
+        crate::applog::log(&format!("[tree_list] 打开资源管理器失败 ({path}): {e}"));
+    }
+}
+#[cfg(not(windows))]
+fn open_in_explorer(_path: &str, _select_self: bool) {}
+
+/// 文件/文件夹右键菜单。复制路径/复制名称/打开所在文件夹是真实功能；
+/// 删除和属性还是禁用占位——删除是破坏性操作，需要单独一轮做确认弹窗 + 回收站语义，
+/// 不适合和这一批其它改动混在一起仓促上。
+fn context_menu_placeholder(ui: &mut egui::Ui, is_folder: bool, name: &str, full_path: &str) {
+    ui.set_min_width(180.0);
+    let open_label = if is_folder { "📂 在资源管理器中打开" } else { "📂 打开所在文件夹" };
+    if ui.button(open_label).clicked() {
+        open_in_explorer(full_path, !is_folder);
+        ui.close();
+    }
+    if ui.button("📋 复制路径").clicked() {
+        ui.ctx().copy_text(full_path.to_string());
+        ui.close();
+    }
+    if ui.button("📋 复制名称").clicked() {
+        ui.ctx().copy_text(name.to_string());
+        ui.close();
+    }
+    ui.separator();
     ui.add_enabled_ui(false, |ui| {
-        let _ = ui.button("🔄 重新扫描");
-        let _ = ui.button("📂 在资源管理器中打开");
-        ui.separator();
-        let _ = ui.button("✖ 从列表移除");
+        let _ = ui.button("🗑 删除（开发中）");
+        let _ = ui.button("ℹ 属性（开发中）");
     });
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new("右键菜单占位，功能开发中").size(10.0).color(Color32::from_rgb(0x90, 0x90, 0x90)));
+}
+
+/// 磁盘/根目录行的右键菜单。
+fn context_menu_placeholder_disk(ui: &mut egui::Ui, root_path: &str) {
+    ui.set_min_width(180.0);
+    if ui.button("📂 在资源管理器中打开").clicked() {
+        open_in_explorer(root_path, false);
+        ui.close();
+    }
+    if ui.button("📋 复制路径").clicked() {
+        ui.ctx().copy_text(root_path.to_string());
+        ui.close();
+    }
+    ui.separator();
+    ui.add_enabled_ui(false, |ui| {
+        let _ = ui.button("🔄 重新扫描（开发中）");
+        let _ = ui.button("✖ 从列表移除（开发中）");
+    });
 }

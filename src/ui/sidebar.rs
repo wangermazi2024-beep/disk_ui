@@ -1,4 +1,5 @@
-//! 左侧边栏：磁盘概览（选中分区的已用/剩余比例）+ 分类统计（按扩展名归类的大类占比）。
+//! 左侧边栏：磁盘概览（选中分区的已用/剩余比例）+ 分类统计（按扩展名归类的大类占比）
+//! + 两个分析功能的入口（文件扩展名分类 / 重复文件查找，点了在主区域开新标签页）。
 //!
 //! 之前这里还有一块"空间统计"文字（逻辑大小/物理大小/系统已用/剩余空间/文件/文件夹），
 //! 那部分现在改成扫描完成时打印到日志——原因是现在支持同时扫多个分区，塞在侧边栏里
@@ -6,16 +7,23 @@
 //! 概览图和分类统计还留着，不然界面太单调。
 
 use egui::{Color32, Rect, RichText, Vec2};
-use crate::categorize::compute_categories;
 use crate::disk_info::DiskInfo;
 use crate::format::human_size;
-use crate::model::Node;
+use crate::model::{CategoryStat, Node};
 
 const DIM: Color32 = Color32::from_rgb(0x90, 0x90, 0x90);
 
-/// `focused`：当前"聚焦"的分区/目录（一般是用户选中的那个，没选中就用第一个），
-/// 侧边栏内容都是针对这一个来显示的。
-pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>) {
+pub enum SidebarAction {
+    None,
+    OpenExtensions,
+    OpenDuplicates,
+}
+
+/// `focused`：当前"聚焦"的分区/目录（一般是用户选中的那个，没选中就用第一个）。
+/// `categories`：调用方缓存好的分类统计（扫描完成时算一次，不在这里现算——
+/// 分类统计要遍历整棵树，放在每帧都执行的侧边栏里现算会明显卡顿）。
+pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>, categories: Option<&[CategoryStat]>) -> SidebarAction {
+    let mut action = SidebarAction::None;
     ui.add_space(10.0);
     ui.label(RichText::new("磁盘概览").strong().size(13.0));
     ui.add_space(8.0);
@@ -55,8 +63,7 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>) 
     ui.label(RichText::new("分类统计").strong().size(13.0));
     ui.add_space(8.0);
 
-    if let Some(node) = focused {
-        let cats = compute_categories(node);
+    if let Some(cats) = categories {
         let total: u64 = cats.iter().map(|c| c.size).sum::<u64>().max(1);
         for c in cats.iter().filter(|c| c.size > 0) {
             let pct = c.size as f32 / total as f32;
@@ -82,20 +89,33 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>) 
     ui.add_space(18.0);
     ui.separator();
     ui.add_space(10.0);
-    placeholder_section(ui, "🗂 文件扩展名分类", "按具体扩展名（.mp4/.jpg/…）统计占用");
-    ui.add_space(10.0);
-    placeholder_section(ui, "🧬 重复文件查找", "按内容哈希查找重复文件");
+    ui.label(RichText::new("更多分析").strong().size(13.0));
+    ui.add_space(8.0);
+
+    ui.add_enabled_ui(focused.is_some(), |ui| {
+        if analysis_button(ui, "🗂 文件扩展名分类", "按具体扩展名（.mp4/.jpg/…）统计占用") {
+            action = SidebarAction::OpenExtensions;
+        }
+        ui.add_space(8.0);
+        if analysis_button(ui, "🧬 重复文件查找", "按大小找出相同大小的候选重复文件") {
+            action = SidebarAction::OpenDuplicates;
+        }
+    });
+    if focused.is_none() {
+        ui.add_space(6.0);
+        ui.label(RichText::new("扫描完成后可用").size(10.5).color(DIM));
+    }
+
+    action
 }
 
-/// 还没做的功能先占好位置，明确标注"开发中"，不是遗漏也不是能点的死链接。
-fn placeholder_section(ui: &mut egui::Ui, title: &str, desc: &str) {
-    ui.add_enabled_ui(false, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(12.5));
-            ui.label(RichText::new("开发中").size(9.5).color(Color32::from_rgb(0xF5, 0xA6, 0x23)));
-        });
-        ui.label(RichText::new(desc).size(10.5).color(DIM));
-    });
+fn analysis_button(ui: &mut egui::Ui, title: &str, desc: &str) -> bool {
+    let resp = ui.add(egui::Button::new("").frame(false).min_size(Vec2::new(ui.available_width(), 38.0)));
+    let rect = resp.rect;
+    ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(0x33, 0x33, 0x38));
+    ui.painter().text(rect.left_top() + Vec2::new(8.0, 8.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(12.5), Color32::WHITE);
+    ui.painter().text(rect.left_top() + Vec2::new(8.0, 24.0), egui::Align2::LEFT_TOP, desc, egui::FontId::proportional(10.0), DIM);
+    resp.clicked()
 }
 
 fn draw_ring(ui: &mut egui::Ui, used_pct: f32) {

@@ -1,4 +1,6 @@
 //! 应用主状态：启动即显示主界面（空的），弹窗选分区/目录 → 顺序批量扫描 → 结果树。
+//! 主区域是标签页：默认"主列表"一个标签，点"文件扩展名分类"/"重复文件查找"
+//! 会各自开一个新标签页，不会替换掉主列表。
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -6,20 +8,37 @@ use std::sync::mpsc::{self, Receiver};
 
 use egui::{Color32, RichText};
 
+use crate::categorize;
 use crate::disk_info::{self, DiskInfo};
 use crate::export;
-use crate::model::{Node, NodePath};
+use crate::model::{CategoryStat, DuplicateGroup, ExtensionStat, Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
-use crate::ui::{sidebar, startup, tree_list, TreeAction};
+use crate::ui::{analysis, sidebar, startup, tree_list, TreeAction};
+
+/// 主区域的一个标签页。"主列表"永远是第一个、不能关闭；
+/// 扩展名分类/重复文件查找是按需打开的，数据在打开的那一刻算一次，存在标签页里。
+enum Tab {
+    Main,
+    Extensions { partition_idx: usize, title: String, data: Vec<ExtensionStat> },
+    Duplicates { partition_idx: usize, title: String, data: Vec<DuplicateGroup> },
+}
 
 pub struct DiskUiApp {
     partitions: Vec<Node>,
     partition_infos: Vec<Option<DiskInfo>>,
+    /// 分类统计缓存：扫描完成时算一次存起来，不在每一帧里现算——分类统计要遍历
+    /// 整棵树，几十万个文件的情况下每帧都重算一遍是明显能感觉到卡顿的（如果界面按
+    /// 60fps 刷新，就是一秒钟内把整棵树重新遍历 60 次），缓存下来后侧边栏只是读一个
+    /// 现成的 Vec，不用每帧都现算。
+    partition_categories: Vec<Vec<CategoryStat>>,
     /// 和 `partitions`/`partition_infos` 一一对应：这个分区/目录当初是从哪个路径扫的，
-    /// 展开文件夹时懒加载所有者要用到。
+    /// 展开文件夹时懒加载所有者、右键菜单拼完整路径都要用到。
     partition_root_paths: Vec<String>,
     selected: Option<NodePath>,
+
+    tabs: Vec<Tab>,
+    active_tab: usize,
 
     scanning: bool,
     scanned_count: u64,
@@ -32,9 +51,6 @@ pub struct DiskUiApp {
     /// 选择分区/目录的弹窗。启动时就是 `Some(..)`（软件一打开就弹出来选），
     /// 背景仍然是（空的）主界面；"文件 > 添加扫描…"也是把这个重新置为 `Some`。
     picker: Option<startup::PickerState>,
-    /// 占位功能的提示弹窗（文件扩展名分类 / 重复文件查找），点了先弹"开发中"，
-    /// 不写实际功能，但入口、菜单位置先留好。
-    placeholder_dialog: Option<&'static str>,
 
     /// 视图 > 显示全部信息：开=全部列 + 元数据文件；关=只留关键列、隐藏元数据文件。
     show_all_details: bool,
@@ -46,8 +62,11 @@ impl Default for DiskUiApp {
         Self {
             partitions: Vec::new(),
             partition_infos: Vec::new(),
+            partition_categories: Vec::new(),
             partition_root_paths: Vec::new(),
             selected: None,
+            tabs: vec![Tab::Main],
+            active_tab: 0,
             scanning: false,
             scanned_count: 0,
             scan_error: None,
@@ -55,7 +74,6 @@ impl Default for DiskUiApp {
             scan_queue: VecDeque::new(),
             current_scan_path: None,
             picker: Some(startup::PickerState::new(drives)),
-            placeholder_dialog: None,
             show_all_details: true,
         }
     }
@@ -70,11 +88,15 @@ impl eframe::App for DiskUiApp {
         if self.picker.is_some() {
             self.show_picker_modal(ui.ctx());
         }
-        if let Some(title) = self.placeholder_dialog {
-            self.show_placeholder_modal(ui.ctx(), title);
-        }
 
-        ui.ctx().request_repaint();
+        // 扫描中：进度数字和转圈动画要持续刷新，这时候需要强制重绘。
+        // 空闲时不再无条件 request_repaint()：那样等于强制 egui 一直按屏幕刷新率
+        // （通常 60Hz）重绘，不管界面有没有变化都要重新布局一遍，是 egui 官方
+        // GitHub 讨论区里明确点出来的"不必要 CPU 占用"反模式，鼠标移动/点击/
+        // 菜单展开这些交互 egui 自己就会触发重绘，不需要每帧手动催一次。
+        if self.scanning {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -89,6 +111,10 @@ impl DiskUiApp {
             #[cfg(windows)]
             is_admin: crate::mft_scan::is_elevated(),
         });
+
+        let focused_idx = self.selected.as_ref().and_then(|p| p.first().copied())
+            .or(if self.partitions.is_empty() { None } else { Some(0) });
+
         match action {
             TopbarAction::AddScan => {
                 let drives = disk_info::list_fixed_drive_letters();
@@ -96,41 +122,57 @@ impl DiskUiApp {
             }
             TopbarAction::ExportCsv => self.export_csv(),
             TopbarAction::ToggleShowAll => self.show_all_details = !self.show_all_details,
-            TopbarAction::ShowExtensionBreakdown => self.placeholder_dialog = Some("文件扩展名分类"),
-            TopbarAction::ShowDuplicateFinder => self.placeholder_dialog = Some("查找重复文件"),
+            TopbarAction::ShowExtensionBreakdown => { if let Some(pi) = focused_idx { self.open_extension_tab(pi); } }
+            TopbarAction::ShowDuplicateFinder => { if let Some(pi) = focused_idx { self.open_duplicate_tab(pi); } }
             #[cfg(windows)]
             TopbarAction::RestartAsAdmin => self.restart_as_admin(),
             TopbarAction::None => {}
         }
 
         self.show_branding_bar(ui);
+        self.show_tab_bar(ui);
 
-        // 弹窗打开的时候，背景内容（侧边栏 + 结果列表）整体禁用，
-        // 提示用户先处理弹窗——但仍然可见，不是替换成另一个界面。
-        let background_enabled = self.picker.is_none() && self.placeholder_dialog.is_none();
-        let focused_idx = self.selected.as_ref().and_then(|p| p.first().copied()).or(if self.partitions.is_empty() { None } else { Some(0) });
+        // 弹窗打开的时候，背景内容（侧边栏 + 主区域）整体禁用，提示用户先处理弹窗——
+        // 但仍然可见，不是替换成另一个界面。
+        let background_enabled = self.picker.is_none();
         let focused_node = focused_idx.and_then(|i| self.partitions.get(i));
         let focused_info = focused_idx.and_then(|i| self.partition_infos.get(i)).and_then(|o| o.as_ref());
+        let focused_categories = focused_idx.and_then(|i| self.partition_categories.get(i)).map(|v| v.as_slice());
 
+        let mut sidebar_action = sidebar::SidebarAction::None;
         egui::Panel::left("sidebar").exact_size(220.0)
             .frame(egui::Frame::default().fill(Color32::from_rgb(0x2A, 0x2A, 0x2E)).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| {
                 ui.add_enabled_ui(background_enabled, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        sidebar::show(ui, focused_node, focused_info);
+                        sidebar_action = sidebar::show(ui, focused_node, focused_info, focused_categories);
                     });
                 });
             });
+        match sidebar_action {
+            sidebar::SidebarAction::OpenExtensions => { if let Some(pi) = focused_idx { self.open_extension_tab(pi); } }
+            sidebar::SidebarAction::OpenDuplicates => { if let Some(pi) = focused_idx { self.open_duplicate_tab(pi); } }
+            sidebar::SidebarAction::None => {}
+        }
 
+        let tab_idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
         let tree_action = egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_rgb(0x24, 0x24, 0x28)).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| {
                 ui.add_enabled_ui(background_enabled, |ui| {
-                    tree_list::show(ui, &self.partitions, &self.partition_infos, &self.selected, self.show_all_details)
+                    match self.tabs.get(tab_idx) {
+                        Some(Tab::Main) | None => {
+                            Some(tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details))
+                        }
+                        Some(Tab::Extensions { data, .. }) => { analysis::show_extensions(ui, data); None }
+                        Some(Tab::Duplicates { data, .. }) => { analysis::show_duplicates(ui, data); None }
+                    }
                 }).inner
             })
             .inner;
-        self.apply_tree_action(tree_action);
+        if let Some(action) = tree_action {
+            self.apply_tree_action(action);
+        }
     }
 
     /// 窗口左下角的小品牌条：软件名 + 开发者。
@@ -146,8 +188,73 @@ impl DiskUiApp {
             });
     }
 
-    /// 选分区/目录的弹窗。用 `egui::Window` 模拟模态：无标题栏、不可缩放、居中，
-    /// 背景内容在 `show_main_screen` 里已经被 `add_enabled_ui(false, ..)` 整体禁用了。
+    /// 标签栏：只有"主列表"一个标签时不画，省地方（和之前单标签页的观感一致）。
+    fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
+        if self.tabs.len() <= 1 { return; }
+        let mut select_idx: Option<usize> = None;
+        let mut close_idx: Option<usize> = None;
+        egui::Panel::top("tab_bar").exact_size(30.0)
+            .frame(egui::Frame::default().fill(Color32::from_rgb(0x26, 0x26, 0x2A)).inner_margin(egui::Margin::symmetric(6, 3)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let title = match tab {
+                            Tab::Main => "📋 主列表".to_string(),
+                            Tab::Extensions { title, .. } => format!("🗂 {title}"),
+                            Tab::Duplicates { title, .. } => format!("🧬 {title}"),
+                        };
+                        if ui.selectable_label(i == self.active_tab, title).clicked() {
+                            select_idx = Some(i);
+                        }
+                        if !matches!(tab, Tab::Main) && ui.small_button("×").clicked() {
+                            close_idx = Some(i);
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+        if let Some(i) = select_idx { self.active_tab = i; }
+        if let Some(i) = close_idx {
+            self.tabs.remove(i);
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len().saturating_sub(1);
+            } else if self.active_tab > i {
+                self.active_tab -= 1;
+            }
+        }
+    }
+
+    /// 打开（或切换到已经开着的）某个分区的"文件扩展名分类"标签页。
+    fn open_extension_tab(&mut self, pi: usize) {
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Extensions { partition_idx, .. } if *partition_idx == pi)) {
+            self.active_tab = idx;
+            return;
+        }
+        let Some(node) = self.partitions.get(pi) else { return };
+        let data = categorize::compute_extension_breakdown(node);
+        let title = node.name.clone();
+        crate::applog::log(&format!("[app] 打开扩展名分类标签页: {title}（{} 种扩展名）", data.len()));
+        self.tabs.push(Tab::Extensions { partition_idx: pi, title, data });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    /// 打开（或切换到已经开着的）某个分区的"重复文件查找"标签页。
+    fn open_duplicate_tab(&mut self, pi: usize) {
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Duplicates { partition_idx, .. } if *partition_idx == pi)) {
+            self.active_tab = idx;
+            return;
+        }
+        let Some(node) = self.partitions.get(pi) else { return };
+        let root_path = self.partition_root_paths.get(pi).cloned().unwrap_or_default();
+        let data = categorize::compute_duplicate_candidates(node, &root_path);
+        let title = node.name.clone();
+        crate::applog::log(&format!("[app] 打开重复文件候选标签页: {title}（{} 组候选）", data.len()));
+        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, data });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    /// 选分区/目录的弹窗。用 `egui::Window` 模拟模态：无标题栏内容外的自定义按钮，
+    /// 不可缩放、居中，背景内容在 `show_main_screen` 里已经被 `add_enabled_ui(false, ..)` 整体禁用了。
     fn show_picker_modal(&mut self, ctx: &egui::Context) {
         let show_cancel = !self.partitions.is_empty() || self.scanning || !self.scan_queue.is_empty();
         let Some(picker) = &mut self.picker else { return };
@@ -169,26 +276,6 @@ impl DiskUiApp {
             startup::PickerAction::Cancel => { self.picker = None; }
             startup::PickerAction::None => {}
         }
-    }
-
-    fn show_placeholder_modal(&mut self, ctx: &egui::Context, title: &'static str) {
-        let mut close = false;
-        egui::Window::new(title)
-            .id(egui::Id::new("placeholder_modal"))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_min_width(280.0);
-                ui.add_space(6.0);
-                ui.label(RichText::new("🚧 功能开发中，敬请期待").size(14.0));
-                ui.add_space(4.0);
-                ui.label(RichText::new("入口和菜单位置已经留好，具体统计/查找逻辑还没实现。")
-                    .size(11.5).color(Color32::from_rgb(0x90, 0x90, 0x90)));
-                ui.add_space(10.0);
-                if ui.button("知道了").clicked() { close = true; }
-            });
-        if close { self.placeholder_dialog = None; }
     }
 
     fn start_scan_batch(&mut self, paths: Vec<PathBuf>) {
@@ -223,8 +310,10 @@ impl DiskUiApp {
                     let path = self.current_scan_path.take()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    let categories = categorize::compute_categories(&node);
                     self.partitions.push(node);
                     self.partition_infos.push(info);
+                    self.partition_categories.push(categories);
                     self.partition_root_paths.push(path);
                     self.selected = None;
                     finished = true;
@@ -347,7 +436,7 @@ fn log_scan_summary(node: &Node, info: Option<&DiskInfo>) {
         free.map(crate::format::human_size).unwrap_or_else(|| "未知".to_string()),
         node.file_count, node.folder_count,
     ));
-    for c in crate::categorize::compute_categories(node) {
+    for c in categorize::compute_categories(node) {
         if c.size > 0 {
             crate::applog::log(&format!("  分类[{}]: {}", c.label, crate::format::human_size(c.size)));
         }
