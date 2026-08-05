@@ -200,8 +200,8 @@ impl DiskUiApp {
                     for (i, tab) in self.tabs.iter().enumerate() {
                         let title = match tab {
                             Tab::Main => "📋 主列表".to_string(),
-                            Tab::Extensions { title, .. } => format!("🗂 {title}"),
-                            Tab::Duplicates { title, .. } => format!("🧬 {title}"),
+                            Tab::Extensions { title, .. } => format!("🗐 {title}"),
+                            Tab::Duplicates { title, .. } => format!("🔍 {title}"),
                         };
                         if ui.selectable_label(i == self.active_tab, title).clicked() {
                             select_idx = Some(i);
@@ -339,18 +339,11 @@ impl DiskUiApp {
             TreeAction::Select(p) => { self.selected = Some(p); }
             TreeAction::ToggleExpand(p) => {
                 if let Some(&pi) = p.first() {
-                    let root_path = self.partition_root_paths.get(pi).cloned();
-                    if let (Some(part), Some(root_path)) = (self.partitions.get_mut(pi), root_path) {
-                        let now_expanded = if p.len() == 1 {
+                    if let Some(part) = self.partitions.get_mut(pi) {
+                        if p.len() == 1 {
                             part.expanded = !part.expanded;
-                            part.expanded
                         } else {
-                            part.exclusive_toggle(&p[1..])
-                        };
-                        if now_expanded {
-                            if let Some((full_path, node)) = locate_for_owner(part, &root_path, &p[1..]) {
-                                populate_owner_one_level(node, &full_path);
-                            }
+                            part.exclusive_toggle(&p[1..]);
                         }
                     }
                 }
@@ -442,28 +435,3 @@ fn log_scan_summary(node: &Node, info: Option<&DiskInfo>) {
         }
     }
 }
-
-/// 从分区根节点走到 `indices` 指向的节点，同时拼出它的完整文件系统路径。
-/// `indices` 是 NodePath 去掉分区下标之后剩下的部分（分区根本身对应 indices 为空）。
-fn locate_for_owner<'a>(root: &'a mut Node, root_path: &str, indices: &[usize]) -> Option<(String, &'a mut Node)> {
-    let mut path = root_path.trim_end_matches('\\').to_string();
-    let mut cur = root;
-    for &i in indices {
-        cur = cur.children.get_mut(i)?;
-        if path.is_empty() { path = cur.name.clone(); } else { path.push('\\'); path.push_str(&cur.name); }
-    }
-    Some((path, cur))
-}
-
-/// 给 `node` 的直接子项懒加载所有者信息（只查一层，已经查过的跳过），
-/// 只在用户点开一个文件夹时触发，不在扫描过程中调用，所以不会拖慢常规扫描/MFT 扫描本身。
-#[cfg(windows)]
-fn populate_owner_one_level(node: &mut Node, path: &str) {
-    for child in &mut node.children {
-        if !child.owner.is_empty() { continue; }
-        let child_path = if path.is_empty() { child.name.clone() } else { format!("{path}\\{}", child.name) };
-        child.owner = crate::mft_scan::get_owner(&child_path);
-    }
-}
-#[cfg(not(windows))]
-fn populate_owner_one_level(_node: &mut Node, _path: &str) {}

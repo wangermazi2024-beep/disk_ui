@@ -160,7 +160,7 @@ pub fn show(
                                     ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+22.0), egui::Align2::LEFT_TOP, format!("总: {}  已用: {}  可用: {}", human_size_compact(i.total_bytes), human_size_compact(i.used_bytes), human_size_compact(i.free_bytes)), egui::FontId::proportional(10.0), Color32::from_rgb(0xA0,0xC0,0xE0));
                                     ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+36.0), egui::Align2::LEFT_TOP, format!("扫描: 逻辑={}  物理={}", human_size_compact(p.logical_size), human_size_compact(p.physical_size)), egui::FontId::proportional(10.0), Color32::from_rgb(0xA0,0xA0,0xA0));
                                 }
-                                if resp.clicked() { clicked_row.set(row_idx); }
+                                if resp.clicked() || resp.secondary_clicked() { clicked_row.set(row_idx); }
                                 let root_path = root_paths.get(*pi).cloned().unwrap_or_default();
                                 resp.context_menu(|ui| context_menu_placeholder_disk(ui, &root_path));
                             });
@@ -238,7 +238,7 @@ pub fn show(
                                     text_x += 18.0;
                                 }
                                 p.text(Pos2::new(text_x,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);
-                                if resp.clicked(){clicked_row.set(row_idx);}
+                                if resp.clicked() || resp.secondary_clicked() {clicked_row.set(row_idx);}
                                 let full_path = build_full_path(partitions, root_paths, abs_path);
                                 resp.context_menu(|ui| context_menu_placeholder(ui, is_folder, &c.name, &full_path));
                             });

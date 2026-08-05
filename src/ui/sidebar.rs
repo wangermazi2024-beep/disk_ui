@@ -93,11 +93,11 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>, 
     ui.add_space(8.0);
 
     ui.add_enabled_ui(focused.is_some(), |ui| {
-        if analysis_button(ui, "🗂 文件扩展名分类", "按具体扩展名（.mp4/.jpg/…）统计占用") {
+        if analysis_button(ui, "🗐 文件扩展名分类", "按具体扩展名（.mp4/.jpg/…）统计占用") {
             action = SidebarAction::OpenExtensions;
         }
         ui.add_space(8.0);
-        if analysis_button(ui, "🧬 重复文件查找", "按大小找出相同大小的候选重复文件") {
+        if analysis_button(ui, "🔍 重复文件查找", "按大小找出相同大小的候选重复文件") {
             action = SidebarAction::OpenDuplicates;
         }
     });

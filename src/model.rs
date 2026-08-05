@@ -175,14 +175,24 @@ impl Node {
     pub fn collapse_all(&mut self) {
         // 迭代版本：和 mft_scan.rs 的 populate_owners 用同一套写法——栈里存相对 NodePath，
         // 每次用 navigate_mut 重新定位，不持有多个 &mut Node 引用，也不用原生递归。
+        //
+        // 关键优化：只有当前节点"本来就是展开状态"时才继续往它的子节点走。
+        // 因为 exclusive_toggle 每次展开新节点之前都会先把兄弟节点全部收起，
+        // 所以"某节点 expanded==false"就必然意味着它的整棵子树里不可能还有
+        // expanded==true 的节点——不满足这个前提就没必要再往下探。
+        // 少这一个判断的话，每次展开/收起都要把兄弟节点的整棵子树遍历一遍
+        // （哪怕从来没展开过），这才是"展开列表卡 0.3-0.6 秒"的真正原因。
         let mut stack: Vec<Vec<usize>> = vec![Vec::new()];
         while let Some(rel) = stack.pop() {
             let Some(cur) = (if rel.is_empty() { Some(&mut *self) } else { self.navigate_mut(&rel) }) else { continue };
+            let was_expanded = cur.expanded;
             cur.expanded = false;
-            for i in 0..cur.children.len() {
-                let mut child_rel = rel.clone();
-                child_rel.push(i);
-                stack.push(child_rel);
+            if was_expanded {
+                for i in 0..cur.children.len() {
+                    let mut child_rel = rel.clone();
+                    child_rel.push(i);
+                    stack.push(child_rel);
+                }
             }
         }
     }

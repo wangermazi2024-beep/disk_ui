@@ -54,11 +54,11 @@ pub fn show(ui: &mut egui::Ui, state: TopbarState) -> TopbarAction {
                 });
 
                 ui.menu_button("分析", |ui| {
-                    if ui.button("🗂 文件扩展名分类…").clicked() {
+                    if ui.button("🗐 文件扩展名分类…").clicked() {
                         action = TopbarAction::ShowExtensionBreakdown;
                         ui.close();
                     }
-                    if ui.button("🧬 查找重复文件…").clicked() {
+                    if ui.button("🔍 查找重复文件…").clicked() {
                         action = TopbarAction::ShowDuplicateFinder;
                         ui.close();
                     }

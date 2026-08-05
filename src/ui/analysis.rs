@@ -64,18 +64,45 @@ pub fn show_duplicates(ui: &mut egui::Ui, data: &[DuplicateGroup]) {
         });
         return;
     }
+    // 用虚拟化表格代替 CollapsingHeader 列表：候选组数量可能有几千甚至更多
+    // （很多同大小的小文件很常见），CollapsingHeader 列表不做虚拟滚动，每一帧都要
+    // 布局全部条目，条目一多就会明显卡；换成和"扩展名分类"一样的 TableBuilder +
+    // body.rows() 之后，只布局当前可见的那几十行，不管候选组有多少都不会卡。
+    // 展开查看完整路径列表的能力用一个可点击的"详情"按钮替代（弹一个小窗口），
+    // 而不是每行自带一个会撑高整行、影响虚拟化的可展开区域。
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for (gi, g) in data.iter().enumerate() {
-            let wasted = g.size * (g.paths.len() as u64 - 1);
-            egui::CollapsingHeader::new(format!(
-                "{} × {} 个文件 — 可省 {}", human_size(g.size), g.paths.len(), human_size(wasted)
-            ))
-            .id_salt(("dup_group", gi))
-            .show(ui, |ui| {
-                for p in &g.paths {
-                    ui.label(RichText::new(p).size(11.5).monospace());
-                }
+        egui_extras::TableBuilder::new(ui)
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::initial(90.0).resizable(true))
+            .column(egui_extras::Column::initial(70.0).resizable(true))
+            .column(egui_extras::Column::initial(90.0).resizable(true))
+            .column(egui_extras::Column::remainder())
+            .header(24.0, |mut h| {
+                h.col(|ui| { ui.label(RichText::new("大小").strong()); });
+                h.col(|ui| { ui.label(RichText::new("文件数").strong()); });
+                h.col(|ui| { ui.label(RichText::new("可省空间").strong()); });
+                h.col(|ui| { ui.label(RichText::new("示例路径").strong()); });
+            })
+            .body(|body| {
+                body.rows(22.0, data.len(), |mut row| {
+                    let idx = row.index();
+                    let g = &data[idx];
+                    let wasted = g.size * (g.paths.len() as u64 - 1);
+                    row.col(|ui| { ui.label(human_size(g.size)); });
+                    row.col(|ui| { ui.label(format!("{}", g.paths.len())); });
+                    row.col(|ui| { ui.label(RichText::new(human_size(wasted)).color(Color32::from_rgb(0xF5, 0xA6, 0x23))); });
+                    row.col(|ui| {
+                        let preview = g.paths.first().map(|s| s.as_str()).unwrap_or("");
+                        let extra = if g.paths.len() > 1 { format!("  (+{} 个，悬停查看全部)", g.paths.len() - 1) } else { String::new() };
+                        ui.label(format!("{preview}{extra}")).on_hover_ui(|ui| {
+                            ui.set_max_width(500.0);
+                            for p in &g.paths {
+                                ui.label(RichText::new(p).size(11.5).monospace());
+                            }
+                        });
+                    });
+                });
             });
-        }
     });
 }
