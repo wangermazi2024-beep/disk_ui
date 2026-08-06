@@ -39,48 +39,58 @@ pub fn compute_categories(root: &Node) -> Vec<crate::model::CategoryStat> {
     (0..6).map(|i| crate::model::CategoryStat { label: LABELS[i], size: totals[i], color: COLORS[i] }).collect()
 }
 
-/// 按扩展名统计每种后缀总共占了多少空间、多少个文件。按总大小从大到小排序。
-/// 迭代遍历（显式栈），不管树多深都不会栈溢出。
-pub fn compute_extension_breakdown(root: &Node) -> Vec<crate::model::ExtensionStat> {
+/// 按扩展名分类，建一棵"合成树"：每种扩展名一个虚拟文件夹，下面放这个扩展名的
+/// 全部真实文件（克隆自原树，带上 full_path_override 记住它们在磁盘上的真实路径）。
+/// 建成 Node 树是为了直接复用 tree_list::show() 渲染——和主列表长得一模一样，
+/// 可以展开、可以右键复制路径/打开所在文件夹，而不是另外画一套简化表格。
+pub fn build_extension_tree(root: &Node, root_path: &str) -> Node {
     use std::collections::HashMap;
-    let mut totals: HashMap<String, (u64, u64)> = HashMap::new(); // ext -> (size, count)
-    let mut stack: Vec<&Node> = vec![root];
-    while let Some(cur) = stack.pop() {
+    let mut groups: HashMap<String, Vec<Node>> = HashMap::new();
+    let mut stack: Vec<(&Node, String)> = vec![(root, root_path.trim_end_matches('\\').to_string())];
+    while let Some((cur, path)) = stack.pop() {
         match cur.kind {
             NodeKind::File => {
                 let ext = cur.name.rsplit_once('.')
-                    .filter(|(base, e)| !base.is_empty() && !e.is_empty()) // 处理 ".gitignore" 这类"隐藏点文件"，不当成扩展名
+                    .filter(|(base, e)| !base.is_empty() && !e.is_empty())
                     .map(|(_, e)| e.to_ascii_lowercase())
                     .unwrap_or_else(|| "（无扩展名）".to_string());
-                let entry = totals.entry(ext).or_insert((0, 0));
-                entry.0 += cur.logical_size;
-                entry.1 += 1;
+                let leaf = cur.clone().with_full_path(path.clone());
+                groups.entry(ext).or_default().push(leaf);
             }
-            NodeKind::Folder => stack.extend(cur.children.iter()),
+            NodeKind::Folder => {
+                for child in &cur.children {
+                    let child_path = if path.is_empty() { child.name.clone() } else { format!("{path}\\{}", child.name) };
+                    stack.push((child, child_path));
+                }
+            }
         }
     }
-    let mut result: Vec<crate::model::ExtensionStat> = totals.into_iter()
-        .map(|(ext, (size, count))| crate::model::ExtensionStat { ext, size, count })
-        .collect();
-    result.sort_by(|a, b| b.size.cmp(&a.size));
-    result
+    let ext_folders: Vec<Node> = groups.into_iter().map(|(ext, files)| {
+        let display_ext = if ext.starts_with('（') { ext.clone() } else { format!(".{ext}") };
+        let count = files.len();
+        Node::new_folder_with_meta(
+            format!("{display_ext}（{count} 个文件）"),
+            GROUP_COLOR, files, 0, 0, 0, 0x10, 0, false, String::new(),
+        )
+    }).collect();
+    Node::new_folder_with_meta("按扩展名分类".to_string(), GROUP_COLOR, ext_folders, 0, 0, 0, 0x10, 0, false, String::new())
 }
 
-/// 按文件大小分组找候选重复文件（同一个大小、出现在 2 个或以上不同位置）。
-/// 只按大小分组，不读文件内容比对——这是最便宜的初筛，大小相同不代表内容一定相同，
-/// 界面上会标"候选"。按"潜在可省空间"（size × (count-1)）从大到小排序，最值得关注的排前面。
-/// 迭代遍历（显式栈），路径随栈一起带着走，不用回头拼接。
-pub fn compute_duplicate_candidates(root: &Node, root_path: &str) -> Vec<crate::model::DuplicateGroup> {
+/// 按文件大小分组找候选重复文件，同样建一棵合成树（每组一个虚拟文件夹）。
+/// 只按大小分组，不读文件内容比对——大小相同不代表内容一定相同，
+/// 文件夹名字里会写"候选"，界面上也会有提示，不会让人误以为是确认过的重复文件。
+/// 按"潜在可省空间"（size × (count-1)）从大到小排序，最值得关注的排前面。
+pub fn build_duplicate_tree(root: &Node, root_path: &str) -> Node {
     use std::collections::HashMap;
-    let mut groups: HashMap<u64, Vec<String>> = HashMap::new();
-    let base = root_path.trim_end_matches('\\');
-    let mut stack: Vec<(&Node, String)> = vec![(root, base.to_string())];
+    let mut groups: HashMap<u64, Vec<Node>> = HashMap::new();
+    let mut stack: Vec<(&Node, String)> = vec![(root, root_path.trim_end_matches('\\').to_string())];
     while let Some((cur, path)) = stack.pop() {
         match cur.kind {
             NodeKind::File => {
                 if cur.logical_size > 0 {
-                    // 0 字节文件到处都是、比较没有意义，跳过，避免"候选"列表被一堆空文件淹没
-                    groups.entry(cur.logical_size).or_default().push(path);
+                    // 0 字节文件到处都是、比较没有意义，跳过，避免候选列表被一堆空文件淹没
+                    let leaf = cur.clone().with_full_path(path.clone());
+                    groups.entry(cur.logical_size).or_default().push(leaf);
                 }
             }
             NodeKind::Folder => {
@@ -91,14 +101,20 @@ pub fn compute_duplicate_candidates(root: &Node, root_path: &str) -> Vec<crate::
             }
         }
     }
-    let mut result: Vec<crate::model::DuplicateGroup> = groups.into_iter()
-        .filter(|(_, paths)| paths.len() >= 2)
-        .map(|(size, paths)| crate::model::DuplicateGroup { size, paths })
-        .collect();
-    result.sort_by(|a, b| {
-        let wa = a.size * (a.paths.len() as u64 - 1);
-        let wb = b.size * (b.paths.len() as u64 - 1);
-        wb.cmp(&wa)
-    });
-    result
+    let mut pairs: Vec<(u64, Node)> = groups.into_iter()
+        .filter(|(_, files)| files.len() >= 2)
+        .map(|(size, files)| {
+            let wasted = size * (files.len() as u64 - 1);
+            let count = files.len();
+            let name = format!(
+                "{} × {count} 个文件（候选，可省 {}）",
+                crate::format::human_size(size), crate::format::human_size(wasted),
+            );
+            (wasted, Node::new_folder_with_meta(name, GROUP_COLOR, files, 0, 0, 0, 0x10, 0, false, String::new()))
+        }).collect();
+    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+    let dup_folders: Vec<Node> = pairs.into_iter().map(|(_, n)| n).collect();
+    Node::new_folder_with_meta("候选重复文件（按大小分组）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new())
 }
+
+const GROUP_COLOR: Color32 = Color32::from_rgb(0xF5, 0xA6, 0x23);

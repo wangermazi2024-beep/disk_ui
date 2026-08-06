@@ -1,6 +1,9 @@
 //! 应用主状态：启动即显示主界面（空的），弹窗选分区/目录 → 顺序批量扫描 → 结果树。
 //! 主区域是标签页：默认"主列表"一个标签，点"文件扩展名分类"/"重复文件查找"
-//! 会各自开一个新标签页，不会替换掉主列表。
+//! 会各自开一个新标签页。这两个分析标签页内部也是用 tree_list::show() 渲染的
+//! （数据先在 categorize.rs 里重新组织成一棵"合成树"——按扩展名/大小分组当文件夹，
+//! 真实文件当叶子），所以看起来、操作起来和主列表完全一样：能展开、能右键复制路径/
+//! 打开所在文件夹，不是另外画的一套简化表格。
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -11,17 +14,18 @@ use egui::{Color32, RichText};
 use crate::categorize;
 use crate::disk_info::{self, DiskInfo};
 use crate::export;
-use crate::model::{CategoryStat, DuplicateGroup, ExtensionStat, Node, NodePath};
+use crate::model::{CategoryStat, Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
-use crate::ui::{analysis, sidebar, startup, tree_list, TreeAction};
+use crate::ui::{sidebar, startup, tree_list, TreeAction};
 
 /// 主区域的一个标签页。"主列表"永远是第一个、不能关闭；
-/// 扩展名分类/重复文件查找是按需打开的，数据在打开的那一刻算一次，存在标签页里。
+/// 扩展名分类/重复文件查找是按需打开的，数据（合成树）在打开的那一刻算一次，存在标签页里。
+/// 每个分析标签页有自己独立的 `selected`（展开/选中状态），不会和主列表互相干扰。
 enum Tab {
     Main,
-    Extensions { partition_idx: usize, title: String, data: Vec<ExtensionStat> },
-    Duplicates { partition_idx: usize, title: String, data: Vec<DuplicateGroup> },
+    Extensions { partition_idx: usize, title: String, root: Node, selected: Option<NodePath> },
+    Duplicates { partition_idx: usize, title: String, root: Node, selected: Option<NodePath> },
 }
 
 pub struct DiskUiApp {
@@ -33,7 +37,7 @@ pub struct DiskUiApp {
     /// 现成的 Vec，不用每帧都现算。
     partition_categories: Vec<Vec<CategoryStat>>,
     /// 和 `partitions`/`partition_infos` 一一对应：这个分区/目录当初是从哪个路径扫的，
-    /// 展开文件夹时懒加载所有者、右键菜单拼完整路径都要用到。
+    /// 右键菜单拼完整路径、打开扩展名/重复文件分析都要用到。
     partition_root_paths: Vec<String>,
     selected: Option<NodePath>,
 
@@ -156,23 +160,28 @@ impl DiskUiApp {
         }
 
         let tab_idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        let empty_infos: [Option<DiskInfo>; 1] = [None];
         let tree_action = egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_rgb(0x24, 0x24, 0x28)).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| {
                 ui.add_enabled_ui(background_enabled, |ui| {
                     match self.tabs.get(tab_idx) {
                         Some(Tab::Main) | None => {
-                            Some(tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details))
+                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details)
                         }
-                        Some(Tab::Extensions { data, .. }) => { analysis::show_extensions(ui, data); None }
-                        Some(Tab::Duplicates { data, .. }) => { analysis::show_duplicates(ui, data); None }
+                        Some(Tab::Extensions { root, selected, .. }) | Some(Tab::Duplicates { root, selected, .. }) => {
+                            // 合成树只有一个"分区根"，root_path 留空——叶子文件节点自己带了
+                            // full_path_override（真实完整路径），右键复制路径/打开所在文件夹
+                            // 直接用那个，不需要靠 root_path 拼。
+                            let roots = std::slice::from_ref(root);
+                            let paths = [String::new()];
+                            tree_list::show(ui, roots, &empty_infos, &paths, selected, self.show_all_details)
+                        }
                     }
                 }).inner
             })
             .inner;
-        if let Some(action) = tree_action {
-            self.apply_tree_action(action);
-        }
+        self.apply_tree_action(tree_action);
     }
 
     /// 窗口左下角的小品牌条：软件名 + 开发者。
@@ -231,10 +240,11 @@ impl DiskUiApp {
             return;
         }
         let Some(node) = self.partitions.get(pi) else { return };
-        let data = categorize::compute_extension_breakdown(node);
+        let root_path = self.partition_root_paths.get(pi).cloned().unwrap_or_default();
+        let root = categorize::build_extension_tree(node, &root_path);
         let title = node.name.clone();
-        crate::applog::log(&format!("[app] 打开扩展名分类标签页: {title}（{} 种扩展名）", data.len()));
-        self.tabs.push(Tab::Extensions { partition_idx: pi, title, data });
+        crate::applog::log(&format!("[app] 打开扩展名分类标签页: {title}（{} 种扩展名）", root.children.len()));
+        self.tabs.push(Tab::Extensions { partition_idx: pi, title, root, selected: None });
         self.active_tab = self.tabs.len() - 1;
     }
 
@@ -246,15 +256,15 @@ impl DiskUiApp {
         }
         let Some(node) = self.partitions.get(pi) else { return };
         let root_path = self.partition_root_paths.get(pi).cloned().unwrap_or_default();
-        let data = categorize::compute_duplicate_candidates(node, &root_path);
+        let root = categorize::build_duplicate_tree(node, &root_path);
         let title = node.name.clone();
-        crate::applog::log(&format!("[app] 打开重复文件候选标签页: {title}（{} 组候选）", data.len()));
-        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, data });
+        crate::applog::log(&format!("[app] 打开重复文件候选标签页: {title}（{} 组候选）", root.children.len()));
+        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None });
         self.active_tab = self.tabs.len() - 1;
     }
 
-    /// 选分区/目录的弹窗。用 `egui::Window` 模拟模态：无标题栏内容外的自定义按钮，
-    /// 不可缩放、居中，背景内容在 `show_main_screen` 里已经被 `add_enabled_ui(false, ..)` 整体禁用了。
+    /// 选分区/目录的弹窗。用 `egui::Window` 模拟模态：不可缩放、居中，
+    /// 背景内容在 `show_main_screen` 里已经被 `add_enabled_ui(false, ..)` 整体禁用了。
     fn show_picker_modal(&mut self, ctx: &egui::Context) {
         let show_cancel = !self.partitions.is_empty() || self.scanning || !self.scan_queue.is_empty();
         let Some(picker) = &mut self.picker else { return };
@@ -333,23 +343,48 @@ impl DiskUiApp {
         }
     }
 
+    /// 把展开/选中操作应用到"当前激活的那个标签页"自己的树/选中状态上——
+    /// 主列表用 `self.selected` + `self.partitions`，每个分析标签页有自己独立的
+    /// `selected` + 合成 `root`，互不干扰（切标签页不会互相影响展开状态）。
     fn apply_tree_action(&mut self, action: TreeAction) {
+        let tab_idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        let is_view_tab = matches!(self.tabs.get(tab_idx), Some(Tab::Extensions { .. }) | Some(Tab::Duplicates { .. }));
         match action {
             TreeAction::None => {}
-            TreeAction::Select(p) => { self.selected = Some(p); }
+            TreeAction::Select(p) | TreeAction::EnterNode(p) => {
+                if is_view_tab {
+                    if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                        let selected = match tab {
+                            Tab::Extensions { selected, .. } | Tab::Duplicates { selected, .. } => selected,
+                            Tab::Main => return,
+                        };
+                        *selected = Some(p);
+                    }
+                } else {
+                    self.selected = Some(p);
+                }
+            }
             TreeAction::ToggleExpand(p) => {
-                if let Some(&pi) = p.first() {
-                    if let Some(part) = self.partitions.get_mut(pi) {
-                        if p.len() == 1 {
-                            part.expanded = !part.expanded;
-                        } else {
-                            part.exclusive_toggle(&p[1..]);
+                if is_view_tab {
+                    if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                        let (root, selected) = match tab {
+                            Tab::Extensions { root, selected, .. } | Tab::Duplicates { root, selected, .. } => (root, selected),
+                            Tab::Main => return,
+                        };
+                        // 合成树只有一个根（tree_list 里传的是单元素切片），abs_path[0] 恒为 0，
+                        // 真正要用来定位/展开的是 p[1..]。
+                        if p.len() == 1 { root.expanded = !root.expanded; } else { root.exclusive_toggle(&p[1..]); }
+                        *selected = Some(p);
+                    }
+                } else {
+                    if let Some(&pi) = p.first() {
+                        if let Some(part) = self.partitions.get_mut(pi) {
+                            if p.len() == 1 { part.expanded = !part.expanded; } else { part.exclusive_toggle(&p[1..]); }
                         }
                     }
+                    self.selected = Some(p);
                 }
-                self.selected = Some(p);
             }
-            TreeAction::EnterNode(p) => { self.selected = Some(p); }
         }
     }
 

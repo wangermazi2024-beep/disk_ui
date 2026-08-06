@@ -325,6 +325,11 @@ fn build_full_path(partitions: &[Node], root_paths: &[String], abs_path: &[usize
         cur = n;
         if path.is_empty() { path = cur.name.clone(); } else { path.push('\\'); path.push_str(&cur.name); }
     }
+    // 分析视图（扩展名分类/重复文件查找）里的合成节点：它们在合成树里的位置和真实磁盘
+    // 目录结构对不上，沿祖先名字拼出来的 path 是错的，有 full_path_override 就用它。
+    if let Some(real) = &cur.full_path_override {
+        return real.clone();
+    }
     path
 }
 

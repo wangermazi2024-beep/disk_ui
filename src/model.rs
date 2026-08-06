@@ -45,9 +45,19 @@ pub struct Node {
     pub is_reserved: bool,
     /// 所有者（SID 或用户名，可能为空）。
     pub owner: String,
+    /// 只给"分析视图"（扩展名分类/重复文件查找）里的合成节点用：这些节点是按扩展名/大小
+    /// 重新分组显示的，在合成树里的位置和它们在磁盘上真实的父目录不是一回事，
+    /// 沿着树往上拼祖先名字重建出来的路径会是错的。有这个字段就直接用它，
+    /// 没有（正常扫描出来的节点）就还是按原来的办法从父级拼。
+    pub full_path_override: Option<String>,
 }
 
 impl Node {
+    /// 给合成节点（分析视图用）标记真实完整路径，链式调用。
+    pub fn with_full_path(mut self, path: String) -> Self {
+        self.full_path_override = Some(path);
+        self
+    }
     pub fn new_folder(name: impl Into<String>, color: Color32, children: Vec<Node>) -> Self {
         Self::new_folder_with_meta(name, color, children, 0, 0, 0, 0x10, 0, false, String::new())
     }
@@ -96,6 +106,7 @@ impl Node {
             reparse_tag,
             is_reserved,
             owner,
+            full_path_override: None,
         }
     }
 
@@ -135,6 +146,7 @@ impl Node {
             reparse_tag,
             is_reserved,
             owner,
+            full_path_override: None,
         }
     }
 
@@ -230,20 +242,4 @@ pub struct CategoryStat {
     pub label: &'static str,
     pub size: u64,
     pub color: Color32,
-}
-
-/// 按扩展名统计的一行：扩展名（不带点，小写；没有扩展名的文件归到"（无扩展名）"）、
-/// 总大小、文件数。
-pub struct ExtensionStat {
-    pub ext: String,
-    pub size: u64,
-    pub count: u64,
-}
-
-/// 一组"候选重复文件"：文件大小完全一样的一批文件。
-/// 注意：这只是按大小分组，不是按内容哈希比对——大小相同不代表内容一定相同，
-/// 只是最快能算出来的一个初筛信号，界面上会明确标注"候选"，不是"确认重复"。
-pub struct DuplicateGroup {
-    pub size: u64,
-    pub paths: Vec<String>,
 }
