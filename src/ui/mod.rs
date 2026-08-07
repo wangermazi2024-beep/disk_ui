@@ -1,3 +1,4 @@
+pub mod compact_tree;
 pub mod sidebar;
 pub mod startup;
 pub mod topbar;

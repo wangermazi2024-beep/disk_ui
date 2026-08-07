@@ -336,14 +336,23 @@ fn build_full_path(partitions: &[Node], root_paths: &[String], abs_path: &[usize
 /// Windows 下打开资源管理器并选中某个文件/文件夹；`select_self` 为 true 时定位到这一项本身，
 /// 否则是"打开这个文件夹"（用于文件的"打开所在文件夹"——选中文件本身，而不是钻进它内部，
 /// 因为文件打不开"进入"）。
+///
+/// 路径必须整体带双引号：`explorer /select,C:\some path\file.txt`（不带引号）在路径带空格时
+/// 会静默失败，退化成打开资源管理器的默认位置（很多机器上是"文档"），而不是报错或者什么都
+/// 不做——这是 Windows 一个有据可查的老毛病，不是这边逻辑写错了。之前就是漏了这层引号，
+/// 导致"有的文件用资源管理器打开会跳到 Documents"。
 #[cfg(windows)]
 fn open_in_explorer(path: &str, select_self: bool) {
     if path.is_empty() { return; }
-    let result = if select_self {
-        std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn()
+    let (cmd_desc, result) = if select_self {
+        let arg = format!("/select,\"{path}\"");
+        let r = std::process::Command::new("explorer").arg(&arg).spawn();
+        (format!("explorer {arg}"), r)
     } else {
-        std::process::Command::new("explorer").arg(path).spawn()
+        let r = std::process::Command::new("explorer").arg(path).spawn();
+        (format!("explorer {path}"), r)
     };
+    crate::applog::log(&format!("[tree_list] 打开资源管理器: {cmd_desc}"));
     if let Err(e) = result {
         crate::applog::log(&format!("[tree_list] 打开资源管理器失败 ({path}): {e}"));
     }

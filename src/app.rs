@@ -1,9 +1,8 @@
 //! 应用主状态：启动即显示主界面（空的），弹窗选分区/目录 → 顺序批量扫描 → 结果树。
 //! 主区域是标签页：默认"主列表"一个标签，点"文件扩展名分类"/"重复文件查找"
-//! 会各自开一个新标签页。这两个分析标签页内部也是用 tree_list::show() 渲染的
-//! （数据先在 categorize.rs 里重新组织成一棵"合成树"——按扩展名/大小分组当文件夹，
-//! 真实文件当叶子），所以看起来、操作起来和主列表完全一样：能展开、能右键复制路径/
-//! 打开所在文件夹，不是另外画的一套简化表格。
+//! 会各自开一个新标签页。这两个分析标签页内部用 `ui::compact_tree` 渲染（和主列表
+//! 视觉语言一致——能展开、有缩进参考线、右键菜单——但列不一样：数据先在 categorize.rs
+//! 里重新组织成一棵"合成树"，按扩展名/大小分组当文件夹，真实文件当叶子）。
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -62,7 +61,7 @@ pub struct DiskUiApp {
 
 impl Default for DiskUiApp {
     fn default() -> Self {
-        let drives = disk_info::list_fixed_drive_letters();
+        let drives = disk_info::list_fixed_drives_with_labels();
         Self {
             partitions: Vec::new(),
             partition_infos: Vec::new(),
@@ -121,7 +120,7 @@ impl DiskUiApp {
 
         match action {
             TopbarAction::AddScan => {
-                let drives = disk_info::list_fixed_drive_letters();
+                let drives = disk_info::list_fixed_drives_with_labels();
                 self.picker = Some(startup::PickerState::new(drives));
             }
             TopbarAction::ExportCsv => self.export_csv(),
@@ -160,7 +159,6 @@ impl DiskUiApp {
         }
 
         let tab_idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
-        let empty_infos: [Option<DiskInfo>; 1] = [None];
         let tree_action = egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(Color32::from_rgb(0x24, 0x24, 0x28)).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| {
@@ -170,12 +168,7 @@ impl DiskUiApp {
                             tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details)
                         }
                         Some(Tab::Extensions { root, selected, .. }) | Some(Tab::Duplicates { root, selected, .. }) => {
-                            // 合成树只有一个"分区根"，root_path 留空——叶子文件节点自己带了
-                            // full_path_override（真实完整路径），右键复制路径/打开所在文件夹
-                            // 直接用那个，不需要靠 root_path 拼。
-                            let roots = std::slice::from_ref(root);
-                            let paths = [String::new()];
-                            tree_list::show(ui, roots, &empty_infos, &paths, selected, self.show_all_details)
+                            crate::ui::compact_tree::show(ui, root, selected)
                         }
                     }
                 }).inner

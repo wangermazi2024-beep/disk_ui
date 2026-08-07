@@ -2,21 +2,21 @@
 //!
 //! 首次启动时占满整个窗口显示；用户扫完一批之后想再追加扫描目标时，
 //! 同一套状态和渲染逻辑也会以浮动窗口的形式复用（见 `app.rs` 的"文件 > 添加扫描…"）。
-//! 在用户点"开始扫描"之前，这个界面本身不会触发任何磁盘查询——分区列表只是盘符，
-//! 不含任何容量/卷标信息，所有真实数据都要等对应的扫描任务跑完才会出现。
+//! 分区列表带真实卷名（GetVolumeInformationW，很轻量，不算"扫描数据"），没有卷名的盘
+//! 才退化显示"本地磁盘"；在用户点"开始扫描"之前不会查询任何分区的容量信息。
 
 use std::collections::HashSet;
 use egui::{Color32, RichText};
 
 pub struct PickerState {
-    /// 系统里有哪些固定磁盘盘符（只是盘符列表，不含容量等信息）。
-    pub available_drives: Vec<char>,
+    /// 系统里有哪些固定磁盘盘符 + 真实卷名（没有卷名的是 None，界面上退化成"本地磁盘"）。
+    pub available_drives: Vec<(char, Option<String>)>,
     pub selected_drives: HashSet<char>,
     pub custom_paths: Vec<String>,
 }
 
 impl PickerState {
-    pub fn new(available_drives: Vec<char>) -> Self {
+    pub fn new(available_drives: Vec<(char, Option<String>)>) -> Self {
         Self { available_drives, selected_drives: HashSet::new(), custom_paths: Vec::new() }
     }
 
@@ -50,9 +50,13 @@ pub fn show(ui: &mut egui::Ui, state: &mut PickerState, show_cancel: bool) -> Pi
     } else {
         ui.label(RichText::new("固定磁盘分区（可多选）").size(12.5).color(Color32::from_rgb(0xC8, 0xC8, 0xC8)));
         ui.add_space(4.0);
-        for &letter in &state.available_drives {
+        for &(letter, ref label) in &state.available_drives {
             let mut checked = state.selected_drives.contains(&letter);
-            if ui.checkbox(&mut checked, format!("本地磁盘 ({letter}:)")).changed() {
+            let display = match label {
+                Some(l) => format!("{l} ({letter}:)"),
+                None => format!("本地磁盘 ({letter}:)"),
+            };
+            if ui.checkbox(&mut checked, display).changed() {
                 if checked {
                     state.selected_drives.insert(letter);
                 } else {

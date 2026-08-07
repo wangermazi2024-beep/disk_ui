@@ -50,6 +50,32 @@ pub fn list_fixed_drive_letters() -> Vec<char> {
 #[cfg(not(windows))]
 pub fn list_fixed_drive_letters() -> Vec<char> { Vec::new() }
 
+/// 只列出固定磁盘的盘符 + 卷标，不查容量（不调用 GetDiskFreeSpaceExW）。
+/// 卷标查询（GetVolumeInformationW）本身很轻量，只是个名字，不算"扫描数据"——
+/// 给启动选择界面用真实卷名（没有卷标的盘就是 None，界面上退化成"本地磁盘"），
+/// 而不是不管有没有卷名一律显示"本地磁盘 (C:)"。
+#[cfg(windows)]
+pub fn list_fixed_drives_with_labels() -> Vec<(char, Option<String>)> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+    list_fixed_drive_letters().into_iter().map(|letter| {
+        let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain(std::iter::once(0)).collect();
+        let mut label = [0u16; 260];
+        let mut fs_unused = [0u16; 260];
+        let mut serial = 0u32; let mut max_len = 0u32; let mut flags = 0u32;
+        let ok = unsafe {
+            GetVolumeInformationW(root.as_ptr(), label.as_mut_ptr(), 260, &mut serial, &mut max_len, &mut flags, fs_unused.as_mut_ptr(), 260)
+        };
+        let label_s = if ok != 0 {
+            let ll = label.iter().position(|&c| c == 0).unwrap_or(0);
+            let s = String::from_utf16_lossy(&label[..ll]);
+            if s.is_empty() { None } else { Some(s) }
+        } else { None };
+        (letter, label_s)
+    }).collect()
+}
+#[cfg(not(windows))]
+pub fn list_fixed_drives_with_labels() -> Vec<(char, Option<String>)> { Vec::new() }
+
 #[cfg(windows)]
 pub fn query_disk_info(drive_letter: char) -> Option<DiskInfo> {
     use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumeInformationW};

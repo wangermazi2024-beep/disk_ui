@@ -80,17 +80,15 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>, 
             ui.add_space(7.0);
         }
         if cats.iter().all(|c| c.size == 0) {
-            ui.label(RichText::new("（暂无数据）").size(11.5).color(DIM));
+            ui.vertical_centered(|ui| ui.label(RichText::new("（暂无数据）").size(11.5).color(DIM)));
         }
     } else {
-        ui.label(RichText::new("扫描完成后显示").size(12.0).color(DIM));
+        ui.vertical_centered(|ui| ui.label(RichText::new("扫描完成后显示").size(12.0).color(DIM)));
     }
 
     ui.add_space(18.0);
     ui.separator();
     ui.add_space(10.0);
-    ui.label(RichText::new("更多分析").strong().size(13.0));
-    ui.add_space(8.0);
 
     ui.add_enabled_ui(focused.is_some(), |ui| {
         if analysis_button(ui, "🗐 文件扩展名分类", "按具体扩展名（.mp4/.jpg/…）统计占用") {
@@ -103,7 +101,7 @@ pub fn show(ui: &mut egui::Ui, focused: Option<&Node>, info: Option<&DiskInfo>, 
     });
     if focused.is_none() {
         ui.add_space(6.0);
-        ui.label(RichText::new("扫描完成后可用").size(10.5).color(DIM));
+        ui.vertical_centered(|ui| ui.label(RichText::new("扫描完成后可用").size(10.5).color(DIM)));
     }
 
     action
