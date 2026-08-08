@@ -66,7 +66,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>) -> Tree
                     // 每一列都要能点击（选中/右键菜单），不是只有名称那一列能点——
                     // 统一在每个 row.col() 开头画背景（选中蓝底/隐藏淡橙底）+ 建立点击感应区，
                     // 四列各自画一段，视觉上连起来就是一整行的高亮，而不是只有名称那一小块。
-                    let paint_bg_and_sense = |ui: &mut egui::Ui| -> egui::Response {
+                    let paint_bg_and_sense = |ui: &mut egui::Ui| -> (egui::Rect, egui::Response) {
                         let rect = ui.available_rect_before_wrap();
                         let resp = ui.allocate_rect(rect, Sense::click());
                         if hidden {
@@ -75,7 +75,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>) -> Tree
                         if is_selected {
                             ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0x4C, 0x8B, 0xF5, 0x40));
                         }
-                        resp
+                        (rect, resp)
                     };
                     let handle_click = |resp: &egui::Response| {
                         if resp.clicked() || resp.secondary_clicked() { clicked_row.set(Some(row_idx)); }
@@ -83,8 +83,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>) -> Tree
 
                     // 名称
                     row.col(|ui| {
-                        let rect = ui.available_rect_before_wrap();
-                        let resp = paint_bg_and_sense(ui);
+                        let (rect, resp) = paint_bg_and_sense(ui);
                         let guide_color = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x14);
                         for lvl in 0..fr.depth {
                             let x = rect.min.x + lvl as f32 * 16.0 + 10.0;
@@ -111,17 +110,17 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>) -> Tree
                     });
                     // 大小
                     row.col(|ui| {
-                        let resp = paint_bg_and_sense(ui);
-                        ui.painter().text(ui.available_rect_before_wrap().left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
+                        let (rect, resp) = paint_bg_and_sense(ui);
+                        ui.painter().text(rect.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
                             human_size(n.logical_size), egui::FontId::proportional(12.0), Color32::from_rgb(0xD0, 0xD0, 0xD0));
                         handle_click(&resp);
                         if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path)); }
                     });
                     // 修改时间
                     row.col(|ui| {
-                        let resp = paint_bg_and_sense(ui);
+                        let (rect, resp) = paint_bg_and_sense(ui);
                         if !is_group {
-                            ui.painter().text(ui.available_rect_before_wrap().left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
+                            ui.painter().text(rect.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
                                 format_filetime_local(n.modified_ft), egui::FontId::proportional(11.0), Color32::from_rgb(0xC0, 0xC0, 0xC0));
                         }
                         handle_click(&resp);
@@ -129,10 +128,10 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>) -> Tree
                     });
                     // 路径（只有真实文件才有意义，分组行留空）
                     row.col(|ui| {
-                        let resp = paint_bg_and_sense(ui);
+                        let (rect, resp) = paint_bg_and_sense(ui);
                         if !is_group {
                             let dir = full_path.rsplit_once('\\').map(|(d, _)| d).unwrap_or("");
-                            ui.painter().text(ui.available_rect_before_wrap().left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
+                            ui.painter().text(rect.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
                                 dir, egui::FontId::proportional(11.5), Color32::from_rgb(0xA0, 0xA0, 0xA0));
                         }
                         handle_click(&resp);
