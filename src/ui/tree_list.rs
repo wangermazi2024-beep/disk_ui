@@ -90,6 +90,11 @@ pub fn show(
     // "非关键列隐藏"，可以保证列数在任何开关状态下都完全不变，从根上排除这类风险。
     let extra_w = |normal: f32| if show_all { normal } else { 0.0 };
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        // 表格默认的 item_spacing 会在行与行、列与列之间留出几像素的间距——这段间距
+        // 不属于任何一个单元格，我们手画的高亮背景、手动建的点击感应区都不会覆盖到它，
+        // 于是就成了"看着是空白、点了没反应"的死区。这里直接把间距清零，行与行之间
+        // 紧挨着，不会再有这种缝隙。
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
         let mut builder = egui_extras::TableBuilder::new(ui)
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))

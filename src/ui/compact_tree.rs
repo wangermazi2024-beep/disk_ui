@@ -36,6 +36,9 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>) -> Tree
 
         // 名称 | 大小 | 修改时间 | 路径（放最后，用 remainder，避免中间夹在两个固定宽度列
         // 之间时缺一条可视的拖拽分隔线，看起来不像两个独立的列）。
+        // 表格默认的 item_spacing 会在行之间留出几像素间距，手画的高亮/点击感应区都盖不到，
+        // 就成了"点了没反应"的死区，这里清零，行与行紧挨着。
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
         let builder = egui_extras::TableBuilder::new(ui)
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
