@@ -16,15 +16,15 @@ use crate::export;
 use crate::model::{CategoryStat, Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
-use crate::ui::{sidebar, startup, tree_list, SortState, TreeAction};
+use crate::ui::{sidebar, startup, tree_list, TreeAction};
 
 /// 主区域的一个标签页。"主列表"永远是第一个、不能关闭；
 /// 扩展名分类/重复文件查找是按需打开的，数据（合成树）在打开的那一刻算一次，存在标签页里。
 /// 每个分析标签页有自己独立的 `selected`（展开/选中状态），不会和主列表互相干扰。
 enum Tab {
     Main,
-    Extensions { partition_idx: usize, title: String, root: Node, selected: Option<NodePath> },
-    Duplicates { partition_idx: usize, title: String, root: Node, selected: Option<NodePath> },
+    Extensions { partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState },
+    Duplicates { partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState },
 }
 
 pub struct DiskUiApp {
@@ -58,9 +58,9 @@ pub struct DiskUiApp {
     /// 视图 > 显示全部信息：开=全部列 + 元数据文件；关=只留关键列、隐藏元数据文件。
     show_all_details: bool,
 
-    /// 主列表当前的排序列 + 方向，点表头改；默认和构建时的排序规则一致
-    /// （按逻辑大小降序），不点表头的话行为和以前完全一样。
-    sort: SortState,
+    /// 主列表当前的排序列 + 方向 + 展开版本号 + 可见行缓存，点表头改；
+    /// 默认和构建时的排序规则一致（按逻辑大小降序），不点表头的话行为和以前完全一样。
+    list_state: tree_list::ListState,
 }
 
 impl Default for DiskUiApp {
@@ -82,7 +82,7 @@ impl Default for DiskUiApp {
             current_scan_path: None,
             picker: Some(startup::PickerState::new(drives)),
             show_all_details: true,
-            sort: SortState::default(),
+            list_state: tree_list::ListState::default(),
         }
     }
 }
@@ -168,12 +168,12 @@ impl DiskUiApp {
             .frame(egui::Frame::default().fill(Color32::from_rgb(0x24, 0x24, 0x28)).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| {
                 ui.add_enabled_ui(background_enabled, |ui| {
-                    match self.tabs.get(tab_idx) {
+                    match self.tabs.get_mut(tab_idx) {
                         Some(Tab::Main) | None => {
-                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details, &mut self.sort)
+                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details, &mut self.list_state)
                         }
-                        Some(Tab::Extensions { root, selected, .. }) | Some(Tab::Duplicates { root, selected, .. }) => {
-                            crate::ui::compact_tree::show(ui, root, selected)
+                        Some(Tab::Extensions { root, selected, view, .. }) | Some(Tab::Duplicates { root, selected, view, .. }) => {
+                            crate::ui::compact_tree::show(ui, root, selected, view)
                         }
                     }
                 }).inner
@@ -242,7 +242,7 @@ impl DiskUiApp {
         let root = categorize::build_extension_tree(node, &root_path);
         let title = node.name.clone();
         crate::applog::log(&format!("[app] 打开扩展名分类标签页: {title}（{} 种扩展名）", root.children.len()));
-        self.tabs.push(Tab::Extensions { partition_idx: pi, title, root, selected: None });
+        self.tabs.push(Tab::Extensions { partition_idx: pi, title, root, selected: None, view: crate::ui::compact_tree::ViewState::default() });
         self.active_tab = self.tabs.len() - 1;
     }
 
@@ -257,7 +257,7 @@ impl DiskUiApp {
         let root = categorize::build_duplicate_tree(node, &root_path);
         let title = node.name.clone();
         crate::applog::log(&format!("[app] 打开重复文件候选标签页: {title}（{} 组候选）", root.children.len()));
-        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None });
+        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None, view: crate::ui::compact_tree::ViewState::default() });
         self.active_tab = self.tabs.len() - 1;
     }
 
@@ -324,6 +324,9 @@ impl DiskUiApp {
                     self.partition_categories.push(categories);
                     self.partition_root_paths.push(path);
                     self.selected = None;
+                    // `partitions.push` 可能触发 Vec 扩容、所有元素搬家，主列表缓存里
+                    // 存的裸指针会跟着失效——版本号 +1 强制下一帧重新收集可见行。
+                    self.list_state.expand_version += 1;
                     finished = true;
                 }
                 ScanMessage::Error(e) => {
@@ -365,14 +368,16 @@ impl DiskUiApp {
             TreeAction::ToggleExpand(p) => {
                 if is_view_tab {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                        let (root, selected) = match tab {
-                            Tab::Extensions { root, selected, .. } | Tab::Duplicates { root, selected, .. } => (root, selected),
+                        let (root, selected, view) = match tab {
+                            Tab::Extensions { root, selected, view, .. } | Tab::Duplicates { root, selected, view, .. } => (root, selected, view),
                             Tab::Main => return,
                         };
                         // 合成树只有一个根（tree_list 里传的是单元素切片），abs_path[0] 恒为 0，
                         // 真正要用来定位/展开的是 p[1..]。
                         if p.len() == 1 { root.expanded = !root.expanded; } else { root.exclusive_toggle(&p[1..]); }
                         *selected = Some(p);
+                        // 展开状态变了，这个标签页缓存的可见行列表要重算。
+                        view.expand_version += 1;
                     }
                 } else {
                     if let Some(&pi) = p.first() {
@@ -380,6 +385,8 @@ impl DiskUiApp {
                             if p.len() == 1 { part.expanded = !part.expanded; } else { part.exclusive_toggle(&p[1..]); }
                         }
                     }
+                    // 展开状态变了，主列表缓存的可见行列表要重算。
+                    self.list_state.expand_version += 1;
                     self.selected = Some(p);
                 }
             }

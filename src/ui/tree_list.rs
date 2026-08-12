@@ -19,14 +19,54 @@ const ROW_H: f32 = 22.0;
 const DISK_ROW_H: f32 = 68.0;
 
 /// 扁平化的可见行。磁盘行 + 子行统一处理。
+#[derive(Clone)]
 enum RowKind {
     Disk { pi: usize },
     Child { pi: usize, node: *const Node, abs_path: NodePath, indent: f32, depth: u32, parent_logical: u64 },
 }
 
+#[derive(Clone)]
 struct FlatRow {
     height: f32,
     kind: RowKind,
+}
+
+/// 排序/展开状态 + 上一次算好的可见行缓存。
+///
+/// 背景：以前 children 是构建时排好序的（改一次、用到天荒地老），点表头排序后
+/// 变成"每帧都要现算"，而 `collect_rows` 本来就是每帧都会重新走一遍整棵树
+/// （因为要响应展开/折叠）。两者叠一起 = 每一帧、每一层可见节点都做一次
+/// `sort_by`，稍微大一点的目录/大量重复文件时这个开销肉眼可见（debug 构建下
+/// 尤其明显）。所以这里把算好的 `Vec<FlatRow>` 缓存起来，只有下面几种情况
+/// 真正变化了才重算：排序变了、展开状态变了（`expand_version`）、
+/// "显示全部信息"开关变了、或者分区数量/整个 `partitions` 数组的内存地址变了
+/// （后者用来兜底探测"扫描线程往 self.partitions 里 push 了新分区，Vec 扩容
+/// 导致所有元素搬家"这种会让缓存里的裸指针失效的情况——地址一变就强制重建，
+/// 不会有 use-after-free 风险）。
+///
+/// `expand_version` 由 app.rs 在真正修改 `partitions` 树结构/展开状态的两处
+/// （ToggleExpand 的处理分支、scan 完成 push 新分区）负责 +1；这里只管比较。
+#[derive(Default)]
+pub struct ListState {
+    pub sort: SortState,
+    pub expand_version: u64,
+    cache: Option<(CacheKey, Vec<FlatRow>)>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct CacheKey {
+    sort: SortState,
+    expand_version: u64,
+    show_all: bool,
+    partitions_len: usize,
+    partitions_ptr: usize,
+}
+
+/// 大小写不敏感比较，不分配新 String（`to_lowercase()` 每次比较都要堆分配一次，
+/// 排序是 O(n log n) 次比较，n 一大——比如上万个文件——每帧都这么分配一遍，
+/// 就是列表变卡的主因之一）。
+fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
 }
 
 /// 按当前排序状态给一层 children 排出显示顺序，返回的是 `children` 里的下标
@@ -41,7 +81,7 @@ fn sorted_child_order(children: &[Node], sort: SortState) -> Vec<usize> {
 
 fn compare_nodes(a: &Node, b: &Node, key: SortKey) -> std::cmp::Ordering {
     match key {
-        SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortKey::Name => cmp_ignore_ascii_case(&a.name, &b.name),
         SortKey::Size => a.logical_size.cmp(&b.logical_size),
         SortKey::Physical => a.physical_size.cmp(&b.physical_size),
         SortKey::Modified => a.modified_ft.cmp(&b.modified_ft),
@@ -53,7 +93,7 @@ fn compare_nodes(a: &Node, b: &Node, key: SortKey) -> std::cmp::Ordering {
         SortKey::Attributes => a.attributes.cmp(&b.attributes),
         SortKey::Reparse => a.reparse_tag.cmp(&b.reparse_tag),
         SortKey::Reserved => a.is_reserved.cmp(&b.is_reserved),
-        SortKey::Owner => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+        SortKey::Owner => cmp_ignore_ascii_case(&a.owner, &b.owner),
     }
 }
 
@@ -131,7 +171,7 @@ pub fn show(
     root_paths: &[String],
     selected: &Option<NodePath>,
     show_all: bool,
-    sort: &mut SortState,
+    state: &mut ListState,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
     // "关键列"始终保持正常宽度；非关键列在 show_all=false 时收缩到 0 宽度
@@ -171,9 +211,9 @@ pub fn show(
         let table = builder.header(ROW_H, |mut h| {
             for (label, key) in HEADER_COLS {
                 h.col(|ui| {
-                    let active = sort.key == key;
+                    let active = state.sort.key == key;
                     let arrow = if active {
-                        if sort.dir == SortDir::Asc { " ▲" } else { " ▼" }
+                        if state.sort.dir == SortDir::Asc { " ▲" } else { " ▼" }
                     } else { "" };
                     let color = if active { Color32::from_rgb(0xFF, 0xD7, 0x00) } else { Color32::WHITE };
                     let text = egui::RichText::new(format!("{label}{arrow}")).strong().size(12.0).color(color);
@@ -185,22 +225,39 @@ pub fn show(
             }
         });
         // 表头点击立刻生效（排序状态在渲染 body 之前就更新），不用等下一帧。
-        if let Some(key) = sort_clicked_cell.get() { sort.click(key); }
-        let sort = *sort;
+        if let Some(key) = sort_clicked_cell.get() { state.sort.click(key); }
+
+        // 只有排序/展开/显示全部信息/分区数组真的变了才重新扫一遍树、重新排序；
+        // 否则复用上一帧缓存的可见行列表，避免每一帧都对（可能很大的）子树做
+        // sort_by。`partitions.as_ptr()` 兜底探测扫描线程往 `partitions` push
+        // 新分区导致 Vec 扩容、所有元素搬家的情况——地址一变就强制重建，
+        // 缓存里存的裸指针绝不会指向已经失效的内存。
+        let cache_key = CacheKey {
+            sort: state.sort,
+            expand_version: state.expand_version,
+            show_all,
+            partitions_len: partitions.len(),
+            partitions_ptr: partitions.as_ptr() as usize,
+        };
+        let need_rebuild = state.cache.as_ref().map_or(true, |(k, _)| *k != cache_key);
+        if need_rebuild {
+            let mut flat_rows: Vec<FlatRow> = Vec::new();
+            let partition_order = sorted_child_order(partitions, state.sort);
+            for pi in partition_order {
+                let partition = &partitions[pi];
+                flat_rows.push(FlatRow { height: DISK_ROW_H, kind: RowKind::Disk { pi } });
+                if partition.expanded {
+                    let mut rel_path: NodePath = Vec::new();
+                    collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, state.sort, &mut flat_rows);
+                }
+            }
+            state.cache = Some((cache_key, flat_rows));
+        }
+        let flat_rows = &state.cache.as_ref().unwrap().1;
+
         table
             .body(|body| {
                 let mut final_action = TreeAction::None;
-                // ── 先收集所有可见行（磁盘行 + 子行） ──
-                let mut flat_rows: Vec<FlatRow> = Vec::new();
-                let partition_order = sorted_child_order(partitions, sort);
-                for pi in partition_order {
-                    let partition = &partitions[pi];
-                    flat_rows.push(FlatRow { height: DISK_ROW_H, kind: RowKind::Disk { pi } });
-                    if partition.expanded {
-                        let mut rel_path: NodePath = Vec::new();
-                        collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, sort, &mut flat_rows);
-                    }
-                }
 
                 // ── 用 heterogeneous_rows 做虚拟化渲染 ──
                 let heights: Vec<f32> = flat_rows.iter().map(|r| r.height).collect();
