@@ -14,3 +14,65 @@ pub enum TreeAction {
     #[allow(dead_code)]
     EnterNode(NodePath),
 }
+
+/// 主列表（tree_list）可排序的字段。父占比/总占比两列本质上和逻辑大小同序
+/// （同一层级内 parent_logical 相同，全树内 disk_logical 也相同），
+/// 所以这两列点击时都映射到 `Size`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Size,
+    Modified,
+    Physical,
+    Created,
+    Accessed,
+    Items,
+    Files,
+    Folders,
+    Attributes,
+    Reparse,
+    Reserved,
+    Owner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    fn toggled(self) -> Self {
+        match self {
+            SortDir::Asc => SortDir::Desc,
+            SortDir::Desc => SortDir::Asc,
+        }
+    }
+}
+
+/// 当前排序状态：排哪一列 + 升/降序。默认和原来"构建时排序"的规则一致
+/// （按逻辑大小降序），保证不带排序状态的旧行为不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortState {
+    pub key: SortKey,
+    pub dir: SortDir,
+}
+
+impl Default for SortState {
+    fn default() -> Self {
+        Self { key: SortKey::Size, dir: SortDir::Desc }
+    }
+}
+
+impl SortState {
+    /// 表头被点击：点同一列切换方向；点新列换到新列，默认降序
+    /// （体积/时间/数量类列一般更想先看"最大/最新"的，降序更符合直觉）。
+    pub fn click(&mut self, key: SortKey) {
+        if self.key == key {
+            self.dir = self.dir.toggled();
+        } else {
+            self.key = key;
+            self.dir = SortDir::Desc;
+        }
+    }
+}

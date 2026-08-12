@@ -13,7 +13,7 @@ use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use crate::disk_info::DiskInfo;
 use crate::format::{format_attributes, format_filetime_local as format_filetime, human_size, human_size_compact};
 use crate::model::{Node, NodePath};
-use super::TreeAction;
+use super::{SortDir, SortKey, SortState, TreeAction};
 
 const ROW_H: f32 = 22.0;
 const DISK_ROW_H: f32 = 68.0;
@@ -29,22 +29,71 @@ struct FlatRow {
     kind: RowKind,
 }
 
-/// 收集子行（含所有已展开的更深层级）。children 已在构建时排序。
+/// 按当前排序状态给一层 children 排出显示顺序，返回的是 `children` 里的下标
+/// （不改变 children 本身的存储顺序——那是 abs_path 依赖的"真实"下标，
+/// 排序只影响遍历/显示时按什么顺序走这些下标）。
+fn sorted_child_order(children: &[Node], sort: SortState) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..children.len()).collect();
+    order.sort_by(|&a, &b| compare_nodes(&children[a], &children[b], sort.key));
+    if sort.dir == SortDir::Desc { order.reverse(); }
+    order
+}
+
+fn compare_nodes(a: &Node, b: &Node, key: SortKey) -> std::cmp::Ordering {
+    match key {
+        SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortKey::Size => a.logical_size.cmp(&b.logical_size),
+        SortKey::Physical => a.physical_size.cmp(&b.physical_size),
+        SortKey::Modified => a.modified_ft.cmp(&b.modified_ft),
+        SortKey::Created => a.created_ft.cmp(&b.created_ft),
+        SortKey::Accessed => a.accessed_ft.cmp(&b.accessed_ft),
+        SortKey::Items => (a.file_count + a.folder_count).cmp(&(b.file_count + b.folder_count)),
+        SortKey::Files => a.file_count.cmp(&b.file_count),
+        SortKey::Folders => a.folder_count.cmp(&b.folder_count),
+        SortKey::Attributes => a.attributes.cmp(&b.attributes),
+        SortKey::Reparse => a.reparse_tag.cmp(&b.reparse_tag),
+        SortKey::Reserved => a.is_reserved.cmp(&b.is_reserved),
+        SortKey::Owner => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+    }
+}
+
+/// 表头文字对应的排序键：父占比/总占比两列本质上和逻辑大小同序，都映射到 `Size`。
+const HEADER_COLS: [(&str, SortKey); 15] = [
+    ("名称", SortKey::Name),
+    ("父占比", SortKey::Size),
+    ("总占比", SortKey::Size),
+    ("逻辑大小", SortKey::Size),
+    ("修改时间", SortKey::Modified),
+    ("物理大小", SortKey::Physical),
+    ("创建时间", SortKey::Created),
+    ("访问时间", SortKey::Accessed),
+    ("项目", SortKey::Items),
+    ("文件", SortKey::Files),
+    ("文件夹", SortKey::Folders),
+    ("属性", SortKey::Attributes),
+    ("重解析点", SortKey::Reparse),
+    ("保留", SortKey::Reserved),
+    ("所有者", SortKey::Owner),
+];
+
+/// 收集子行（含所有已展开的更深层级）。每一层按 `sort` 现算显示顺序
+/// （不改变 `node.children` 的实际存储顺序，abs_path 里存的还是真实下标）。
 /// `show_reserved`：为 false 时跳过 NTFS 保留的元数据文件（is_reserved，如 $MFT/$LogFile），
 /// 对应"视图 > 显示全部信息"关闭的情况。
 /// 迭代版本：用显式栈代替原生递归，栈里存"待处理节点 + 它的相对路径/深度/父 logical_size"，
-/// 子节点按倒序入栈，保证出栈顺序（先序、从左到右）和原来的递归版完全一致。
+/// 子节点按倒序入栈，保证出栈顺序（先序、从左到右）和排好的显示顺序完全一致。
 fn collect_rows(
     node: &Node, pi: usize, rel_path: &mut Vec<usize>, depth: u32,
-    parent_logical: u64, show_reserved: bool, rows: &mut Vec<FlatRow>,
+    parent_logical: u64, show_reserved: bool, sort: SortState, rows: &mut Vec<FlatRow>,
 ) {
     struct Item<'a> { node: &'a Node, rel_path: Vec<usize>, depth: u32, parent_logical: u64 }
-    let mut stack: Vec<Item> = node.children.iter().enumerate().rev()
-        .filter(|(_, c)| show_reserved || !c.is_reserved)
-        .map(|(i, child)| {
+    let order = sorted_child_order(&node.children, sort);
+    let mut stack: Vec<Item> = order.into_iter().rev()
+        .filter(|&i| show_reserved || !node.children[i].is_reserved)
+        .map(|i| {
             let mut rp = rel_path.clone();
             rp.push(i);
-            Item { node: child, rel_path: rp, depth, parent_logical }
+            Item { node: &node.children[i], rel_path: rp, depth, parent_logical }
         }).collect();
     while let Some(item) = stack.pop() {
         let mut abs_path = vec![pi];
@@ -63,12 +112,13 @@ fn collect_rows(
         });
         if item.node.is_folder() && item.node.expanded {
             let child_parent_logical = item.node.logical_size.max(1);
-            for (i, gc) in item.node.children.iter().enumerate().rev()
-                .filter(|(_, c)| show_reserved || !c.is_reserved)
+            let child_order = sorted_child_order(&item.node.children, sort);
+            for i in child_order.into_iter().rev()
+                .filter(|&i| show_reserved || !item.node.children[i].is_reserved)
             {
                 let mut rp = item.rel_path.clone();
                 rp.push(i);
-                stack.push(Item { node: gc, rel_path: rp, depth: item.depth + 1, parent_logical: child_parent_logical });
+                stack.push(Item { node: &item.node.children[i], rel_path: rp, depth: item.depth + 1, parent_logical: child_parent_logical });
             }
         }
     }
@@ -81,6 +131,7 @@ pub fn show(
     root_paths: &[String],
     selected: &Option<NodePath>,
     show_all: bool,
+    sort: &mut SortState,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
     // "关键列"始终保持正常宽度；非关键列在 show_all=false 时收缩到 0 宽度
@@ -116,21 +167,38 @@ pub fn show(
             .column(egui_extras::Column::initial(extra_w(80.0)).clip(true).resizable(show_all).at_least(0.0)); // 所有者
 
         builder = builder.sense(egui::Sense::click());
-        builder
-            .header(ROW_H, |mut h| {
-                let cols = ["名称", "父占比", "总占比", "逻辑大小", "修改时间", "物理大小",
-                    "创建时间", "访问时间", "项目", "文件", "文件夹", "属性", "重解析点", "保留", "所有者"];
-                for c in cols { h.col(|ui| { ui.label(egui::RichText::new(c).strong().size(12.0).color(Color32::WHITE)); }); }
-            })
+        let sort_clicked_cell: Cell<Option<SortKey>> = Cell::new(None);
+        let table = builder.header(ROW_H, |mut h| {
+            for (label, key) in HEADER_COLS {
+                h.col(|ui| {
+                    let active = sort.key == key;
+                    let arrow = if active {
+                        if sort.dir == SortDir::Asc { " ▲" } else { " ▼" }
+                    } else { "" };
+                    let color = if active { Color32::from_rgb(0xFF, 0xD7, 0x00) } else { Color32::WHITE };
+                    let text = egui::RichText::new(format!("{label}{arrow}")).strong().size(12.0).color(color);
+                    let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
+                    let resp = resp.on_hover_text("点击排序，再次点击切换升/降序");
+                    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                    if resp.clicked() { sort_clicked_cell.set(Some(key)); }
+                });
+            }
+        });
+        // 表头点击立刻生效（排序状态在渲染 body 之前就更新），不用等下一帧。
+        if let Some(key) = sort_clicked_cell.get() { sort.click(key); }
+        let sort = *sort;
+        table
             .body(|body| {
                 let mut final_action = TreeAction::None;
                 // ── 先收集所有可见行（磁盘行 + 子行） ──
                 let mut flat_rows: Vec<FlatRow> = Vec::new();
-                for (pi, partition) in partitions.iter().enumerate() {
+                let partition_order = sorted_child_order(partitions, sort);
+                for pi in partition_order {
+                    let partition = &partitions[pi];
                     flat_rows.push(FlatRow { height: DISK_ROW_H, kind: RowKind::Disk { pi } });
                     if partition.expanded {
                         let mut rel_path: NodePath = Vec::new();
-                        collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, &mut flat_rows);
+                        collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, sort, &mut flat_rows);
                     }
                 }
 

@@ -16,7 +16,7 @@ use crate::export;
 use crate::model::{CategoryStat, Node, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
-use crate::ui::{sidebar, startup, tree_list, TreeAction};
+use crate::ui::{sidebar, startup, tree_list, SortState, TreeAction};
 
 /// 主区域的一个标签页。"主列表"永远是第一个、不能关闭；
 /// 扩展名分类/重复文件查找是按需打开的，数据（合成树）在打开的那一刻算一次，存在标签页里。
@@ -57,6 +57,10 @@ pub struct DiskUiApp {
 
     /// 视图 > 显示全部信息：开=全部列 + 元数据文件；关=只留关键列、隐藏元数据文件。
     show_all_details: bool,
+
+    /// 主列表当前的排序列 + 方向，点表头改；默认和构建时的排序规则一致
+    /// （按逻辑大小降序），不点表头的话行为和以前完全一样。
+    sort: SortState,
 }
 
 impl Default for DiskUiApp {
@@ -78,6 +82,7 @@ impl Default for DiskUiApp {
             current_scan_path: None,
             picker: Some(startup::PickerState::new(drives)),
             show_all_details: true,
+            sort: SortState::default(),
         }
     }
 }
@@ -165,7 +170,7 @@ impl DiskUiApp {
                 ui.add_enabled_ui(background_enabled, |ui| {
                     match self.tabs.get(tab_idx) {
                         Some(Tab::Main) | None => {
-                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details)
+                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details, &mut self.sort)
                         }
                         Some(Tab::Extensions { root, selected, .. }) | Some(Tab::Duplicates { root, selected, .. }) => {
                             crate::ui::compact_tree::show(ui, root, selected)
