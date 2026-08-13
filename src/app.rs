@@ -23,8 +23,35 @@ use crate::ui::{sidebar, startup, tree_list, TreeAction};
 /// 每个分析标签页有自己独立的 `selected`（展开/选中状态），不会和主列表互相干扰。
 enum Tab {
     Main,
-    Extensions { partition_idx: usize, title: String, root: Node, selected: Option<NodePath> },
-    Duplicates { partition_idx: usize, title: String, root: Node, selected: Option<NodePath> },
+    Extensions { partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState },
+    Duplicates { partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState },
+}
+
+/// 右键菜单点了"删除到回收站"之后、用户在确认框里点"确定"之前的中间状态。
+/// 单独存一份 name/full_path/is_folder（而不是等确认时再重新沿 abs_path 走一遍树）是
+/// 因为确认框要立刻展示这些信息，且这段时间里树本身理论上可能变（虽然当前 UI 下
+/// 用户点了确认框就基本被这个模态挡住了，操作不了别的，但直接存一份更稳妥、也省事）。
+///
+/// `source` 记的是这个删除请求是从哪棵树发起的：主列表（`self.partitions`）还是
+/// 某个分析标签页自己的合成树（`Tab::Extensions`/`Tab::Duplicates` 里的 `root`）。
+/// 这两棵树的节点是各自独立的 `Node` 拷贝（`categorize.rs` 建合成树时是克隆的，
+/// 不是共享引用），所以"从哪棵树来的就摘哪棵树"，不能用同一份 abs_path 去两边都摘——
+/// 下标含义完全不是一回事。已知的权衡：如果同一个文件在主列表和某个分析标签页里
+/// 都能看到，从分析标签页删除后，主列表那边在下次重新扫描之前还会显示这个已经不存在
+/// 的文件（磁盘上已经真删了，只是内存里那棵没同步更新）——分析标签页本来就是"打开那一刻
+/// 拍的快照"，这个限制和它本来的语义是一致的。
+struct PendingDelete {
+    source: DeleteSource,
+    abs_path: NodePath,
+    name: String,
+    full_path: String,
+    is_folder: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DeleteSource {
+    Main,
+    Tab(usize),
 }
 
 pub struct DiskUiApp {
@@ -57,6 +84,14 @@ pub struct DiskUiApp {
 
     /// 视图 > 显示全部信息：开=全部列 + 元数据文件；关=只留关键列、隐藏元数据文件。
     show_all_details: bool,
+
+    /// 主列表当前的排序列 + 方向 + 展开版本号 + 可见行缓存，点表头改；
+    /// 默认和构建时的排序规则一致（按逻辑大小降序），不点表头的话行为和以前完全一样。
+    list_state: tree_list::ListState,
+
+    /// 右键菜单"删除到回收站"点了之后、确认框点"确定"/"取消"之前的等待状态；
+    /// `None` 时不显示确认框。
+    pending_delete: Option<PendingDelete>,
 }
 
 impl Default for DiskUiApp {
@@ -78,6 +113,8 @@ impl Default for DiskUiApp {
             current_scan_path: None,
             picker: Some(startup::PickerState::new(drives)),
             show_all_details: true,
+            list_state: tree_list::ListState::default(),
+            pending_delete: None,
         }
     }
 }
@@ -90,6 +127,9 @@ impl eframe::App for DiskUiApp {
         self.show_main_screen(ui);
         if self.picker.is_some() {
             self.show_picker_modal(ui.ctx());
+        }
+        if self.pending_delete.is_some() {
+            self.show_delete_confirm_modal(ui.ctx());
         }
 
         // 扫描中：进度数字和转圈动画要持续刷新，这时候需要强制重绘。
@@ -163,12 +203,12 @@ impl DiskUiApp {
             .frame(egui::Frame::default().fill(Color32::from_rgb(0x24, 0x24, 0x28)).inner_margin(egui::Margin::same(4)))
             .show(ui, |ui| {
                 ui.add_enabled_ui(background_enabled, |ui| {
-                    match self.tabs.get(tab_idx) {
+                    match self.tabs.get_mut(tab_idx) {
                         Some(Tab::Main) | None => {
-                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details)
+                            tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details, &mut self.list_state)
                         }
-                        Some(Tab::Extensions { root, selected, .. }) | Some(Tab::Duplicates { root, selected, .. }) => {
-                            crate::ui::compact_tree::show(ui, root, selected)
+                        Some(Tab::Extensions { root, selected, view, .. }) | Some(Tab::Duplicates { root, selected, view, .. }) => {
+                            crate::ui::compact_tree::show(ui, root, selected, view)
                         }
                     }
                 }).inner
@@ -237,7 +277,7 @@ impl DiskUiApp {
         let root = categorize::build_extension_tree(node, &root_path);
         let title = node.name.clone();
         crate::applog::log(&format!("[app] 打开扩展名分类标签页: {title}（{} 种扩展名）", root.children.len()));
-        self.tabs.push(Tab::Extensions { partition_idx: pi, title, root, selected: None });
+        self.tabs.push(Tab::Extensions { partition_idx: pi, title, root, selected: None, view: crate::ui::compact_tree::ViewState::default() });
         self.active_tab = self.tabs.len() - 1;
     }
 
@@ -252,7 +292,7 @@ impl DiskUiApp {
         let root = categorize::build_duplicate_tree(node, &root_path);
         let title = node.name.clone();
         crate::applog::log(&format!("[app] 打开重复文件候选标签页: {title}（{} 组候选）", root.children.len()));
-        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None });
+        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None, view: crate::ui::compact_tree::ViewState::default() });
         self.active_tab = self.tabs.len() - 1;
     }
 
@@ -319,6 +359,9 @@ impl DiskUiApp {
                     self.partition_categories.push(categories);
                     self.partition_root_paths.push(path);
                     self.selected = None;
+                    // `partitions.push` 可能触发 Vec 扩容、所有元素搬家，主列表缓存里
+                    // 存的裸指针会跟着失效——版本号 +1 强制下一帧重新收集可见行。
+                    self.list_state.expand_version += 1;
                     finished = true;
                 }
                 ScanMessage::Error(e) => {
@@ -360,14 +403,16 @@ impl DiskUiApp {
             TreeAction::ToggleExpand(p) => {
                 if is_view_tab {
                     if let Some(tab) = self.tabs.get_mut(tab_idx) {
-                        let (root, selected) = match tab {
-                            Tab::Extensions { root, selected, .. } | Tab::Duplicates { root, selected, .. } => (root, selected),
+                        let (root, selected, view) = match tab {
+                            Tab::Extensions { root, selected, view, .. } | Tab::Duplicates { root, selected, view, .. } => (root, selected, view),
                             Tab::Main => return,
                         };
                         // 合成树只有一个根（tree_list 里传的是单元素切片），abs_path[0] 恒为 0，
                         // 真正要用来定位/展开的是 p[1..]。
                         if p.len() == 1 { root.expanded = !root.expanded; } else { root.exclusive_toggle(&p[1..]); }
                         *selected = Some(p);
+                        // 展开状态变了，这个标签页缓存的可见行列表要重算。
+                        view.expand_version += 1;
                     }
                 } else {
                     if let Some(&pi) = p.first() {
@@ -375,8 +420,104 @@ impl DiskUiApp {
                             if p.len() == 1 { part.expanded = !part.expanded; } else { part.exclusive_toggle(&p[1..]); }
                         }
                     }
+                    // 展开状态变了，主列表缓存的可见行列表要重算。
+                    self.list_state.expand_version += 1;
                     self.selected = Some(p);
                 }
+            }
+            TreeAction::RequestDelete { abs_path, name, full_path, is_folder } => {
+                // 只是记下来，真正删除要等用户在确认框里点"确定"——见 show_delete_confirm_modal。
+                // is_view_tab 已经在函数开头算好了：决定这个 abs_path 应该去哪棵树上摘。
+                let source = if is_view_tab { DeleteSource::Tab(tab_idx) } else { DeleteSource::Main };
+                self.pending_delete = Some(PendingDelete { source, abs_path, name, full_path, is_folder });
+            }
+        }
+    }
+
+    /// "删除到回收站"确认框：点右键菜单只是记了个 `pending_delete`，这里才是用户
+    /// 点"确定"之后真正调用 Win32 API 的地方。
+    fn show_delete_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_delete else { return };
+        let kind = if pending.is_folder { "文件夹" } else { "文件" };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("确认删除")
+            .id(egui::Id::new("delete_confirm_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(format!("确定要把这个{kind}删除到回收站吗？"));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&pending.name).strong());
+                ui.label(egui::RichText::new(&pending.full_path).small().color(egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+                if pending.is_folder {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("文件夹里的所有内容都会一起被删除。").small().color(egui::Color32::from_rgb(0xF5, 0xA6, 0x23)));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() { cancel = true; }
+                    if ui.add(egui::Button::new(egui::RichText::new("删除到回收站").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(0xC0, 0x40, 0x40))).clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+            });
+        if cancel {
+            self.pending_delete = None;
+        } else if confirm {
+            self.execute_pending_delete();
+        }
+    }
+
+    fn execute_pending_delete(&mut self) {
+        let Some(pending) = self.pending_delete.take() else { return };
+        match crate::file_ops::delete_to_recycle_bin(&pending.full_path) {
+            Ok(()) => {
+                match pending.source {
+                    DeleteSource::Main => {
+                        // 从内存里的树上把这一项摘掉（同时更新沿途所有祖先的聚合统计），
+                        // 不用为了这一个文件重新扫一遍整个分区。abs_path 至少是
+                        // [分区下标, 子节点下标, ...]——右键菜单的"删除"目前只挂在文件/
+                        // 文件夹行上，不挂在磁盘/根目录行上，所以这里长度必然 >= 2；
+                        // 如果哪天误传了长度 1 的路径，宁可什么都不做也不去动
+                        // partitions/partition_infos/partition_categories/partition_root_paths
+                        // 这几个下标必须一一对应的并行数组——只删 partitions 一个会把它们全错位。
+                        if pending.abs_path.len() >= 2 {
+                            if let Some(&pi) = pending.abs_path.first() {
+                                if let Some(part) = self.partitions.get_mut(pi) {
+                                    part.remove_at_path(&pending.abs_path[1..]);
+                                }
+                            }
+                        }
+                        if self.selected.as_ref() == Some(&pending.abs_path) { self.selected = None; }
+                        // 树结构变了（对应节点及其祖先的聚合统计都变了），主列表缓存要重算。
+                        self.list_state.expand_version += 1;
+                    }
+                    DeleteSource::Tab(tab_idx) => {
+                        // 同样的道理，只是摘的是这个标签页自己的合成树，不是 self.partitions。
+                        // 如果这时候标签页已经不在了、或者被切换成了别的类型（用户在弹窗
+                        // 打开期间关掉了那个标签页——理论上够不着，因为确认框是模态的，
+                        // 但防御一下总没坏处），就什么都不做，不去动任何数据。
+                        let Some(tab) = self.tabs.get_mut(tab_idx) else { return };
+                        let (root, selected, view) = match tab {
+                            Tab::Extensions { root, selected, view, .. } | Tab::Duplicates { root, selected, view, .. } => (root, selected, view),
+                            Tab::Main => return,
+                        };
+                        if pending.abs_path.len() >= 2 {
+                            root.remove_at_path(&pending.abs_path[1..]);
+                        }
+                        if selected.as_ref() == Some(&pending.abs_path) { *selected = None; }
+                        view.expand_version += 1;
+                    }
+                }
+                self.scan_error = Some(format!("已删除到回收站: {}", pending.name));
+            }
+            Err(e) => {
+                self.scan_error = Some(format!("删除失败 ({}): {e}", pending.name));
             }
         }
     }

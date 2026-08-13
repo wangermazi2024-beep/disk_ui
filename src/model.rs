@@ -209,6 +209,29 @@ impl Node {
         }
     }
 
+    /// 沿 `path` 找到目标节点并从其父节点的 `children` 里移除，同时把它的体积/
+    /// 文件数/文件夹数从沿途所有祖先节点的聚合统计里减掉（`file_count`/`folder_count`/
+    /// `logical_size`/`physical_size` 都是"整棵子树的合计"，删掉一个节点必须让
+    /// 所有祖先跟着更新，不然主列表显示的父目录大小会变成"删除前的旧值"）。
+    /// 用于"删除到回收站"成功之后，把这一项从内存里的树上摘掉，不用重新扫描整个分区。
+    pub fn remove_at_path(&mut self, path: &[usize]) -> Option<Node> {
+        let &idx = path.first()?;
+        let removed = if path.len() == 1 {
+            if idx >= self.children.len() { return None; }
+            self.children.remove(idx)
+        } else {
+            self.children.get_mut(idx)?.remove_at_path(&path[1..])?
+        };
+        self.logical_size = self.logical_size.saturating_sub(removed.logical_size);
+        self.size = self.logical_size;
+        self.physical_size = self.physical_size.saturating_sub(removed.physical_size);
+        let removed_files = removed.file_count + if removed.is_file() { 1 } else { 0 };
+        let removed_folders = removed.folder_count + if removed.is_folder() { 1 } else { 0 };
+        self.file_count = self.file_count.saturating_sub(removed_files);
+        self.folder_count = self.folder_count.saturating_sub(removed_folders);
+        Some(removed)
+    }
+
     pub fn exclusive_toggle(&mut self, path: &[usize]) -> bool {
         if path.is_empty() {
             return false;

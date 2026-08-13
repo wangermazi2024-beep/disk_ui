@@ -7,6 +7,7 @@ pub mod categorize;
 pub mod dir_enum;
 pub mod disk_info;
 pub mod export;
+pub mod file_ops;
 pub mod format;
 pub mod model;
 #[cfg(windows)]

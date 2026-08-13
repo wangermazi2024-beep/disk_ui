@@ -1,6 +1,6 @@
 //! DiskForge WMS 入口。
 
-pub use disk_ui::{applog, categorize, disk_info, export, format, model, scan};
+pub use disk_ui::{applog, categorize, disk_info, export, file_ops, format, model, scan};
 #[cfg(windows)]
 pub use disk_ui::mft_scan;
 
