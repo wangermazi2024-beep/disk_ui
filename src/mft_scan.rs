@@ -50,6 +50,9 @@ use crate::model::Node;
 
 /// NTFS 根目录的 MFT 记录号固定是 5。
 const NTFS_ROOT_RECORD: u64 = 5;
+/// build_tree 的防御性深度上限，见那里的注释——正常文件系统不可能触发，
+/// 只有 parent_to_children 里出现环（损坏卷等异常数据）才会碰到。
+const MAX_TREE_DEPTH: usize = 100_000;
 /// record < 16 是 NTFS 保留系统文件（$MFT/$LogFile/$Bitmap 等）。
 const NTFS_RESERVED_MAX: u64 = 16;
 
@@ -57,6 +60,8 @@ const NTFS_RESERVED_MAX: u64 = 16;
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
+// 目前建树/取属性用不到 $INDEX_ALLOCATION（目录索引，不影响我们关心的大小/时间/属性），
+// 保留常量只是为了把 NTFS 属性类型表写完整，方便以后要读目录索引结构时直接用，不是半成品。
 #[allow(dead_code)]
 const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_REPARSE_POINT: u32 = 0xC0;
@@ -66,10 +71,16 @@ const ATTR_END: u32 = 0xFFFF_FFFF;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+// 判断"是不是重解析点"目前是靠 reparse_tag != 0 这个更直接的信号，没有另外去读这个属性位；
+// 保留常量是为了让 FILE_ATTRIBUTE_* 这张表本身是完整的，以后要单独判断这一位时能直接用。
 #[allow(dead_code)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
-/// IO_REPARSE_TAG_*（部分）
+/// IO_REPARSE_TAG_*（部分）。目前代码里只识别 IO_REPARSE_TAG_WOF（Windows 压缩文件系统，
+/// 用来判断压缩标记）；MOUNT_POINT（挂载点/连接点）和 SYMLINK（符号链接）这两个常量先列在
+/// 这里备用——常规扫描那边已经用"是不是目录重解析点"这个更粗的判断跳过了 junction/symlink
+/// 不递归，暂时不需要区分"具体是哪种重解析点"，等以后要在 UI 上区分"这是连接点"还是
+/// "这是符号链接"的时候直接能用，不用再去查一遍常量值。
 #[allow(dead_code)]
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
 #[allow(dead_code)]
@@ -112,6 +123,12 @@ pub struct NtfsContext {
     pub parent_to_children: HashMap<u64, Vec<FileRecordName>>,
     pub bytes_per_cluster: u32,
     pub bytes_per_record: u32,
+    /// USA fixup 要按"每个物理扇区最后 2 字节"来做校验/回填，绝大多数 NTFS 卷是 512 字节
+    /// 扇区（哪怕是 4Kn 硬盘，出厂通常也会做 512e 兼容），但原生 4K 扇区（4Kn，非 512e）的盘
+    /// 确实存在，写死 512 会导致这类盘上 fixup 校验位置全错，记录被误判"fixup 失败"而整条
+    /// 丢弃（扫描结果悄悄漏文件，不报错，是最不容易发现的一类 bug）。这个字段就是从
+    /// FSCTL_GET_NTFS_VOLUME_DATA 真实查到的 BytesPerSector，不是编的。
+    pub bytes_per_sector: u32,
 }
 
 pub fn is_elevated() -> bool {
@@ -359,9 +376,13 @@ fn load_volume(
         )));
     }
     let bytes_per_record = vol_info.BytesPerFileRecordSegment.max(1024);
+    // USA fixup 用的真实扇区大小：绝大多数是 512，但原生 4K 扇区（4Kn）的盘不是，
+    // 写死 512 在那种盘上会让每条 MFT 记录的 fixup 校验都失败、记录被静默丢弃。
+    // 0 是不应该出现的异常值，兜底回退到 512（历史上几乎所有 NTFS 卷的实际值）。
+    let bytes_per_sector = if vol_info.BytesPerSector > 0 { vol_info.BytesPerSector } else { 512 };
     crate::dlog!(
-        "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerFileRecordSegment={}, MftStartLcn={}, MftValidDataLength={}",
-        bytes_per_cluster, bytes_per_record, vol_info.MftStartLcn, vol_info.MftValidDataLength
+        "[mft_scan] 卷信息: BytesPerCluster={}, BytesPerFileRecordSegment={}, BytesPerSector={}, MftStartLcn={}, MftValidDataLength={}",
+        bytes_per_cluster, bytes_per_record, bytes_per_sector, vol_info.MftStartLcn, vol_info.MftValidDataLength
     );
 
     // 拿 MFT 的 retrieval pointers（打开 $MFT::$DATA 用 FILE_READ_ATTRIBUTES）
@@ -440,6 +461,7 @@ fn load_volume(
         parent_to_children: HashMap::new(),
         bytes_per_cluster,
         bytes_per_record,
+        bytes_per_sector,
     };
 
     let cluster_size = bytes_per_cluster as u64;
@@ -549,13 +571,16 @@ fn process_record(rec: &mut [u8], current_record: u64, ctx: &mut NtfsContext) {
         current_record
     };
 
-    // USA fixup
+    // USA fixup：每个"物理扇区"最后 2 字节要用 Update Sequence Array 里存的原始值校验、
+    // 再回填真实数据。扇区大小从卷信息里真实查到的 bytes_per_sector 来，不是写死 512——
+    // 绝大多数 NTFS 卷确实是 512（4Kn 硬盘出厂通常也做 512e 兼容），但原生 4K 扇区的盘
+    // 写死 512 会让这里的校验位置全部算错，导致记录被误判"fixup 失败"而整条丢弃。
     if usa_count > 0 {
-        let _sector_words = 256usize; // 512/2
-        if usa_offset + usa_count * 2 <= rec.len() {
+        let sector_size = ctx.bytes_per_sector as usize;
+        if sector_size >= 2 && usa_offset + usa_count * 2 <= rec.len() {
             let usn = [rec[usa_offset], rec[usa_offset + 1]];
             for i in 1..usa_count {
-                let sector_end = i * 512; // 每扇区最后 2 字节
+                let sector_end = i * sector_size; // 每扇区最后 2 字节
                 if sector_end > rec.len() {
                     break;
                 }
@@ -820,6 +845,15 @@ fn build_tree(
             let cn = &children[top.next_child_idx];
             top.next_child_idx += 1;
             let child_depth = top.depth + 1; // 先取出来，避免下面 stack.push(...) 里还借用着 top
+            if child_depth > MAX_TREE_DEPTH {
+                // 正常文件系统不可能嵌套这么深；这只会在 parent_to_children 里出现环（损坏卷/
+                // 并发写入导致的中间不一致状态/极端异常数据）时触发——不做这个拦截的话，
+                // 下面会不停地把新 Frame 压栈，内存无限增长直到进程被系统杀掉。
+                // 触发这个分支说明数据本身有问题，跳过继续往下挂，把这一支当成到此为止。
+                crate::dlog!("[mft_scan] 目录深度超过 {MAX_TREE_DEPTH} 层，可能是 parent_to_children 里有环（数据异常），提前截断: record={}", cn.base_record);
+                top.next_child_idx = children.len(); // 直接跳过这个目录剩下的子项，避免刷屏
+                continue;
+            }
             let (c_is_dir, c_logical, c_physical, c_mod, c_created, c_accessed, c_attrs, c_reparse) =
                 record_meta(ctx, cn.base_record);
             let c_is_reserved = cn.base_record < NTFS_RESERVED_MAX;

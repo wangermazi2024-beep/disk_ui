@@ -74,9 +74,12 @@ fn drive_letter_of(path: &Path) -> Option<char> {
 
 pub fn spawn_scan(root: PathBuf, tx: Sender<ScanMessage>) {
     let err_tx = tx.clone();
-    let builder = std::thread::Builder::new()
-        .name("diskforge-scan".into())
-        .stack_size(64 * 1024 * 1024); // 64MB：给 MFT 树构建的原生递归留足深度余量，见下方说明
+    // 不再手动设置大栈：早期版本这里有 64MB 是为了兜底"MFT 树构建的原生递归"，
+    // 但 build_tree/populate_owners/常规遍历现在全部是迭代实现（显式栈/工作队列），
+    // 整个项目已经没有任何一处目录深度相关的原生递归了（这个之前专门扫过一遍确认过），
+    // 继续留着这个大栈纯粹是每次扫描都多占 64MB 虚拟内存却用不上，而且容易让后来的人
+    // 看着注释以为还有递归路径存在。用线程默认栈大小就够。
+    let builder = std::thread::Builder::new().name("diskforge-scan".into());
     let spawn_result = builder.spawn(move || {
         let panic_tx = tx.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
