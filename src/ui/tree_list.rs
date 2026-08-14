@@ -530,6 +530,12 @@ fn context_menu(
         crate::file_ops::open_properties(full_path);
         ui.close();
     }
+    // 去重/迁移到其他盘：尚未实现，先占个位置。只用符号链接一种机制（硬链接/
+    // junction 权衡后特意排除，理由见 file_ops.rs 顶部那段大注释）——按钮先
+    // 摆在这，免得以后要改右键菜单的排版。
+    ui.add_enabled_ui(false, |ui| {
+        let _ = ui.button("🔗 创建符号链接 / 迁移到其他盘（开发中）");
+    });
     // "删除"只在这里发个请求（红色强调，提醒这是破坏性操作），真正执行前
     // app.rs 会弹一个确认框——回收站虽然能找回，但"点错就没了"这种事故
     // 不该一次点击就直接生效。

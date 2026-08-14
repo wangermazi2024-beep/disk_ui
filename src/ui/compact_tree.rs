@@ -374,7 +374,11 @@ fn context_menu(ui: &mut egui::Ui, name: &str, full_path: &str, abs_path: &NodeP
         ui.close();
     }
     ui.separator();
+    // 去重/迁移到其他盘：尚未实现，先占个位置。这个按钮在"重复文件查找"标签页
+    // 里最贴场景——右键点的很可能就是一堆重复文件里的一份，将来接上之后统一
+    // 用符号链接（保留一份、其余位置删除后指向它），不区分同盘/跨盘走不同
+    // 机制，理由见 file_ops.rs 顶部那段大注释，这里先别管细节，只占位置。
     ui.add_enabled_ui(false, |ui| {
-        let _ = ui.button("🔗 创建符号链接（开发中）");
+        let _ = ui.button("🔗 创建符号链接 / 迁移到其他盘（开发中）");
     });
 }
