@@ -76,21 +76,36 @@ pub fn build_extension_tree(root: &Node, root_path: &str) -> Node {
     Node::new_folder_with_meta("按扩展名分类".to_string(), GROUP_COLOR, ext_folders, 0, 0, 0, 0x10, 0, false, String::new())
 }
 
-/// 按文件大小分组找候选重复文件，同样建一棵合成树（每组一个虚拟文件夹）。
-/// 只按大小分组，不读文件内容比对——大小相同不代表内容一定相同，
-/// 文件夹名字里会写"候选"，界面上也会有提示，不会让人误以为是确认过的重复文件。
+/// 按文件大小分组、再用内容哈希确认，找出真正内容相同的重复文件，建一棵合成树
+/// （每组一个虚拟文件夹）。具体的"内容比对"逻辑在 `dedup.rs`——那边有详细注释
+/// 说明为什么不能只按大小分组（大小相同不代表内容相同）、两阶段哈希（局部预筛
+/// + 全文件确认）是怎么工作的，这边只管调用、把结果拼成 UI 要的 `Node` 树。
+///
+/// 即便走完这套内容哈希流程，文件夹名字里依然写"疑似"——理论上仍有极小概率的
+/// 哈希碰撞（`dedup.rs` 里有具体说明），界面上不应该让人误以为这是"绝对保证
+/// 相同"的确认结果；真正要执行删除/建符号链接这类不可逆操作之前，还需要再加
+/// 一道逐字节比较的保险（这一步留给以后接符号链接功能的时候做，`dedup.rs`
+/// 顶部的注释里也提了这一点）。
+///
 /// 按"潜在可省空间"（size × (count-1)）从大到小排序，最值得关注的排前面。
 pub fn build_duplicate_tree(root: &Node, root_path: &str) -> Node {
     use std::collections::HashMap;
-    let mut groups: HashMap<u64, Vec<Node>> = HashMap::new();
+
+    // 阶段一：按大小分组（和以前一样，免费的第一轮筛选，大小都不同直接排除）。
+    let mut by_size: HashMap<u64, Vec<(Node, String)>> = HashMap::new();
     let mut stack: Vec<(&Node, String)> = vec![(root, root_path.trim_end_matches('\\').to_string())];
     while let Some((cur, path)) = stack.pop() {
         match cur.kind {
             NodeKind::File => {
                 if cur.logical_size > 0 {
-                    // 0 字节文件到处都是、比较没有意义，跳过，避免候选列表被一堆空文件淹没
+                    // 0 字节文件到处都是、内容比对没有意义（全都一样），跳过，
+                    // 避免候选列表被一堆空文件淹没。
+                    // `.with_full_path(path.clone())` 记住真实磁盘路径——合成树里的
+                    // 节点是克隆出来的，不再挂在原来的目录结构里，右键菜单的
+                    // "打开所在文件夹"/"复制路径"/删除/属性 全靠这个字段才知道
+                    // 真实位置在哪。
                     let leaf = cur.clone().with_full_path(path.clone());
-                    groups.entry(cur.logical_size).or_default().push(leaf);
+                    by_size.entry(cur.logical_size).or_default().push((leaf, path.clone()));
                 }
             }
             NodeKind::Folder => {
@@ -101,20 +116,28 @@ pub fn build_duplicate_tree(root: &Node, root_path: &str) -> Node {
             }
         }
     }
-    let mut pairs: Vec<(u64, Node)> = groups.into_iter()
-        .filter(|(_, files)| files.len() >= 2)
-        .map(|(size, files)| {
-            let wasted = size * (files.len() as u64 - 1);
-            let count = files.len();
+
+    // 阶段二/三（在 dedup.rs 里）：大小相同的这些文件，内容是不是真的相同。
+    let mut pairs: Vec<(u64, Node)> = Vec::new();
+    for (size, files) in by_size {
+        if files.len() < 2 {
+            continue; // 这个大小全世界就这一个文件，不用比。
+        }
+        let paths: Vec<String> = files.iter().map(|(_, p)| p.clone()).collect();
+        for idxs in crate::dedup::group_by_content(&paths) {
+            let count = idxs.len() as u64;
+            let wasted = size * (count - 1);
+            let group_files: Vec<Node> = idxs.iter().map(|&i| files[i].0.clone()).collect();
             let name = format!(
-                "{} × {count} 个文件（候选，可省 {}）",
+                "{} × {count} 个文件（疑似重复，可省 {}）",
                 crate::format::human_size(size), crate::format::human_size(wasted),
             );
-            (wasted, Node::new_folder_with_meta(name, GROUP_COLOR, files, 0, 0, 0, 0x10, 0, false, String::new()))
-        }).collect();
+            pairs.push((wasted, Node::new_folder_with_meta(name, GROUP_COLOR, group_files, 0, 0, 0, 0x10, 0, false, String::new())));
+        }
+    }
     pairs.sort_by(|a, b| b.0.cmp(&a.0));
     let dup_folders: Vec<Node> = pairs.into_iter().map(|(_, n)| n).collect();
-    Node::new_folder_with_meta("候选重复文件（按大小分组）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new())
+    Node::new_folder_with_meta("疑似重复文件（大小 + 内容哈希确认）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new())
 }
 
 const GROUP_COLOR: Color32 = Color32::from_rgb(0xF5, 0xA6, 0x23);

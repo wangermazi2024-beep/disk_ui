@@ -282,6 +282,13 @@ impl DiskUiApp {
     }
 
     /// 打开（或切换到已经开着的）某个分区的"重复文件查找"标签页。
+    ///
+    /// `categorize::build_duplicate_tree` 现在会真的读文件内容算哈希做确认
+    /// （见 dedup.rs 的说明），不再是纯按大小分组那种"瞬间出结果但一堆假阳性"
+    /// 的旧算法，所以这一步会有实打实的磁盘 I/O，文件数很多的分区可能要等
+    /// 几秒到十几秒——目前是在 UI 线程上同步跑的，这几秒里界面会卡住没法操作，
+    /// 这是已知的后续优化项（参照 scan.rs 那样挪到后台线程 + 进度条），
+    /// 这次先把算法本身做对，异步化留到下一步再做。
     fn open_duplicate_tab(&mut self, pi: usize) {
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Duplicates { partition_idx, .. } if *partition_idx == pi)) {
             self.active_tab = idx;
@@ -289,9 +296,13 @@ impl DiskUiApp {
         }
         let Some(node) = self.partitions.get(pi) else { return };
         let root_path = self.partition_root_paths.get(pi).cloned().unwrap_or_default();
+        let started = std::time::Instant::now();
         let root = categorize::build_duplicate_tree(node, &root_path);
         let title = node.name.clone();
-        crate::applog::log(&format!("[app] 打开重复文件候选标签页: {title}（{} 组候选）", root.children.len()));
+        crate::applog::log(&format!(
+            "[app] 打开重复文件标签页: {title}（{} 组疑似重复，内容哈希比对耗时 {:.1}s）",
+            root.children.len(), started.elapsed().as_secs_f32(),
+        ));
         self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None, view: crate::ui::compact_tree::ViewState::default() });
         self.active_tab = self.tabs.len() - 1;
     }
