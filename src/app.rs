@@ -24,7 +24,17 @@ use crate::ui::{sidebar, startup, tree_list, TreeAction};
 enum Tab {
     Main,
     Extensions { partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState },
-    Duplicates { partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState },
+    Duplicates {
+        partition_idx: usize, title: String, root: Node, selected: Option<NodePath>, view: crate::ui::compact_tree::ViewState,
+        /// 后台线程还在跑内容哈希比对的时候是 `Some((done, total))`；算完变成
+        /// `None`，这时候 `root` 才是真正算好的结果树。在那之前 `root` 只是
+        /// 一棵空占位树（不是 `Option<Node>`，是为了让上面那几处
+        /// `Tab::Extensions { root, .. } | Tab::Duplicates { root, .. }` 合并
+        /// 匹配的地方不用跟着改类型），UI 层看到 `loading.is_some()` 就知道
+        /// 该显示"正在比对内容…"的进度提示，而不是把这棵空树渲染成"一个重复
+        /// 文件都没找到"。
+        loading: Option<(u64, u64)>,
+    },
 }
 
 /// 右键菜单点了"删除到回收站"之后、用户在确认框里点"确定"之前的中间状态。
@@ -92,6 +102,11 @@ pub struct DiskUiApp {
     /// 右键菜单"删除到回收站"点了之后、确认框点"确定"/"取消"之前的等待状态；
     /// `None` 时不显示确认框。
     pending_delete: Option<PendingDelete>,
+
+    /// 正在后台跑"重复文件查找"内容哈希比对的分区，`(分区下标, 结果通道)`。
+    /// 一个 `Vec` 是因为可能同时有好几个分区的比对在并行跑（用户开了多个
+    /// 重复文件标签页）；每帧在 `poll_duplicate_scan` 里收一遍。
+    duplicate_rx: Vec<(usize, Receiver<categorize::DuplicateMessage>)>,
 }
 
 impl Default for DiskUiApp {
@@ -115,6 +130,7 @@ impl Default for DiskUiApp {
             show_all_details: true,
             list_state: tree_list::ListState::default(),
             pending_delete: None,
+            duplicate_rx: Vec::new(),
         }
     }
 }
@@ -123,6 +139,7 @@ impl eframe::App for DiskUiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().set_visuals(egui::Visuals::dark());
         self.poll_scan();
+        self.poll_duplicate_scan();
 
         self.show_main_screen(ui);
         if self.picker.is_some() {
@@ -137,7 +154,7 @@ impl eframe::App for DiskUiApp {
         // （通常 60Hz）重绘，不管界面有没有变化都要重新布局一遍，是 egui 官方
         // GitHub 讨论区里明确点出来的"不必要 CPU 占用"反模式，鼠标移动/点击/
         // 菜单展开这些交互 egui 自己就会触发重绘，不需要每帧手动催一次。
-        if self.scanning {
+        if self.scanning || !self.duplicate_rx.is_empty() {
             ui.ctx().request_repaint();
         }
     }
@@ -206,6 +223,10 @@ impl DiskUiApp {
                     match self.tabs.get_mut(tab_idx) {
                         Some(Tab::Main) | None => {
                             tree_list::show(ui, &self.partitions, &self.partition_infos, &self.partition_root_paths, &self.selected, self.show_all_details, &mut self.list_state)
+                        }
+                        Some(Tab::Duplicates { loading: Some((done, total)), title, .. }) => {
+                            show_duplicate_loading(ui, title, *done, *total);
+                            TreeAction::None
                         }
                         Some(Tab::Extensions { root, selected, view, .. }) | Some(Tab::Duplicates { root, selected, view, .. }) => {
                             crate::ui::compact_tree::show(ui, root, selected, view)
@@ -283,12 +304,10 @@ impl DiskUiApp {
 
     /// 打开（或切换到已经开着的）某个分区的"重复文件查找"标签页。
     ///
-    /// `categorize::build_duplicate_tree` 现在会真的读文件内容算哈希做确认
-    /// （见 dedup.rs 的说明），不再是纯按大小分组那种"瞬间出结果但一堆假阳性"
-    /// 的旧算法，所以这一步会有实打实的磁盘 I/O，文件数很多的分区可能要等
-    /// 几秒到十几秒——目前是在 UI 线程上同步跑的，这几秒里界面会卡住没法操作，
-    /// 这是已知的后续优化项（参照 scan.rs 那样挪到后台线程 + 进度条），
-    /// 这次先把算法本身做对，异步化留到下一步再做。
+    /// `categorize::spawn_duplicate_scan` 会真的读文件内容算哈希做确认
+    /// （见 dedup.rs 的说明），这一步有实打实的磁盘 I/O——但现在是在后台线程上
+    /// 跑的：这里立刻插入一个 `loading: Some(...)` 的占位标签页就返回，真正的
+    /// 计算通过 `duplicate_rx` 异步收结果，界面全程可以正常操作，不会卡住。
     fn open_duplicate_tab(&mut self, pi: usize) {
         if let Some(idx) = self.tabs.iter().position(|t| matches!(t, Tab::Duplicates { partition_idx, .. } if *partition_idx == pi)) {
             self.active_tab = idx;
@@ -296,15 +315,56 @@ impl DiskUiApp {
         }
         let Some(node) = self.partitions.get(pi) else { return };
         let root_path = self.partition_root_paths.get(pi).cloned().unwrap_or_default();
-        let started = std::time::Instant::now();
-        let root = categorize::build_duplicate_tree(node, &root_path);
         let title = node.name.clone();
-        crate::applog::log(&format!(
-            "[app] 打开重复文件标签页: {title}（{} 组疑似重复，内容哈希比对耗时 {:.1}s）",
-            root.children.len(), started.elapsed().as_secs_f32(),
-        ));
-        self.tabs.push(Tab::Duplicates { partition_idx: pi, title, root, selected: None, view: crate::ui::compact_tree::ViewState::default() });
+        crate::applog::log(&format!("[app] 开始比对重复文件: {title}"));
+
+        let (tx, rx) = mpsc::channel();
+        categorize::spawn_duplicate_scan(node, &root_path, tx);
+        self.duplicate_rx.push((pi, rx));
+
+        self.tabs.push(Tab::Duplicates {
+            partition_idx: pi, title, root: Node::new_folder("", Color32::WHITE, Vec::new()),
+            selected: None, view: crate::ui::compact_tree::ViewState::default(), loading: Some((0, 0)),
+        });
         self.active_tab = self.tabs.len() - 1;
+    }
+
+    /// 每帧调用：收后台"重复文件查找"线程的进度/结果消息，更新对应标签页。
+    /// 同一时间可能有好几个分区的比对在并行跑（用户开了好几个不同分区的重复
+    /// 文件标签页），所以是一个 `Vec`，不是单个 `Option<Receiver<_>>`。
+    ///
+    /// 标签页有可能在后台还没算完的时候就被用户关掉了（当前没有做"取消正在跑
+    /// 的计算"这件事，关掉标签页只是不再展示结果，后台线程会自己跑到底）——
+    /// 这种情况下消息直接丢弃，不去找已经不存在的标签页；`duplicate_rx` 里的
+    /// 记录要等对应的发送端彻底断开（后台线程跑完、`tx` 被 drop）才清掉，
+    /// 不然会有一条永远不会再收到消息、但也一直留在 `Vec` 里的僵尸记录。
+    fn poll_duplicate_scan(&mut self) {
+        if self.duplicate_rx.is_empty() {
+            return;
+        }
+        let mut done_pi: Vec<usize> = Vec::new();
+        for (pi, rx) in &self.duplicate_rx {
+            let pi = *pi;
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        let tab = self.tabs.iter_mut().find(|t| matches!(t, Tab::Duplicates { partition_idx, .. } if *partition_idx == pi));
+                        if let Some(Tab::Duplicates { root, loading, .. }) = tab {
+                            match msg {
+                                categorize::DuplicateMessage::Progress { done, total } => *loading = Some((done, total)),
+                                categorize::DuplicateMessage::Done(tree) => { *root = *tree; *loading = None; }
+                            }
+                        }
+                        // 标签页已经被关掉的情况：消息直接丢弃，什么都不做。
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => { done_pi.push(pi); break; }
+                }
+            }
+        }
+        if !done_pi.is_empty() {
+            self.duplicate_rx.retain(|(pi, _)| !done_pi.contains(pi));
+        }
     }
 
     /// 选分区/目录的弹窗。用 `egui::Window` 模拟模态：不可缩放、居中，
@@ -586,6 +646,30 @@ impl DiskUiApp {
 
 /// 从选择界面的状态构造出这一批要扫描的路径列表：已选中的固定分区（按盘符排序，保证
 /// 每次顺序确定）+ 用户手动添加的自定义目录。
+/// "重复文件查找"标签页在后台线程还没算完时显示的占位内容：转圈 + 进度条。
+/// `total` 只统计了 header 预筛阶段的文件数（见 `dedup.rs`），`done` 有可能
+/// 略微超过它，这里夹一下避免进度条看起来"超过 100%"。
+fn show_duplicate_loading(ui: &mut egui::Ui, title: &str, done: u64, total: u64) {
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() / 2.0 - 48.0).max(0.0));
+        ui.spinner();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("正在比对内容：{title}")).strong().size(15.0));
+        ui.add_space(4.0);
+        if total == 0 {
+            ui.label("正在收集候选文件…");
+        } else {
+            let shown_done = done.min(total);
+            ui.label(format!("已处理 {shown_done} / {total} 个候选文件（大小相同，正在确认内容是否真的一致）"));
+            let frac = (shown_done as f32 / total as f32).clamp(0.0, 1.0);
+            ui.add(egui::ProgressBar::new(frac).desired_width(320.0));
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("这一步要真的读文件内容算哈希，文件数很多的分区可能要等一会儿——界面这段时间可以正常操作其它标签页。")
+            .small().color(Color32::from_rgb(0x90, 0x90, 0x90)));
+    });
+}
+
 fn build_scan_paths(picker: &startup::PickerState) -> Vec<PathBuf> {
     let mut drives: Vec<char> = picker.selected_drives.iter().copied().collect();
     drives.sort_unstable();

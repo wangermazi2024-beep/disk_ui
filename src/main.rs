@@ -45,7 +45,7 @@ fn setup_fonts(ctx: &egui::Context) {
 /// 崩溃兜底：GUI 程序双击启动时没有控制台，一旦 panic，用户只会看到窗口消失，
 /// 什么线索都留不下——这对"换台电脑就崩"这类问题完全没法排查。这里在 `main()`
 /// 最开始装一个 panic hook，把 panic 信息（消息、发生位置、线程名）连同标准的
-/// panic 打印一起写进 disklens_log.txt，下次崩溃时日志里就能直接看到原因。
+/// panic 打印一起写进 diskforge_log.txt，下次崩溃时日志里就能直接看到原因。
 fn install_panic_logger() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
