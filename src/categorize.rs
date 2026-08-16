@@ -119,8 +119,8 @@ fn collect_duplicate_candidates(root: &Node, root_path: &str) -> (Vec<Node>, Vec
 
 /// 后台线程算重复文件期间/算完之后回传给 UI 线程的消息。`Progress` 里的
 /// `done`/`total` 见 `dedup::find_duplicates` 的说明——`total` 只统计了
-/// header 预筛阶段的文件数，`done` 有可能略微超过它（footer/全文件确认阶段
-/// 是在子集上再跑一遍，也会计入 `done`），UI 展示进度条时应该夹一下
+/// header 预筛阶段的文件数，`done` 有可能略微超过它（全文件确认阶段是在
+/// 子集上再跑一遍，也会计入 `done`），UI 展示进度条时应该夹一下
 /// （`done.min(total)`），避免看起来"超过 100%"。
 pub enum DuplicateMessage {
     Progress { done: u64, total: u64 },
@@ -145,24 +145,20 @@ pub fn spawn_duplicate_scan(root: &Node, root_path: &str, tx: std::sync::mpsc::S
         };
         let groups = crate::dedup::find_duplicates(&paths, size_groups, &on_progress);
 
-        // 把结果落盘：一条一条记录 sha256/大小/文件数/路径，方便用别的工具
-        // （PowerShell 的 `Get-FileHash -Algorithm SHA256`、`certutil -hashfile`
-        // 之类）独立核对"这个算法找出来的是不是真的重复文件"。用 `log_batch`
-        // 一次性刷盘，不是每组都单独 flush 一次——组数一多（实测一次 C 盘
-        // 扫描能有十几万组"候选"，内容比对之后剩下的"确认"组数量级会小很多，
-        // 但依然可能有成千上万组），一条条 flush 本身就会变成新的性能瓶颈。
-        let mut log_lines: Vec<String> = Vec::with_capacity(groups.len());
-        let mut wasted_total: u64 = 0;
-        for g in &groups {
-            let wasted = g.size * (g.file_indices.len() as u64 - 1);
-            wasted_total += wasted;
-            let files_desc: Vec<String> = g.file_indices.iter().map(|&i| paths[i].clone()).collect();
-            log_lines.push(format!(
-                "[dedup] sha256={} size={} count={} 可省={} 路径: {}",
-                g.sha256_hex, g.size, g.file_indices.len(), wasted, files_desc.join(" | "),
-            ));
-        }
-        crate::applog::log_batch(&log_lines);
+        // 之前这里会把每一组的 sha256/大小/文件数/路径都拼成一行、`log_batch`
+        // 一次性落盘，是为了方便用 PowerShell 的 `Get-FileHash -Algorithm SHA256`
+        // 之类的工具独立核对结果——但实测这一步本身就是"进度条已经走到 100%、
+        // 界面却还在卡住不动"的真正原因：确认阶段之后如果还剩下几千甚至上万个
+        // 分组，每组的路径列表拼接（`files_desc.join(" | ")`、`format!`）全部
+        // 堆在一起做，是这段时间里唯一还在跑但完全不出现在进度条里的工作，
+        // 看起来就像"卡死了"。先整个去掉，不在日志里逐组打印路径了。
+        // TODO(以后想验证算法/看具体是哪些文件的时候)：更好的位置是在 UI 的
+        // 重复文件列表里加一列"SHA-256"直接展示（`DuplicateGroup.sha256_hex`
+        // 已经带着这个值，`categorize.rs` 建 Node 树的时候可以想办法把它带
+        // 到节点上，比如借用 `Node.owner: String` 这个字段，或者给 `Node`
+        // 单独加一个字段），可以直接在界面上复制/核对，比翻几万行日志文件
+        // 好用得多，也不会有这里这种"日志本身拖慢程序"的问题。
+        let wasted_total: u64 = groups.iter().map(|g| g.size * (g.file_indices.len() as u64 - 1)).sum();
         crate::applog::log(&format!(
             "[dedup] 完成: 候选 {total_candidates} 个文件 → 确认 {} 组疑似重复，预计可省 {}，耗时 {:.1}s",
             groups.len(), crate::format::human_size(wasted_total), started.elapsed().as_secs_f32(),

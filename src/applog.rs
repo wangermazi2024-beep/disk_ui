@@ -105,8 +105,16 @@ pub fn init() {
     // 接上 log crate 门面。只应该在整个进程里调用一次，失败（比如别的什么代码
     // 抢先装了别的 logger，这里几乎不会发生）也不影响 applog::log()/dlog!
     // 正常工作——见模块顶部注释。
+    //
+    // 级别定成 Info、不是 Trace：eframe/winit 自己内部也是用 `log` crate
+    // 打诊断信息的（`event_result: Ok(Wait)`、`request_redraw for WindowId(...)`
+    // 这类每一帧都会打一堆的框架内部调试信息，级别是 Trace/Debug）。之前设成
+    // Trace 相当于把这些框架内部噪音也全部转发进了我们自己的日志文件，
+    // 一堆无用信息把真正有用的日志淹没掉，还平白多了很多次磁盘写入。
+    // Info 只放行"真正想让人看见"的日志（我们自己的 `applog::log()`/`dlog!`
+    // 走的是 write_line 直接落地，不受这个过滤影响，不用担心被误伤）。
     if log::set_boxed_logger(Box::new(DualLogger)).is_ok() {
-        log::set_max_level(LevelFilter::Trace);
+        log::set_max_level(LevelFilter::Info);
     } else {
         eprintln!("[applog] log::set_boxed_logger 失败（可能已经被别的代码设置过），标准 log::xxx! 宏不会写进日志文件，但 applog::log()/dlog! 不受影响。");
     }
@@ -126,11 +134,15 @@ pub fn log(msg: &str) {
     write_line(msg);
 }
 
-/// 批量写日志：给"一次要写很多行"的场景用（比如把重复文件比对结果、每一组
-/// 一行地落盘，可能有成千上万行）。只在最后统一 flush 一次——`log()`/`dlog!`
-/// 为了"程序中途崩了也能看到已经写的日志"特意每行都 flush，但这个代价在
-/// "一次写几千行"的场景下会变成新的瓶颈本身（每次 flush 都是一次系统调用），
-/// 拖慢的不是别的，正是我们想加日志来验证的那个"重复文件查找到底快不快"。
+/// 批量写日志：给"一次要写很多行"的场景用。只在最后统一 flush 一次——`log()`/
+/// `dlog!` 为了"程序中途崩了也能看到已经写的日志"特意每行都 flush，但这个代价
+/// 在"一次写几千行"的场景下会变成新的瓶颈本身（每次 flush 都是一次系统调用）。
+///
+/// 目前项目里没有地方在用（重复文件比对那边原来用它一条条记录每组的哈希/路径，
+/// 后来发现这一步本身就是"进度条走到 100% 却还卡住不动"的元凶，已经去掉了，
+/// 见 `categorize.rs` 里的说明）——先留着这个函数，以后如果有别的地方需要
+/// 一次性写大量日志，不用重新造轮子。
+#[allow(dead_code)]
 pub fn log_batch(lines: &[String]) {
     if lines.is_empty() {
         return;
