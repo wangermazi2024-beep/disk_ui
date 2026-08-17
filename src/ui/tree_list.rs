@@ -12,128 +12,39 @@ use std::cell::Cell;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use crate::disk_info::DiskInfo;
 use crate::format::{format_attributes, format_filetime_local as format_filetime, human_size, human_size_compact};
-use crate::model::{Node, NodePath};
-use super::{SortDir, SortKey, SortState, TreeAction};
+use crate::model::{Node, NodePath, SortKey, SortState};
+use super::TreeAction;
 
 const ROW_H: f32 = 22.0;
 const DISK_ROW_H: f32 = 68.0;
 
 /// 扁平化的可见行。磁盘行 + 子行统一处理。
-#[derive(Clone)]
 enum RowKind {
     Disk { pi: usize },
     Child { pi: usize, node: *const Node, abs_path: NodePath, indent: f32, depth: u32, parent_logical: u64 },
 }
 
-#[derive(Clone)]
 struct FlatRow {
     height: f32,
     kind: RowKind,
 }
 
-/// 排序/展开状态 + 上一次算好的可见行缓存。
-///
-/// 背景：以前 children 是构建时排好序的（改一次、用到天荒地老），点表头排序后
-/// 变成"每帧都要现算"，而 `collect_rows` 本来就是每帧都会重新走一遍整棵树
-/// （因为要响应展开/折叠）。两者叠一起 = 每一帧、每一层可见节点都做一次
-/// `sort_by`，稍微大一点的目录/大量重复文件时这个开销肉眼可见（debug 构建下
-/// 尤其明显）。所以这里把算好的 `Vec<FlatRow>` 缓存起来，只有下面几种情况
-/// 真正变化了才重算：排序变了、展开状态变了（`expand_version`）、
-/// "显示全部信息"开关变了、或者分区数量/整个 `partitions` 数组的内存地址变了
-/// （后者用来兜底探测"扫描线程往 self.partitions 里 push 了新分区，Vec 扩容
-/// 导致所有元素搬家"这种会让缓存里的裸指针失效的情况——地址一变就强制重建，
-/// 不会有 use-after-free 风险）。
-///
-/// `expand_version` 由 app.rs 在真正修改 `partitions` 树结构/展开状态的两处
-/// （ToggleExpand 的处理分支、scan 完成 push 新分区）负责 +1；这里只管比较。
-#[derive(Default)]
-pub struct ListState {
-    pub sort: SortState,
-    pub expand_version: u64,
-    cache: Option<(CacheKey, Vec<FlatRow>)>,
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-struct CacheKey {
-    sort: SortState,
-    expand_version: u64,
-    show_all: bool,
-    partitions_len: usize,
-    partitions_ptr: usize,
-}
-
-/// 大小写不敏感比较，不分配新 String（`to_lowercase()` 每次比较都要堆分配一次，
-/// 排序是 O(n log n) 次比较，n 一大——比如上万个文件——每帧都这么分配一遍，
-/// 就是列表变卡的主因之一）。
-fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
-    a.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
-}
-
-/// 按当前排序状态给一层 children 排出显示顺序，返回的是 `children` 里的下标
-/// （不改变 children 本身的存储顺序——那是 abs_path 依赖的"真实"下标，
-/// 排序只影响遍历/显示时按什么顺序走这些下标）。
-fn sorted_child_order(children: &[Node], sort: SortState) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..children.len()).collect();
-    order.sort_by(|&a, &b| compare_nodes(&children[a], &children[b], sort.key));
-    if sort.dir == SortDir::Desc { order.reverse(); }
-    order
-}
-
-fn compare_nodes(a: &Node, b: &Node, key: SortKey) -> std::cmp::Ordering {
-    match key {
-        SortKey::Name => cmp_ignore_ascii_case(&a.name, &b.name),
-        SortKey::Size => a.logical_size.cmp(&b.logical_size),
-        SortKey::Physical => a.physical_size.cmp(&b.physical_size),
-        SortKey::Modified => a.modified_ft.cmp(&b.modified_ft),
-        SortKey::Created => a.created_ft.cmp(&b.created_ft),
-        SortKey::Accessed => a.accessed_ft.cmp(&b.accessed_ft),
-        SortKey::Items => (a.file_count + a.folder_count).cmp(&(b.file_count + b.folder_count)),
-        SortKey::Files => a.file_count.cmp(&b.file_count),
-        SortKey::Folders => a.folder_count.cmp(&b.folder_count),
-        SortKey::Attributes => a.attributes.cmp(&b.attributes),
-        SortKey::Reparse => a.reparse_tag.cmp(&b.reparse_tag),
-        SortKey::Reserved => a.is_reserved.cmp(&b.is_reserved),
-        SortKey::Owner => cmp_ignore_ascii_case(&a.owner, &b.owner),
-    }
-}
-
-/// 表头文字对应的排序键：父占比/总占比两列本质上和逻辑大小同序，都映射到 `Size`。
-const HEADER_COLS: [(&str, SortKey); 15] = [
-    ("名称", SortKey::Name),
-    ("父占比", SortKey::Size),
-    ("总占比", SortKey::Size),
-    ("逻辑大小", SortKey::Size),
-    ("修改时间", SortKey::Modified),
-    ("物理大小", SortKey::Physical),
-    ("创建时间", SortKey::Created),
-    ("访问时间", SortKey::Accessed),
-    ("项目", SortKey::Items),
-    ("文件", SortKey::Files),
-    ("文件夹", SortKey::Folders),
-    ("属性", SortKey::Attributes),
-    ("重解析点", SortKey::Reparse),
-    ("保留", SortKey::Reserved),
-    ("所有者", SortKey::Owner),
-];
-
-/// 收集子行（含所有已展开的更深层级）。每一层按 `sort` 现算显示顺序
-/// （不改变 `node.children` 的实际存储顺序，abs_path 里存的还是真实下标）。
+/// 收集子行（含所有已展开的更深层级）。children 已在构建时排序。
 /// `show_reserved`：为 false 时跳过 NTFS 保留的元数据文件（is_reserved，如 $MFT/$LogFile），
 /// 对应"视图 > 显示全部信息"关闭的情况。
 /// 迭代版本：用显式栈代替原生递归，栈里存"待处理节点 + 它的相对路径/深度/父 logical_size"，
-/// 子节点按倒序入栈，保证出栈顺序（先序、从左到右）和排好的显示顺序完全一致。
+/// 子节点按倒序入栈，保证出栈顺序（先序、从左到右）和原来的递归版完全一致。
 fn collect_rows(
     node: &Node, pi: usize, rel_path: &mut Vec<usize>, depth: u32,
-    parent_logical: u64, show_reserved: bool, sort: SortState, rows: &mut Vec<FlatRow>,
+    parent_logical: u64, show_reserved: bool, rows: &mut Vec<FlatRow>,
 ) {
     struct Item<'a> { node: &'a Node, rel_path: Vec<usize>, depth: u32, parent_logical: u64 }
-    let order = sorted_child_order(&node.children, sort);
-    let mut stack: Vec<Item> = order.into_iter().rev()
-        .filter(|&i| show_reserved || !node.children[i].is_reserved)
-        .map(|i| {
+    let mut stack: Vec<Item> = node.children.iter().enumerate().rev()
+        .filter(|(_, c)| show_reserved || !c.is_reserved)
+        .map(|(i, child)| {
             let mut rp = rel_path.clone();
             rp.push(i);
-            Item { node: &node.children[i], rel_path: rp, depth, parent_logical }
+            Item { node: child, rel_path: rp, depth, parent_logical }
         }).collect();
     while let Some(item) = stack.pop() {
         let mut abs_path = vec![pi];
@@ -152,13 +63,12 @@ fn collect_rows(
         });
         if item.node.is_folder() && item.node.expanded {
             let child_parent_logical = item.node.logical_size.max(1);
-            let child_order = sorted_child_order(&item.node.children, sort);
-            for i in child_order.into_iter().rev()
-                .filter(|&i| show_reserved || !item.node.children[i].is_reserved)
+            for (i, gc) in item.node.children.iter().enumerate().rev()
+                .filter(|(_, c)| show_reserved || !c.is_reserved)
             {
                 let mut rp = item.rel_path.clone();
                 rp.push(i);
-                stack.push(Item { node: &item.node.children[i], rel_path: rp, depth: item.depth + 1, parent_logical: child_parent_logical });
+                stack.push(Item { node: gc, rel_path: rp, depth: item.depth + 1, parent_logical: child_parent_logical });
             }
         }
     }
@@ -171,9 +81,10 @@ pub fn show(
     root_paths: &[String],
     selected: &Option<NodePath>,
     show_all: bool,
-    state: &mut ListState,
+    sort: &mut SortState,
 ) -> TreeAction {
     let action_cell: Cell<TreeAction> = Cell::new(TreeAction::None);
+    let header_clicked: Cell<Option<SortKey>> = Cell::new(None);
     // "关键列"始终保持正常宽度；非关键列在 show_all=false 时收缩到 0 宽度
     // （而不是真的减少 .column()/col() 调用次数）。egui_extras::TableBuilder 要求
     // 表头、每一行声明的列数必须严格一致，三处手写的列数只要有一处漏改就会在运行时
@@ -207,64 +118,74 @@ pub fn show(
             .column(egui_extras::Column::initial(extra_w(80.0)).clip(true).resizable(show_all).at_least(0.0)); // 所有者
 
         builder = builder.sense(egui::Sense::click());
-        let sort_clicked_cell: Cell<Option<SortKey>> = Cell::new(None);
-        let table = builder.header(ROW_H, |mut h| {
-            for (label, key) in HEADER_COLS {
+        builder
+            .header(ROW_H, |mut h| {
+                // 表头点了要能排序的列：名称/逻辑大小/修改时间/物理大小/创建时间/访问时间/属性/所有者。
+                // 父占比、总占比是相对比例（不是能独立排序的值——总占比基本约等于按逻辑大小排，
+                // 父占比更是每一行都相对不同的父节点，本身就没有全局排序意义），项目/文件/文件夹
+                // 是计数、重解析点/保留很少会拿来排序，这几列保留纯文字表头，不做成按钮。
+                let sort_label = |key: SortKey, label: &str| -> String {
+                    if sort.key == Some(key) {
+                        format!("{label} {}", if sort.ascending { "▲" } else { "▼" })
+                    } else {
+                        label.to_string()
+                    }
+                };
                 h.col(|ui| {
-                    let active = state.sort.key == key;
-                    let arrow = if active {
-                        if state.sort.dir == SortDir::Asc { " ▲" } else { " ▼" }
-                    } else { "" };
-                    let color = if active { Color32::from_rgb(0xFF, 0xD7, 0x00) } else { Color32::WHITE };
-                    let text = egui::RichText::new(format!("{label}{arrow}")).strong().size(12.0).color(color);
-                    let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
-                    let resp = resp.on_hover_text("点击排序，再次点击切换升/降序");
-                    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
-                    if resp.clicked() { sort_clicked_cell.set(Some(key)); }
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::Name, "名称")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::Name)); }
                 });
-            }
-        });
-        // 表头点击立刻生效（排序状态在渲染 body 之前就更新），不用等下一帧。
-        if let Some(key) = sort_clicked_cell.get() { state.sort.click(key); }
-
-        // 只有排序/展开/显示全部信息/分区数组真的变了才重新扫一遍树、重新排序；
-        // 否则复用上一帧缓存的可见行列表，避免每一帧都对（可能很大的）子树做
-        // sort_by。`partitions.as_ptr()` 兜底探测扫描线程往 `partitions` push
-        // 新分区导致 Vec 扩容、所有元素搬家的情况——地址一变就强制重建，
-        // 缓存里存的裸指针绝不会指向已经失效的内存。
-        let cache_key = CacheKey {
-            sort: state.sort,
-            expand_version: state.expand_version,
-            show_all,
-            partitions_len: partitions.len(),
-            partitions_ptr: partitions.as_ptr() as usize,
-        };
-        let need_rebuild = state.cache.as_ref().map_or(true, |(k, _)| *k != cache_key);
-        if need_rebuild {
-            let mut flat_rows: Vec<FlatRow> = Vec::new();
-            let partition_order = sorted_child_order(partitions, state.sort);
-            for pi in partition_order {
-                let partition = &partitions[pi];
-                flat_rows.push(FlatRow { height: DISK_ROW_H, kind: RowKind::Disk { pi } });
-                if partition.expanded {
-                    let mut rel_path: NodePath = Vec::new();
-                    collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, state.sort, &mut flat_rows);
-                }
-            }
-            state.cache = Some((cache_key, flat_rows));
-        }
-        let flat_rows = &state.cache.as_ref().unwrap().1;
-
-        table
+                h.col(|ui| { ui.label(egui::RichText::new("父占比").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| { ui.label(egui::RichText::new("总占比").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::LogicalSize, "逻辑大小")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::LogicalSize)); }
+                });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::Modified, "修改时间")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::Modified)); }
+                });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::PhysicalSize, "物理大小")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::PhysicalSize)); }
+                });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::Created, "创建时间")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::Created)); }
+                });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::Accessed, "访问时间")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::Accessed)); }
+                });
+                h.col(|ui| { ui.label(egui::RichText::new("项目").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| { ui.label(egui::RichText::new("文件").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| { ui.label(egui::RichText::new("文件夹").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::Attributes, "属性")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::Attributes)); }
+                });
+                h.col(|ui| { ui.label(egui::RichText::new("重解析点").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| { ui.label(egui::RichText::new("保留").strong().size(12.0).color(Color32::WHITE)); });
+                h.col(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(sort_label(SortKey::Owner, "所有者")).strong().size(12.0).color(Color32::WHITE)).frame(false);
+                    if ui.add(btn).clicked() { header_clicked.set(Some(SortKey::Owner)); }
+                });
+            })
             .body(|body| {
                 let mut final_action = TreeAction::None;
+                // ── 先收集所有可见行（磁盘行 + 子行） ──
+                let mut flat_rows: Vec<FlatRow> = Vec::new();
+                for (pi, partition) in partitions.iter().enumerate() {
+                    flat_rows.push(FlatRow { height: DISK_ROW_H, kind: RowKind::Disk { pi } });
+                    if partition.expanded {
+                        let mut rel_path: NodePath = Vec::new();
+                        collect_rows(partition, pi, &mut rel_path, 0, partition.logical_size.max(1), show_all, &mut flat_rows);
+                    }
+                }
 
                 // ── 用 heterogeneous_rows 做虚拟化渲染 ──
                 let heights: Vec<f32> = flat_rows.iter().map(|r| r.height).collect();
                 let clicked_row: Cell<usize> = Cell::new(usize::MAX);
-                // 右键菜单点"删除到回收站"时，通过这个 Cell 把请求带出 body 闭包
-                // （菜单是嵌在 row.col 更深一层的闭包里画的，够不着外层的 final_action）。
-                let delete_request: Cell<Option<TreeAction>> = Cell::new(None);
 
                 body.heterogeneous_rows(heights.into_iter(), |mut row| {
                     let row_idx = row.index();
@@ -282,11 +203,15 @@ pub fn show(
                             let info_ref = info;
                             let root_path = root_paths.get(*pi).cloned().unwrap_or_default();
 
+                            let paint_bg = |ui: &mut egui::Ui| -> Rect {
+                                let r = ui.available_rect_before_wrap();
+                                if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }
+                                r
+                            };
+
                             // 名称
                             row.col(|ui| {
-                                let rect = ui.available_rect_before_wrap();
-                                let resp = ui.allocate_rect(rect, Sense::click());
-                                if part_selected { ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }
+                                let rect = paint_bg(ui);
                                 let arrow = if p.expanded { "▼" } else { "▶" };
                                 ui.painter().text(Pos2::new(rect.min.x+2.0, rect.min.y+6.0), egui::Align2::LEFT_TOP, arrow, egui::FontId::proportional(10.0), Color32::from_rgb(0xAA,0xCC,0xFF));
                                 ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+4.0), egui::Align2::LEFT_TOP, format!("💾 {}", p.name), egui::FontId::proportional(13.0), if part_selected {Color32::from_rgb(0xFF,0xFF,0x80)} else {Color32::from_rgb(0xFF,0xD7,0x00)});
@@ -294,36 +219,42 @@ pub fn show(
                                     ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+22.0), egui::Align2::LEFT_TOP, format!("总: {}  已用: {}  可用: {}", human_size_compact(i.total_bytes), human_size_compact(i.used_bytes), human_size_compact(i.free_bytes)), egui::FontId::proportional(10.0), Color32::from_rgb(0xA0,0xC0,0xE0));
                                     ui.painter().text(Pos2::new(rect.min.x+18.0, rect.min.y+36.0), egui::Align2::LEFT_TOP, format!("扫描: 逻辑={}  物理={}", human_size_compact(p.logical_size), human_size_compact(p.physical_size)), egui::FontId::proportional(10.0), Color32::from_rgb(0xA0,0xA0,0xA0));
                                 }
-                                if resp.clicked() || resp.secondary_clicked() { clicked_row.set(row_idx); }
-                                resp.context_menu(|ui| context_menu_disk(ui, &root_path));
                             });
                             // 父占比
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } draw_bar(ui.painter(),r,1.0,Color32::from_rgb(0xFF,0xD7,0x00)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); draw_bar(ui.painter(),r,1.0,Color32::from_rgb(0xFF,0xD7,0x00));});
                             // 总占比
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } draw_bar(ui.painter(),r,part_pct,Color32::from_rgb(0x4C,0x8B,0xF5)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); draw_bar(ui.painter(),r,part_pct,Color32::from_rgb(0x4C,0x8B,0xF5));});
                             // 逻辑大小
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(p.logical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0x4C,0x8B,0xF5)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(p.logical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0x4C,0x8B,0xF5));});
                             // 修改时间
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } let t=info_ref.map(|i|i.file_system.clone()).filter(|s|!s.is_empty()).unwrap_or_else(||format_filetime(p.modified_ft)); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(11.0),Color32::from_rgb(0xA0,0xC0,0xE0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); let t=info_ref.map(|i|i.file_system.clone()).filter(|s|!s.is_empty()).unwrap_or_else(||format_filetime(p.modified_ft)); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(11.0),Color32::from_rgb(0xA0,0xC0,0xE0));});
                             // 物理大小
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(p.physical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0xF5,0xA6,0x23)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(p.physical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0xF5,0xA6,0x23));});
                             // 创建时间
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } let s=format_filetime(p.created_ft); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); let s=format_filetime(p.created_ft); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 访问时间
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } let s=format_filetime(p.accessed_ft); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); let s=format_filetime(p.accessed_ft); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 项目/文件/文件夹
                             for val in [p.file_count+p.folder_count, p.file_count, p.folder_count] {
-                                row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format!("{}",val),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                                row.col(|ui| { let r = paint_bg(ui); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format!("{}",val),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             }
                             // 属性
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format_attributes(p.attributes),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format_attributes(p.attributes),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 重解析点
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } let t=if p.reparse_tag!=0 {format!("0x{:X}",p.reparse_tag)}else{"—".into()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); let t=if p.reparse_tag!=0 {format!("0x{:X}",p.reparse_tag)}else{"—".into()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 保留
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } let t=if p.is_reserved {"是"}else{"—"}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); let t=if p.is_reserved {"是"}else{"—"}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 所有者
-                            row.col(|ui| { let r=ui.available_rect_before_wrap(); let resp=ui.allocate_rect(r,Sense::click()); if part_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); } let t=if p.owner.is_empty(){"—".into()}else{p.owner.clone()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0)); if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu_disk(ui, &root_path)); });
+                            row.col(|ui| { let r = paint_bg(ui); let t=if p.owner.is_empty(){"—".into()}else{p.owner.clone()}; ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
+                            // 整行点击/右键判定：用 egui_extras 官方的 row.response()
+                            // （加入这一行的所有单元格 Response 的并集），覆盖整行没有缝隙，
+                            // 不是自己在每个格子里各判断一遍——这是 egui_extras 自带的机制，
+                            // 用现成的，不用自己再造一遍轮子。
+                            let resp = row.response();
+                            if resp.clicked() || resp.secondary_clicked() { clicked_row.set(row_idx); }
+                            resp.context_menu(|ui| context_menu_placeholder_disk(ui, &root_path));
                         }
+
                         RowKind::Child { pi, node, abs_path, indent, depth, parent_logical } => {
                             let child = unsafe { &**node };
                             let is_folder = child.is_folder();
@@ -336,15 +267,19 @@ pub fn show(
                             let full_path = build_full_path(partitions, root_paths, abs_path);
                             let hidden = c.is_hidden_or_system();
 
+                            let paint_bg = |ui: &mut egui::Ui| -> Rect {
+                                let r = ui.available_rect_before_wrap();
+                                if hidden {
+                                    // 隐藏/系统项：整个格子淡橙色打底，一眼就能扫到，不需要盯着看图标
+                                    ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0xF5, 0xA6, 0x23, 0x1C));
+                                }
+                                if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }
+                                r
+                            };
+
                             // 名称
                             row.col(|ui| {
-                                let rect = ui.available_rect_before_wrap();
-                                let resp = ui.allocate_rect(rect, Sense::click());
-                                if hidden {
-                                    // 隐藏/系统项：整个名称格淡橙色打底，一眼就能扫到，不需要盯着看图标
-                                    ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0xF5, 0xA6, 0x23, 0x1C));
-                                }
-                                if is_selected { ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }
+                                let rect = paint_bg(ui);
                                 // 缩进参考线：每一层级画一条竖线贯穿整行，展开层级多的时候
                                 // 能顺着线看清楚某一项到底属于哪一层，而不是只能数缩进空格数。
                                 let guide_color = Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x14);
@@ -371,36 +306,39 @@ pub fn show(
                                     p.text(badge.center(), egui::Align2::CENTER_CENTER, "H", egui::FontId::proportional(9.5), Color32::from_rgb(0x2A,0x2A,0x2E));
                                     text_x += 18.0;
                                 }
-                                p.text(Pos2::new(text_x,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);
-                                if resp.clicked() || resp.secondary_clicked() {clicked_row.set(row_idx);}
-                                resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request));
-                            });
+                                p.text(Pos2::new(text_x,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);});
                             // 父占比
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }draw_bar(ui.painter(),r,pct,bar_color);if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);draw_bar(ui.painter(),r,pct,bar_color);});
                             // 总占比
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }draw_bar(ui.painter(),r,total_pct,Color32::from_rgb(0x4C,0x8B,0xF5));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);draw_bar(ui.painter(),r,total_pct,Color32::from_rgb(0x4C,0x8B,0xF5));});
                             // 逻辑大小
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.logical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0x4C,0x8B,0xF5));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.logical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0x4C,0x8B,0xF5));});
                             // 修改时间
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.modified_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);let s=format_filetime(c.modified_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 物理大小
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.physical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0xF5,0xA6,0x23));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.physical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0xF5,0xA6,0x23));});
                             // 创建时间
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.created_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);let s=format_filetime(c.created_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 访问时间
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.accessed_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);let s=format_filetime(c.accessed_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 项目/文件/文件夹
                             for val in [if is_folder{c.file_count+c.folder_count}else{0}, if is_folder{c.file_count}else{0}, if is_folder{c.folder_count}else{0}] {
-                                row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if is_folder{format!("{}",val)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                                row.col(|ui|{let r = paint_bg(ui);let t=if is_folder{format!("{}",val)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             }
                             // 属性
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format_attributes(c.attributes),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format_attributes(c.attributes),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 重解析点
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.reparse_tag!=0{format!("0x{:X}",c.reparse_tag)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);let t=if c.reparse_tag!=0{format!("0x{:X}",c.reparse_tag)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 保留
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.is_reserved{"是"}else{"—"};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);let t=if c.is_reserved{"是"}else{"—"};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
                             // 所有者
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.owner.is_empty(){"—".into()}else{c.owner.clone()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r = paint_bg(ui);let t=if c.owner.is_empty(){"—".into()}else{c.owner.clone()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));});
+                            // 整行点击/右键判定：用 egui_extras 官方的 row.response()
+                            // （加入这一行的所有单元格 Response 的并集），覆盖整行没有缝隙，
+                            // 不是自己在每个格子里各判断一遍——现成的机制，不用自己再造轮子。
+                            let resp = row.response();
+                            if resp.clicked() || resp.secondary_clicked() { clicked_row.set(row_idx); }
+                            resp.context_menu(|ui| context_menu_placeholder(ui, is_folder, &c.name, &full_path));
                         }
                     }
                 });
@@ -425,14 +363,20 @@ pub fn show(
                     }
                 }
                 let _ = &mut final_action;
-                // 删除请求优先：正常行点击（左键选中/右键仅弹出菜单）不会同时设置
-                // delete_request，两者不会真的抢——这里只是给"万一"兜个底。
-                if let Some(action) = delete_request.into_inner() {
-                    final_action = action;
-                }
                 action_cell.set(final_action);
             });
     });
+    // 表头点了要排序：同一列再点一次就切换正倒序，点别的列就换成那一列、默认正序。
+    // 这里只是更新"排序状态"这个小结构体，不碰任何 Node 数据——调用方（app.rs）
+    // 发现排序状态变了之后才会真正去重排树，渲染这边不产生任何额外开销。
+    if let Some(key) = header_clicked.get() {
+        if sort.key == Some(key) {
+            sort.ascending = !sort.ascending;
+        } else {
+            sort.key = Some(key);
+            sort.ascending = true;
+        }
+    }
     action_cell.into_inner()
 }
 
@@ -475,17 +419,14 @@ fn build_full_path(partitions: &[Node], root_paths: &[String], abs_path: &[usize
 /// 否则是"打开这个文件夹"（用于文件的"打开所在文件夹"——选中文件本身，而不是钻进它内部，
 /// 因为文件打不开"进入"）。
 ///
-/// 路径必须整体带双引号：`explorer /select,C:\some path\file.txt`（不带引号）在路径带空格时
-/// 会静默失败，退化成打开资源管理器的默认位置（很多机器上是"文档"），而不是报错或者什么都
-/// 不做——这是 Windows 一个有据可查的老毛病，不是这边逻辑写错了。之前就是漏了这层引号，
-/// 导致"有的文件用资源管理器打开会跳到 Documents"。
-#[cfg(windows)]
 /// 关键点：必须用 `raw_arg` 而不是普通的 `arg`。Rust 标准库的 `Command::arg()` 在
 /// Windows 上会对参数里的引号做自己的转义（比如把 `"` 转成 `\"`），这是为了让参数能被
 /// 标准的 C 运行时命令行解析器正确还原成"一个完整参数"。但 explorer.exe 对 `/select,`
 /// 这种开关根本不走那套标准解析逻辑，它想看到的就是命令行里字面意义上的引号字符。
 /// Rust 加了转义之后，explorer.exe 解析不出真正的路径，会静默失败、退化成打开默认位置
-/// （很多机器上是"文档"）——这正是"用资源管理器打开却跳到 Documents"的真正原因。
+/// （很多机器上是"文档"）——这正是"用资源管理器打开却跳到 Documents"的真正原因，
+/// 之前就是漏了这层引号。
+#[cfg(windows)]
 fn open_in_explorer(path: &str, select_self: bool) {
     use std::os::windows::process::CommandExt;
     if path.is_empty() { return; }
@@ -505,11 +446,10 @@ fn open_in_explorer(path: &str, select_self: bool) {
 #[cfg(not(windows))]
 fn open_in_explorer(_path: &str, _select_self: bool) {}
 
-/// 文件/文件夹右键菜单。
-fn context_menu(
-    ui: &mut egui::Ui, is_folder: bool, name: &str, full_path: &str,
-    abs_path: &NodePath, delete_request: &Cell<Option<TreeAction>>,
-) {
+/// 文件/文件夹右键菜单。复制路径/复制名称/打开所在文件夹是真实功能；
+/// 删除和属性还是禁用占位——删除是破坏性操作，需要单独一轮做确认弹窗 + 回收站语义，
+/// 不适合和这一批其它改动混在一起仓促上。
+fn context_menu_placeholder(ui: &mut egui::Ui, is_folder: bool, name: &str, full_path: &str) {
     ui.set_min_width(180.0);
     let open_label = if is_folder { "📂 在资源管理器中打开" } else { "📂 打开所在文件夹" };
     if ui.button(open_label).clicked() {
@@ -525,34 +465,14 @@ fn context_menu(
         ui.close();
     }
     ui.separator();
-    // "属性" 直接调系统原生对话框，不用二次确认——纯只读操作。
-    if ui.button("ℹ 属性").clicked() {
-        crate::file_ops::open_properties(full_path);
-        ui.close();
-    }
-    // 去重/迁移到其他盘：尚未实现，先占个位置。只用符号链接一种机制（硬链接/
-    // junction 权衡后特意排除，理由见 file_ops.rs 顶部那段大注释）——按钮先
-    // 摆在这，免得以后要改右键菜单的排版。
     ui.add_enabled_ui(false, |ui| {
-        let _ = ui.button("🔗 创建符号链接 / 迁移到其他盘（开发中）");
+        let _ = ui.button("🗑 删除（开发中）");
+        let _ = ui.button("ℹ 属性（开发中）");
     });
-    // "删除"只在这里发个请求（红色强调，提醒这是破坏性操作），真正执行前
-    // app.rs 会弹一个确认框——回收站虽然能找回，但"点错就没了"这种事故
-    // 不该一次点击就直接生效。
-    if ui.add(egui::Button::new(egui::RichText::new("🗑 删除到回收站").color(Color32::from_rgb(0xE0, 0x60, 0x60)))).clicked() {
-        delete_request.set(Some(TreeAction::RequestDelete {
-            abs_path: abs_path.clone(),
-            name: name.to_string(),
-            full_path: full_path.to_string(),
-            is_folder,
-        }));
-        ui.close();
-    }
 }
 
-/// 磁盘/根目录行的右键菜单。删除到回收站不适用于整个分区/扫描根目录，这里不放；
-/// "属性"看的是这个根目录本身（比如某个磁盘分区），一样直接调系统对话框。
-fn context_menu_disk(ui: &mut egui::Ui, root_path: &str) {
+/// 磁盘/根目录行的右键菜单。
+fn context_menu_placeholder_disk(ui: &mut egui::Ui, root_path: &str) {
     ui.set_min_width(180.0);
     if ui.button("📂 在资源管理器中打开").clicked() {
         open_in_explorer(root_path, false);
@@ -560,10 +480,6 @@ fn context_menu_disk(ui: &mut egui::Ui, root_path: &str) {
     }
     if ui.button("📋 复制路径").clicked() {
         ui.ctx().copy_text(root_path.to_string());
-        ui.close();
-    }
-    if ui.button("ℹ 属性").clicked() {
-        crate::file_ops::open_properties(root_path);
         ui.close();
     }
     ui.separator();

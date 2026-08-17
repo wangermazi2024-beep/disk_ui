@@ -14,6 +14,29 @@ pub enum NodeKind {
 /// 树节点在树中的位置，用"从根节点出发的子节点下标序列"表示。
 pub type NodePath = Vec<usize>;
 
+/// 点表头排序支持的排序键。三个列表（主列表 / 扩展名分类 / 重复文件）共用同一套。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortKey {
+    Name,
+    LogicalSize,
+    PhysicalSize,
+    Modified,
+    Created,
+    Accessed,
+    Attributes,
+    Owner,
+    /// 只有分析视图（扩展名分类/重复文件）里的合成节点会用到——按 full_path_override 排序。
+    Path,
+}
+
+/// 当前排序状态：排哪一列、正序还是倒序。`key=None` 表示保持扫描出来的默认顺序
+/// （文件夹在前，同类型按大小从大到小——这是构建时就排好的，不用每帧重算）。
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct SortState {
+    pub key: Option<SortKey>,
+    pub ascending: bool,
+}
+
 #[derive(Clone)]
 pub struct Node {
     pub name: String,
@@ -184,6 +207,30 @@ impl Node {
         Some(cur)
     }
 
+    /// 按某个排序键重新排序这棵树里*每一层*文件夹的子节点（不只是顶层）。
+    /// 只在用户点表头的那一刻调用一次，不是每帧调用——排完之后 Node 树本身就是
+    /// 排好序的，后面每一帧照常读取就行，不会给渲染增加任何额外开销。
+    ///
+    /// 文件夹永远排在文件前面，这条不受排序键影响（和资源管理器的习惯一致）；
+    /// 在"是不是文件夹"这个大类内部，才按选中的键（名称/大小/时间等）比较。
+    ///
+    /// 迭代版本：和 collapse_all 用同一套写法——栈里存相对 NodePath，每次用
+    /// navigate_mut 重新定位，不持有多个 &mut Node 引用，也不用原生递归/裸指针。
+    pub fn sort_recursive(&mut self, key: SortKey, ascending: bool) {
+        let mut stack: Vec<Vec<usize>> = vec![Vec::new()];
+        while let Some(rel) = stack.pop() {
+            let Some(cur) = (if rel.is_empty() { Some(&mut *self) } else { self.navigate_mut(&rel) }) else { continue };
+            cur.children.sort_by(|a, b| compare_by_sort_key(a, b, key, ascending));
+            for i in 0..cur.children.len() {
+                if cur.children[i].is_folder() {
+                    let mut child_rel = rel.clone();
+                    child_rel.push(i);
+                    stack.push(child_rel);
+                }
+            }
+        }
+    }
+
     pub fn collapse_all(&mut self) {
         // 迭代版本：和 mft_scan.rs 的 populate_owners 用同一套写法——栈里存相对 NodePath，
         // 每次用 navigate_mut 重新定位，不持有多个 &mut Node 引用，也不用原生递归。
@@ -207,29 +254,6 @@ impl Node {
                 }
             }
         }
-    }
-
-    /// 沿 `path` 找到目标节点并从其父节点的 `children` 里移除，同时把它的体积/
-    /// 文件数/文件夹数从沿途所有祖先节点的聚合统计里减掉（`file_count`/`folder_count`/
-    /// `logical_size`/`physical_size` 都是"整棵子树的合计"，删掉一个节点必须让
-    /// 所有祖先跟着更新，不然主列表显示的父目录大小会变成"删除前的旧值"）。
-    /// 用于"删除到回收站"成功之后，把这一项从内存里的树上摘掉，不用重新扫描整个分区。
-    pub fn remove_at_path(&mut self, path: &[usize]) -> Option<Node> {
-        let &idx = path.first()?;
-        let removed = if path.len() == 1 {
-            if idx >= self.children.len() { return None; }
-            self.children.remove(idx)
-        } else {
-            self.children.get_mut(idx)?.remove_at_path(&path[1..])?
-        };
-        self.logical_size = self.logical_size.saturating_sub(removed.logical_size);
-        self.size = self.logical_size;
-        self.physical_size = self.physical_size.saturating_sub(removed.physical_size);
-        let removed_files = removed.file_count + if removed.is_file() { 1 } else { 0 };
-        let removed_folders = removed.folder_count + if removed.is_folder() { 1 } else { 0 };
-        self.file_count = self.file_count.saturating_sub(removed_files);
-        self.folder_count = self.folder_count.saturating_sub(removed_folders);
-        Some(removed)
     }
 
     pub fn exclusive_toggle(&mut self, path: &[usize]) -> bool {
@@ -258,6 +282,31 @@ impl Node {
         }
         false
     }
+}
+
+/// 文件夹永远排前面（不受 key 影响），同类内部按 key 比较，ascending 控制正倒序。
+/// 名称比较不区分大小写，和资源管理器一致；时间/大小是纯数值比较，没有歧义。
+fn compare_by_sort_key(a: &Node, b: &Node, key: SortKey, ascending: bool) -> std::cmp::Ordering {
+    let folder_ord = b.is_folder().cmp(&a.is_folder());
+    if folder_ord != std::cmp::Ordering::Equal {
+        return folder_ord;
+    }
+    let ord = match key {
+        SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortKey::LogicalSize => a.logical_size.cmp(&b.logical_size),
+        SortKey::PhysicalSize => a.physical_size.cmp(&b.physical_size),
+        SortKey::Modified => a.modified_ft.cmp(&b.modified_ft),
+        SortKey::Created => a.created_ft.cmp(&b.created_ft),
+        SortKey::Accessed => a.accessed_ft.cmp(&b.accessed_ft),
+        SortKey::Attributes => a.attributes.cmp(&b.attributes),
+        SortKey::Owner => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+        SortKey::Path => {
+            let ap = a.full_path_override.as_deref().unwrap_or("");
+            let bp = b.full_path_override.as_deref().unwrap_or("");
+            ap.to_lowercase().cmp(&bp.to_lowercase())
+        }
+    };
+    if ascending { ord } else { ord.reverse() }
 }
 
 #[derive(Clone)]

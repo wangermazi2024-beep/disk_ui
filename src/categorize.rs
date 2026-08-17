@@ -76,32 +76,21 @@ pub fn build_extension_tree(root: &Node, root_path: &str) -> Node {
     Node::new_folder_with_meta("按扩展名分类".to_string(), GROUP_COLOR, ext_folders, 0, 0, 0, 0x10, 0, false, String::new())
 }
 
-/// 遍历树，收集所有可能重复的候选文件（按大小分好组，只保留组内 >= 2 个的）。
-/// 这一步只是在内存里走一遍已经扫描好的树、克隆一些 `Node` 出来，不涉及任何
-/// 磁盘 I/O，很快，可以放心地在调用方自己的线程（通常是 UI 线程）上同步跑；
-/// 真正慢的"读文件内容算哈希"那部分在 `dedup::find_duplicates` 里，那个函数
-/// 在后台线程上跑（见下面的 `spawn_duplicate_scan`），不会卡住界面。
-fn collect_duplicate_candidates(root: &Node, root_path: &str) -> (Vec<Node>, Vec<String>, Vec<(u64, Vec<usize>)>) {
+/// 按文件大小分组找候选重复文件，同样建一棵合成树（每组一个虚拟文件夹）。
+/// 只按大小分组，不读文件内容比对——大小相同不代表内容一定相同，
+/// 文件夹名字里会写"候选"，界面上也会有提示，不会让人误以为是确认过的重复文件。
+/// 按"潜在可省空间"（size × (count-1)）从大到小排序，最值得关注的排前面。
+pub fn build_duplicate_tree(root: &Node, root_path: &str) -> Node {
     use std::collections::HashMap;
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut paths: Vec<String> = Vec::new();
-
+    let mut groups: HashMap<u64, Vec<Node>> = HashMap::new();
     let mut stack: Vec<(&Node, String)> = vec![(root, root_path.trim_end_matches('\\').to_string())];
     while let Some((cur, path)) = stack.pop() {
         match cur.kind {
             NodeKind::File => {
                 if cur.logical_size > 0 {
-                    // 0 字节文件到处都是、内容比对没有意义（全都一样），跳过，
-                    // 避免候选列表被一堆空文件淹没。
-                    let idx = nodes.len();
-                    // `.with_full_path(path.clone())` 记住真实磁盘路径——合成树里的
-                    // 节点是克隆出来的，不再挂在原来的目录结构里，右键菜单的
-                    // "打开所在文件夹"/"复制路径"/删除/属性 全靠这个字段才知道
-                    // 真实位置在哪。
-                    nodes.push(cur.clone().with_full_path(path.clone()));
-                    paths.push(path);
-                    by_size.entry(cur.logical_size).or_default().push(idx);
+                    // 0 字节文件到处都是、比较没有意义，跳过，避免候选列表被一堆空文件淹没
+                    let leaf = cur.clone().with_full_path(path.clone());
+                    groups.entry(cur.logical_size).or_default().push(leaf);
                 }
             }
             NodeKind::Folder => {
@@ -112,79 +101,20 @@ fn collect_duplicate_candidates(root: &Node, root_path: &str) -> (Vec<Node>, Vec
             }
         }
     }
-
-    let size_groups: Vec<(u64, Vec<usize>)> = by_size.into_iter().filter(|(_, idxs)| idxs.len() >= 2).collect();
-    (nodes, paths, size_groups)
-}
-
-/// 后台线程算重复文件期间/算完之后回传给 UI 线程的消息。`Progress` 里的
-/// `done`/`total` 见 `dedup::find_duplicates` 的说明——`total` 只统计了
-/// header 预筛阶段的文件数，`done` 有可能略微超过它（全文件确认阶段是在
-/// 子集上再跑一遍，也会计入 `done`），UI 展示进度条时应该夹一下
-/// （`done.min(total)`），避免看起来"超过 100%"。
-pub enum DuplicateMessage {
-    Progress { done: u64, total: u64 },
-    Done(Box<Node>),
-}
-
-/// 打开"重复文件查找"标签页的入口。分两段：
-///   1. 在调用方线程（通常是 UI 线程）上同步跑 `collect_duplicate_candidates`——
-///      只是内存里走一遍树，不碰磁盘，很快，不会让界面卡顿。
-///   2. 真正耗时的哈希比对扔进一个新开的后台线程，通过 `tx` 汇报进度、最后
-///      把算好的树回传——调用方（`app.rs`）拿到 `tx` 对应的 `Receiver` 之后
-///      每帧 `try_recv()` 一下就行，界面全程可以正常交互，不会被卡住。
-pub fn spawn_duplicate_scan(root: &Node, root_path: &str, tx: std::sync::mpsc::Sender<DuplicateMessage>) {
-    let (nodes, paths, size_groups) = collect_duplicate_candidates(root, root_path);
-    let total_candidates: usize = size_groups.iter().map(|(_, idxs)| idxs.len()).sum();
-
-    std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        let tx_progress = tx.clone();
-        let on_progress = move |done: u64, total: u64| {
-            let _ = tx_progress.send(DuplicateMessage::Progress { done, total });
-        };
-        let groups = crate::dedup::find_duplicates(&paths, size_groups, &on_progress);
-
-        // 之前这里会把每一组的 sha256/大小/文件数/路径都拼成一行、`log_batch`
-        // 一次性落盘，是为了方便用 PowerShell 的 `Get-FileHash -Algorithm SHA256`
-        // 之类的工具独立核对结果——但实测这一步本身就是"进度条已经走到 100%、
-        // 界面却还在卡住不动"的真正原因：确认阶段之后如果还剩下几千甚至上万个
-        // 分组，每组的路径列表拼接（`files_desc.join(" | ")`、`format!`）全部
-        // 堆在一起做，是这段时间里唯一还在跑但完全不出现在进度条里的工作，
-        // 看起来就像"卡死了"。先整个去掉，不在日志里逐组打印路径了。
-        // TODO(以后想验证算法/看具体是哪些文件的时候)：更好的位置是在 UI 的
-        // 重复文件列表里加一列"SHA-256"直接展示（`DuplicateGroup.sha256_hex`
-        // 已经带着这个值，`categorize.rs` 建 Node 树的时候可以想办法把它带
-        // 到节点上，比如借用 `Node.owner: String` 这个字段，或者给 `Node`
-        // 单独加一个字段），可以直接在界面上复制/核对，比翻几万行日志文件
-        // 好用得多，也不会有这里这种"日志本身拖慢程序"的问题。
-        let wasted_total: u64 = groups.iter().map(|g| g.size * (g.file_indices.len() as u64 - 1)).sum();
-        crate::applog::log(&format!(
-            "[dedup] 完成: 候选 {total_candidates} 个文件 → 确认 {} 组疑似重复，预计可省 {}，耗时 {:.1}s",
-            groups.len(), crate::format::human_size(wasted_total), started.elapsed().as_secs_f32(),
-        ));
-
-        // 组好展示用的 Node 树，按"潜在可省空间"从大到小排序，最值得关注的排前面。
-        let mut pairs: Vec<(u64, Node)> = groups
-            .into_iter()
-            .map(|g| {
-                let wasted = g.size * (g.file_indices.len() as u64 - 1);
-                let count = g.file_indices.len();
-                let group_files: Vec<Node> = g.file_indices.iter().map(|&i| nodes[i].clone()).collect();
-                let name = format!(
-                    "{} × {count} 个文件（SHA-256 确认，可省 {}）",
-                    crate::format::human_size(g.size), crate::format::human_size(wasted),
-                );
-                (wasted, Node::new_folder_with_meta(name, GROUP_COLOR, group_files, 0, 0, 0, 0x10, 0, false, String::new()))
-            })
-            .collect();
-        pairs.sort_by(|a, b| b.0.cmp(&a.0));
-        let dup_folders: Vec<Node> = pairs.into_iter().map(|(_, n)| n).collect();
-        let tree = Node::new_folder_with_meta(
-            "疑似重复文件（大小 + 内容哈希确认）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new(),
-        );
-        let _ = tx.send(DuplicateMessage::Done(Box::new(tree)));
-    });
+    let mut pairs: Vec<(u64, Node)> = groups.into_iter()
+        .filter(|(_, files)| files.len() >= 2)
+        .map(|(size, files)| {
+            let wasted = size * (files.len() as u64 - 1);
+            let count = files.len();
+            let name = format!(
+                "{} × {count} 个文件（候选，可省 {}）",
+                crate::format::human_size(size), crate::format::human_size(wasted),
+            );
+            (wasted, Node::new_folder_with_meta(name, GROUP_COLOR, files, 0, 0, 0, 0x10, 0, false, String::new()))
+        }).collect();
+    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+    let dup_folders: Vec<Node> = pairs.into_iter().map(|(_, n)| n).collect();
+    Node::new_folder_with_meta("候选重复文件（按大小分组）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new())
 }
 
 const GROUP_COLOR: Color32 = Color32::from_rgb(0xF5, 0xA6, 0x23);
