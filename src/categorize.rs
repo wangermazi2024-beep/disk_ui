@@ -160,8 +160,9 @@ pub fn spawn_duplicate_scan(root: &Node, root_path: &str, tx: std::sync::mpsc::S
         if let Some(first) = groups.first() {
             if let Some(&first_file_idx) = first.file_indices.first() {
                 crate::applog::log(&format!(
-                    "[dedup] 示例（仅记第 1 组第 1 个文件，其余不再逐条记录）: hash={} size={} 路径={}",
-                    first.hash_hex, first.size, paths[first_file_idx],
+                    "[dedup] 示例（仅记第 1 组第 1 个文件，其余不再逐条记录，逐字节比较确认一致，不是靠哈希碰巧相同）: hash={} size={} 路径={}",
+                    first.hash_hex.as_deref().unwrap_or("(文件较大，未缓存，无哈希——判定依据是逐字节比较，不影响结果的确定性)"),
+                    first.size, paths[first_file_idx],
                 ));
             }
         }
@@ -180,7 +181,7 @@ pub fn spawn_duplicate_scan(root: &Node, root_path: &str, tx: std::sync::mpsc::S
                 let count = g.file_indices.len();
                 let group_files: Vec<Node> = g.file_indices.iter().map(|&i| nodes[i].clone()).collect();
                 let name = format!(
-                    "{} × {count} 个文件（哈希确认，可省 {}）",
+                    "{} × {count} 个文件（逐字节确认一致，可省 {}）",
                     crate::format::human_size(g.size), crate::format::human_size(wasted),
                 );
                 (wasted, Node::new_folder_with_meta(name, GROUP_COLOR, group_files, 0, 0, 0, 0x10, 0, false, String::new()))
@@ -189,7 +190,7 @@ pub fn spawn_duplicate_scan(root: &Node, root_path: &str, tx: std::sync::mpsc::S
         pairs.sort_by(|a, b| b.0.cmp(&a.0));
         let dup_folders: Vec<Node> = pairs.into_iter().map(|(_, n)| n).collect();
         let tree = Node::new_folder_with_meta(
-            "疑似重复文件（大小 + 内容哈希确认）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new(),
+            "重复文件（逐字节确认，可放心用于符号链接/去重）".to_string(), GROUP_COLOR, dup_folders, 0, 0, 0, 0x10, 0, false, String::new(),
         );
         let _ = tx.send(DuplicateMessage::Done(Box::new(tree)));
     });
