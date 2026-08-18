@@ -111,6 +111,11 @@ pub struct DiskUiApp {
     /// 一个 `Vec` 是因为可能同时有好几个分区的比对在并行跑（用户开了多个
     /// 重复文件标签页）；每帧在 `poll_duplicate_scan` 里收一遍。
     duplicate_rx: Vec<(usize, Receiver<categorize::DuplicateMessage>)>,
+
+    /// 真正在后台线程执行"删除到回收站"（含占用重试）期间，保留一份
+    /// `PendingDelete`（等结果回来了还要用它去更新树）+ 结果通道。
+    /// 只会同时有一个在跑——确认框是模态的，没删完之前弹不出第二个。
+    delete_rx: Option<(PendingDelete, Receiver<Result<(), String>>)>,
 }
 
 impl Default for DiskUiApp {
@@ -135,6 +140,7 @@ impl Default for DiskUiApp {
             list_state: tree_list::ListState::default(),
             pending_delete: None,
             duplicate_rx: Vec::new(),
+            delete_rx: None,
         }
     }
 }
@@ -144,6 +150,7 @@ impl eframe::App for DiskUiApp {
         ui.ctx().set_visuals(egui::Visuals::dark());
         self.poll_scan();
         self.poll_duplicate_scan();
+        self.poll_delete();
 
         self.show_main_screen(ui);
         if self.picker.is_some() {
@@ -158,7 +165,7 @@ impl eframe::App for DiskUiApp {
         // （通常 60Hz）重绘，不管界面有没有变化都要重新布局一遍，是 egui 官方
         // GitHub 讨论区里明确点出来的"不必要 CPU 占用"反模式，鼠标移动/点击/
         // 菜单展开这些交互 egui 自己就会触发重绘，不需要每帧手动催一次。
-        if self.scanning || !self.duplicate_rx.is_empty() {
+        if self.scanning || !self.duplicate_rx.is_empty() || self.delete_rx.is_some() {
             ui.ctx().request_repaint();
         }
     }
@@ -548,9 +555,33 @@ impl DiskUiApp {
         }
     }
 
+    /// 用户在确认框里点了"删除到回收站"：真正的删除（含占用重试，最多可能
+    /// 要等接近 2 秒——见 `file_ops::delete_to_recycle_bin_with_retry`）挪到
+    /// 后台线程做，不在 UI 线程上等，弹窗立刻关掉，界面照常能操作；结果通过
+    /// `delete_rx` 在 `poll_delete` 里收。
     fn execute_pending_delete(&mut self) {
         let Some(pending) = self.pending_delete.take() else { return };
-        match crate::file_ops::delete_to_recycle_bin(&pending.full_path) {
+        let full_path = pending.full_path.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::file_ops::delete_to_recycle_bin_with_retry(&full_path));
+        });
+        self.delete_rx = Some((pending, rx));
+    }
+
+    /// 每帧调用：收后台删除线程的结果。
+    fn poll_delete(&mut self) {
+        let Some((_, rx)) = &self.delete_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return, // 还没删完，下一帧再看
+            // 发送端断开却没收到消息，理论上只会是后台线程 panic 了——正常
+            // 逻辑下 `delete_to_recycle_bin_with_retry` 总会返回一个
+            // Ok/Err，不会出现"什么都不发就跑没了"，这里兜个底不留僵尸记录。
+            Err(mpsc::TryRecvError::Disconnected) => Err("删除线程异常退出".to_string()),
+        };
+        let (pending, _) = self.delete_rx.take().unwrap();
+        match result {
             Ok(()) => {
                 match pending.source {
                     DeleteSource::Main => {
@@ -574,9 +605,8 @@ impl DiskUiApp {
                     }
                     DeleteSource::Tab(tab_idx) => {
                         // 同样的道理，只是摘的是这个标签页自己的合成树，不是 self.partitions。
-                        // 如果这时候标签页已经不在了、或者被切换成了别的类型（用户在弹窗
-                        // 打开期间关掉了那个标签页——理论上够不着，因为确认框是模态的，
-                        // 但防御一下总没坏处），就什么都不做，不去动任何数据。
+                        // 如果这时候标签页已经不在了、或者被切换成了别的类型（用户在删除
+                        // 期间关掉了那个标签页），就什么都不做，不去动任何数据。
                         let Some(tab) = self.tabs.get_mut(tab_idx) else { return };
                         let (root, selected, view) = match tab {
                             Tab::Extensions { root, selected, view, .. } | Tab::Duplicates { root, selected, view, .. } => (root, selected, view),
@@ -592,6 +622,9 @@ impl DiskUiApp {
                 self.scan_error = Some(format!("已删除到回收站: {}", pending.name));
             }
             Err(e) => {
+                // `delete_to_recycle_bin_with_retry` 失败之后已经尝试查过占用
+                // 进程、把结果拼进了错误信息里（见 file_ops.rs），这里直接
+                // 展示，不用再单独查一遍。
                 self.scan_error = Some(format!("删除失败 ({}): {e}", pending.name));
             }
         }

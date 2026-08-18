@@ -41,6 +41,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    # 检测"文件/文件夹被哪个进程占用"用的是 Windows 官方的 Restart Manager
+    # API（资源管理器"文件正在使用"弹窗、Windows Installer 更新前检测占用，
+    # 用的都是同一套 API），见 file_ops.rs 顶部注释。
+    "Win32_System_RestartManager",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
