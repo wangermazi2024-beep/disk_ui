@@ -17,6 +17,10 @@ pub enum TreeAction {
     /// 带上名称/完整路径/是否文件夹，是因为确认框要展示这些信息，而 app.rs
     /// 侧不方便（也没必要）重新从 abs_path 沿树走一遍去拿。
     RequestDelete { abs_path: NodePath, name: String, full_path: String, is_folder: bool },
+    /// 右键菜单点了"检测占用"：查一下这个文件/文件夹当前有没有被别的进程/
+    /// 服务占用。这是纯只读查询（不会像删除那样需要弹确认框），app.rs 收到
+    /// 之后直接查、弹一个结果窗口。
+    RequestCheckLock { abs_path: NodePath, name: String, full_path: String, is_folder: bool },
 }
 
 /// 主列表（tree_list）可排序的字段。父占比/总占比两列本质上和逻辑大小同序

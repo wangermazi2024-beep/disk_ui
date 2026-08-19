@@ -209,6 +209,17 @@ impl Node {
         }
     }
 
+    /// 沿 `path` 找到目标节点，只读、不修改树。用于"检测占用"这种需要先拿到
+    /// 节点（比如文件夹要递归收集子孙文件路径）再去做别的事情的场景——和
+    /// `remove_at_path` 是同一套下标语义，但这个不消耗/修改节点。
+    pub fn get_at_path(&self, path: &[usize]) -> Option<&Node> {
+        let mut cur = self;
+        for &i in path {
+            cur = cur.children.get(i)?;
+        }
+        Some(cur)
+    }
+
     /// 沿 `path` 找到目标节点并从其父节点的 `children` 里移除，同时把它的体积/
     /// 文件数/文件夹数从沿途所有祖先节点的聚合统计里减掉（`file_count`/`folder_count`/
     /// `logical_size`/`physical_size` 都是"整棵子树的合计"，删掉一个节点必须让

@@ -192,7 +192,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                 let clicked_row: Cell<Option<usize>> = Cell::new(None);
                 // 右键菜单点"删除到回收站"时用来把请求带出这层闭包，道理和 tree_list.rs
                 // 里的同名 Cell 一样。
-                let delete_request: Cell<Option<TreeAction>> = Cell::new(None);
+                let action_request: Cell<Option<TreeAction>> = Cell::new(None);
                 body.rows(ROW_H, flat_rows.len(), |mut row| {
                     let row_idx = row.index();
                     let fr = &flat_rows[row_idx];
@@ -246,7 +246,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                         }
                         p.text(Pos2::new(text_x, rect.center().y), egui::Align2::LEFT_CENTER, format!("{icon} {}", n.name), egui::FontId::proportional(13.0), tc);
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &delete_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &action_request)); }
                     });
                     // 大小
                     row.col(|ui| {
@@ -254,7 +254,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                         ui.painter().text(rect.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER,
                             human_size(n.logical_size), egui::FontId::proportional(12.0), Color32::from_rgb(0xD0, 0xD0, 0xD0));
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &delete_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &action_request)); }
                     });
                     // 修改时间
                     row.col(|ui| {
@@ -264,7 +264,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                                 format_filetime_local(n.modified_ft), egui::FontId::proportional(11.0), Color32::from_rgb(0xC0, 0xC0, 0xC0));
                         }
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &delete_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &action_request)); }
                     });
                     // 路径（只有真实文件才有意义，分组行留空）
                     row.col(|ui| {
@@ -275,7 +275,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                                 dir, egui::FontId::proportional(11.5), Color32::from_rgb(0xA0, 0xA0, 0xA0));
                         }
                         handle_click(&resp);
-                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &delete_request)); }
+                        if !is_group { resp.context_menu(|ui| context_menu(ui, &n.name, &full_path, &fr.abs_path, &action_request)); }
                     });
                 });
                 if let Some(idx) = clicked_row.get() {
@@ -288,7 +288,7 @@ pub fn show(ui: &mut egui::Ui, root: &Node, selected: &Option<NodePath>, view: &
                 }
                 // 删除请求优先于普通行点击——道理和 tree_list.rs 一样，正常情况下
                 // 二者不会同时触发，这里只是兜底。
-                if let Some(action) = delete_request.into_inner() {
+                if let Some(action) = action_request.into_inner() {
                     action_cell.set(action);
                 }
             });
@@ -344,7 +344,7 @@ fn open_in_explorer_select(path: &str) {
 #[cfg(not(windows))]
 fn open_in_explorer_select(_path: &str) {}
 
-fn context_menu(ui: &mut egui::Ui, name: &str, full_path: &str, abs_path: &NodePath, delete_request: &Cell<Option<TreeAction>>) {
+fn context_menu(ui: &mut egui::Ui, name: &str, full_path: &str, abs_path: &NodePath, action_request: &Cell<Option<TreeAction>>) {
     ui.set_min_width(180.0);
     if ui.button("📂 打开所在文件夹").clicked() {
         open_in_explorer_select(full_path);
@@ -363,9 +363,19 @@ fn context_menu(ui: &mut egui::Ui, name: &str, full_path: &str, abs_path: &NodeP
         crate::file_ops::open_properties(full_path);
         ui.close();
     }
-    // 这里列出来的都是真实文件（分组行不会调这个菜单），所以 is_folder 恒为 false。
+    // 这里列出来的都是真实文件，不是文件夹（分组行不会调这个菜单），所以
+    // 下面两个按钮的 is_folder 都恒为 false。
+    if ui.button("🔍 检测占用").clicked() {
+        action_request.set(Some(TreeAction::RequestCheckLock {
+            abs_path: abs_path.clone(),
+            name: name.to_string(),
+            full_path: full_path.to_string(),
+            is_folder: false,
+        }));
+        ui.close();
+    }
     if ui.add(egui::Button::new(egui::RichText::new("🗑 删除到回收站").color(Color32::from_rgb(0xE0, 0x60, 0x60)))).clicked() {
-        delete_request.set(Some(TreeAction::RequestDelete {
+        action_request.set(Some(TreeAction::RequestDelete {
             abs_path: abs_path.clone(),
             name: name.to_string(),
             full_path: full_path.to_string(),

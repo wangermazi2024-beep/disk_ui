@@ -13,7 +13,7 @@ use egui::{Color32, RichText};
 use crate::categorize;
 use crate::disk_info::{self, DiskInfo};
 use crate::export;
-use crate::model::{CategoryStat, Node, NodePath};
+use crate::model::{CategoryStat, Node, NodeKind, NodePath};
 use crate::scan::{self, ScanMessage};
 use crate::ui::topbar::{self, TopbarAction, TopbarState};
 use crate::ui::{sidebar, startup, tree_list, TreeAction};
@@ -68,6 +68,40 @@ enum DeleteSource {
     Tab(usize),
 }
 
+/// "检测占用"的结果，`show_lock_check_modal` 展示它、有值就弹窗，`None` 就
+/// 不弹——和 `pending_delete` 是同一套"有 Some 就弹窗"的模式。
+struct LockCheckResult {
+    name: String,
+    is_folder: bool,
+    /// 实际检查了多少个路径（文件本身是 1；文件夹是"它自己 + 收集到的子孙
+    /// 文件数"，受 `LOCK_CHECK_LIMIT` 限制，不一定等于文件夹里的真实文件总数）。
+    checked_count: usize,
+    /// 文件夹里的文件数超过了检查上限，只查了前面一部分——结果窗口要如实
+    /// 告诉用户"没查全"，不能让人误以为"查过了、没事"就真的没事。
+    truncated: bool,
+    procs: Vec<crate::file_ops::LockingProcess>,
+    error: Option<String>,
+}
+
+/// 从某个节点开始（文件直接算它自己，文件夹递归算它和所有子孙），收集用于
+/// "检测占用"的完整路径列表，最多收集 `limit` 个——复用的是已经扫描好、存在
+/// 内存里的树数据，不用重新走一遍文件系统，收集这一步本身很快。
+fn collect_paths_for_lock_check(node: &Node, base_path: &str, limit: usize, out: &mut Vec<String>) {
+    if out.len() >= limit {
+        return;
+    }
+    out.push(base_path.to_string());
+    if node.kind == NodeKind::Folder {
+        for child in &node.children {
+            if out.len() >= limit {
+                return;
+            }
+            let child_path = format!("{base_path}\\{}", child.name);
+            collect_paths_for_lock_check(child, &child_path, limit, out);
+        }
+    }
+}
+
 pub struct DiskUiApp {
     partitions: Vec<Node>,
     partition_infos: Vec<Option<DiskInfo>>,
@@ -116,6 +150,9 @@ pub struct DiskUiApp {
     /// `PendingDelete`（等结果回来了还要用它去更新树）+ 结果通道。
     /// 只会同时有一个在跑——确认框是模态的，没删完之前弹不出第二个。
     delete_rx: Option<(PendingDelete, Receiver<Result<(), String>>)>,
+
+    /// 右键菜单"检测占用"的结果，`Some` 就弹窗展示，见 `show_lock_check_modal`。
+    lock_check_result: Option<LockCheckResult>,
 }
 
 impl Default for DiskUiApp {
@@ -141,6 +178,7 @@ impl Default for DiskUiApp {
             pending_delete: None,
             duplicate_rx: Vec::new(),
             delete_rx: None,
+            lock_check_result: None,
         }
     }
 }
@@ -158,6 +196,9 @@ impl eframe::App for DiskUiApp {
         }
         if self.pending_delete.is_some() {
             self.show_delete_confirm_modal(ui.ctx());
+        }
+        if self.lock_check_result.is_some() {
+            self.show_lock_check_modal(ui.ctx());
         }
 
         // 扫描中：进度数字和转圈动画要持续刷新，这时候需要强制重绘。
@@ -513,6 +554,109 @@ impl DiskUiApp {
                 let source = if is_view_tab { DeleteSource::Tab(tab_idx) } else { DeleteSource::Main };
                 self.pending_delete = Some(PendingDelete { source, abs_path, name, full_path, is_folder });
             }
+            TreeAction::RequestCheckLock { abs_path, name, full_path, is_folder } => {
+                self.run_lock_check(tab_idx, is_view_tab, abs_path, name, full_path, is_folder);
+            }
+        }
+    }
+
+    /// "检测占用"：文件直接查它自己；文件夹的话，把它自己 + 子孙文件的路径都
+    /// 收集起来一起查（复用已经扫描好的树数据，不用重新走一遍文件系统）——
+    /// 一次性把一批路径都交给 Restart Manager 查，比一个个查快得多。文件夹
+    /// 太大的话有个数量上限（见 `LOCK_CHECK_LIMIT`），不然一次塞几十万个路径
+    /// 给 Restart Manager 既没必要也可能很慢；超过上限会在结果里提示"只查了
+    /// 前 N 个"，不会假装查了全部。
+    ///
+    /// 这是个同步调用（不像扫描/重复文件查找那样起后台线程）——单个文件的
+    /// 查询很快，加了数量上限之后文件夹的查询也不会等太久，作为一次性的
+    /// "手动点一下看看"的诊断功能，可以接受这点等待；如果以后发现大文件夹
+    /// 查起来确实明显卡顿，再挪到后台线程也不迟。
+    fn run_lock_check(&mut self, tab_idx: usize, is_view_tab: bool, abs_path: NodePath, name: String, full_path: String, is_folder: bool) {
+        const LOCK_CHECK_LIMIT: usize = 2000;
+        let mut paths: Vec<String> = Vec::new();
+        if is_folder {
+            let node = if is_view_tab {
+                self.tabs.get(tab_idx).and_then(|t| match t {
+                    Tab::Extensions { root, .. } | Tab::Duplicates { root, .. } => root.get_at_path(&abs_path[1..]),
+                    Tab::Main => None,
+                })
+            } else {
+                abs_path.first().and_then(|&pi| self.partitions.get(pi)).and_then(|p| p.get_at_path(&abs_path[1..]))
+            };
+            match node {
+                Some(node) => collect_paths_for_lock_check(node, &full_path, LOCK_CHECK_LIMIT, &mut paths),
+                // 树上找不到这个节点了（比如查询之间被删掉了），退化成只查
+                // 文件夹本身这一个路径，好歹给个结果，不要什么都不做。
+                None => paths.push(full_path.clone()),
+            }
+        } else {
+            paths.push(full_path.clone());
+        }
+
+        let truncated = paths.len() >= LOCK_CHECK_LIMIT;
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let (procs, error) = match crate::file_ops::find_locking_processes(&refs) {
+            Ok(procs) => (procs, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        self.lock_check_result = Some(LockCheckResult { name, is_folder, checked_count: paths.len(), truncated, procs, error });
+    }
+
+    /// "检测占用"的结果窗口。
+    fn show_lock_check_modal(&mut self, ctx: &egui::Context) {
+        let Some(result) = &self.lock_check_result else { return };
+        let mut close = false;
+        egui::Window::new("检测占用")
+            .id(egui::Id::new("lock_check_modal"))
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                let kind = if result.is_folder { "文件夹" } else { "文件" };
+                ui.label(format!("{kind}："));
+                ui.label(egui::RichText::new(&result.name).strong());
+                if result.is_folder {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(format!(
+                        "已检查这个文件夹自己 + 里面 {} 个文件/子文件夹{}",
+                        result.checked_count.saturating_sub(1),
+                        if result.truncated { "（超过上限，只查了前面一部分，不代表后面的一定没被占用）" } else { "" },
+                    )).small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                if let Some(e) = &result.error {
+                    ui.colored_label(Color32::from_rgb(0xE0, 0x60, 0x60), format!("检测失败：{e}"));
+                } else if result.procs.is_empty() {
+                    ui.colored_label(Color32::from_rgb(0x34, 0xC7, 0x59), "✓ 没有检测到占用，可以放心操作。");
+                } else {
+                    ui.colored_label(Color32::from_rgb(0xF5, 0xA6, 0x23), format!("⚠ 检测到 {} 个进程/服务正在占用：", result.procs.len()));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for p in &result.procs {
+                            ui.horizontal(|ui| {
+                                ui.label("•");
+                                ui.label(egui::RichText::new(&p.app_name).strong());
+                                ui.label(format!("(PID {})", p.pid));
+                                if let Some(svc) = &p.service_name {
+                                    ui.label(egui::RichText::new(format!("服务: {svc}")).small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+                                }
+                            });
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("关掉上面这些程序/服务之后再试一次删除/迁移操作。")
+                        .small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("关闭").clicked() { close = true; }
+                });
+            });
+        if close {
+            self.lock_check_result = None;
         }
     }
 

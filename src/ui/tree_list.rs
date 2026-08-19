@@ -262,9 +262,10 @@ pub fn show(
                 // ── 用 heterogeneous_rows 做虚拟化渲染 ──
                 let heights: Vec<f32> = flat_rows.iter().map(|r| r.height).collect();
                 let clicked_row: Cell<usize> = Cell::new(usize::MAX);
-                // 右键菜单点"删除到回收站"时，通过这个 Cell 把请求带出 body 闭包
-                // （菜单是嵌在 row.col 更深一层的闭包里画的，够不着外层的 final_action）。
-                let delete_request: Cell<Option<TreeAction>> = Cell::new(None);
+                // 右键菜单点"删除到回收站"/"检测占用"这类需要直接产出 TreeAction
+                // 的操作时，通过这个 Cell 把请求带出 body 闭包（菜单是嵌在 row.col
+                // 更深一层的闭包里画的，够不着外层的 final_action）。
+                let action_request: Cell<Option<TreeAction>> = Cell::new(None);
 
                 body.heterogeneous_rows(heights.into_iter(), |mut row| {
                     let row_idx = row.index();
@@ -373,34 +374,34 @@ pub fn show(
                                 }
                                 p.text(Pos2::new(text_x,rect.center().y),egui::Align2::LEFT_CENTER,format!("{icon} {}",c.name),egui::FontId::proportional(13.0),tc);
                                 if resp.clicked() || resp.secondary_clicked() {clicked_row.set(row_idx);}
-                                resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request));
+                                resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request));
                             });
                             // 父占比
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }draw_bar(ui.painter(),r,pct,bar_color);if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }draw_bar(ui.painter(),r,pct,bar_color);if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 总占比
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }draw_bar(ui.painter(),r,total_pct,Color32::from_rgb(0x4C,0x8B,0xF5));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }draw_bar(ui.painter(),r,total_pct,Color32::from_rgb(0x4C,0x8B,0xF5));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 逻辑大小
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.logical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0x4C,0x8B,0xF5));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.logical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0x4C,0x8B,0xF5));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 修改时间
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.modified_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.modified_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 物理大小
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.physical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0xF5,0xA6,0x23));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,human_size(c.physical_size),egui::FontId::proportional(11.0),Color32::from_rgb(0xF5,0xA6,0x23));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 创建时间
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.created_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.created_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 访问时间
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.accessed_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let s=format_filetime(c.accessed_ft);ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,if s.is_empty(){"—".into()}else{s},egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 项目/文件/文件夹
                             for val in [if is_folder{c.file_count+c.folder_count}else{0}, if is_folder{c.file_count}else{0}, if is_folder{c.folder_count}else{0}] {
-                                row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if is_folder{format!("{}",val)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                                row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if is_folder{format!("{}",val)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             }
                             // 属性
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format_attributes(c.attributes),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,format_attributes(c.attributes),egui::FontId::proportional(11.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 重解析点
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.reparse_tag!=0{format!("0x{:X}",c.reparse_tag)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.reparse_tag!=0{format!("0x{:X}",c.reparse_tag)}else{"—".into()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 保留
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.is_reserved{"是"}else{"—"};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.is_reserved{"是"}else{"—"};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                             // 所有者
-                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.owner.is_empty(){"—".into()}else{c.owner.clone()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &delete_request)); });
+                            row.col(|ui|{let r=ui.available_rect_before_wrap();let resp=ui.allocate_rect(r,Sense::click()); if is_selected { ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x4C,0x8B,0xF5,0x40)); }let t=if c.owner.is_empty(){"—".into()}else{c.owner.clone()};ui.painter().text(r.center(),egui::Align2::CENTER_CENTER,t,egui::FontId::proportional(10.0),Color32::from_rgb(0xC0,0xC0,0xC0));if resp.clicked()||resp.secondary_clicked(){clicked_row.set(row_idx);} resp.context_menu(|ui| context_menu(ui, is_folder, &c.name, &full_path, abs_path, &action_request)); });
                         }
                     }
                 });
@@ -426,8 +427,8 @@ pub fn show(
                 }
                 let _ = &mut final_action;
                 // 删除请求优先：正常行点击（左键选中/右键仅弹出菜单）不会同时设置
-                // delete_request，两者不会真的抢——这里只是给"万一"兜个底。
-                if let Some(action) = delete_request.into_inner() {
+                // action_request，两者不会真的抢——这里只是给"万一"兜个底。
+                if let Some(action) = action_request.into_inner() {
                     final_action = action;
                 }
                 action_cell.set(final_action);
@@ -508,7 +509,7 @@ fn open_in_explorer(_path: &str, _select_self: bool) {}
 /// 文件/文件夹右键菜单。
 fn context_menu(
     ui: &mut egui::Ui, is_folder: bool, name: &str, full_path: &str,
-    abs_path: &NodePath, delete_request: &Cell<Option<TreeAction>>,
+    abs_path: &NodePath, action_request: &Cell<Option<TreeAction>>,
 ) {
     ui.set_min_width(180.0);
     let open_label = if is_folder { "📂 在资源管理器中打开" } else { "📂 打开所在文件夹" };
@@ -530,6 +531,19 @@ fn context_menu(
         crate::file_ops::open_properties(full_path);
         ui.close();
     }
+    // "检测占用"也是纯只读查询，不用二次确认，直接发请求出去；app.rs 收到
+    // 之后去查 Restart Manager、弹一个结果窗口（不在这里等结果——查询本身
+    // 走的是 Win32 API 调用，交给 app.rs 统一处理，跟"删除"共用同一条
+    // action_request 通道）。
+    if ui.button("🔍 检测占用").clicked() {
+        action_request.set(Some(TreeAction::RequestCheckLock {
+            abs_path: abs_path.clone(),
+            name: name.to_string(),
+            full_path: full_path.to_string(),
+            is_folder,
+        }));
+        ui.close();
+    }
     // 去重/迁移到其他盘：尚未实现，先占个位置。只用符号链接一种机制（硬链接/
     // junction 权衡后特意排除，理由见 file_ops.rs 顶部那段大注释）——按钮先
     // 摆在这，免得以后要改右键菜单的排版。
@@ -540,7 +554,7 @@ fn context_menu(
     // app.rs 会弹一个确认框——回收站虽然能找回，但"点错就没了"这种事故
     // 不该一次点击就直接生效。
     if ui.add(egui::Button::new(egui::RichText::new("🗑 删除到回收站").color(Color32::from_rgb(0xE0, 0x60, 0x60)))).clicked() {
-        delete_request.set(Some(TreeAction::RequestDelete {
+        action_request.set(Some(TreeAction::RequestDelete {
             abs_path: abs_path.clone(),
             name: name.to_string(),
             full_path: full_path.to_string(),
