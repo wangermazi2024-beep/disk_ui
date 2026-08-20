@@ -394,3 +394,105 @@ pub fn delete_to_recycle_bin_with_retry(path: &str) -> Result<(), String> {
         _ => Err(last_err), // 查不到占用进程（可能不是"占用"导致的失败，是别的原因），保留原始错误信息
     }
 }
+
+// ============================================================================
+// 结束占用进程 / 停止占用服务
+// ============================================================================
+//
+// "检测占用"查出来结果之后，光告诉用户"被谁占用"还不够方便——新手用户看到
+// 一个进程名/服务名，未必知道该怎么去关掉它（服务尤其是，很多人不知道
+// 服务管理器在哪）。这里加两个"一键处理"的操作，查完直接能点，处理完就
+// 能回去继续删除/创建符号链接，不用中途切出去开任务管理器/服务管理器。
+//
+// 两个操作都是有一定风险的（结束进程可能导致未保存的工作丢失；停止服务
+// 可能影响系统其它依赖这个服务的功能），调用方（UI 层）必须在真正调用前
+// 给用户一个明确的二次确认，不能做成"点了列表里的按钮就立刻执行"——这两个
+// 函数本身只管"执行"，确认逻辑是 UI 层的责任。
+
+/// 结束一个进程（`TerminateProcess`，相当于任务管理器里的"结束任务"——
+/// 是强制终止，不会给进程留时间做清理/保存工作，这也是为什么调用前必须
+/// 让用户明确确认）。
+#[cfg(windows)]
+pub fn terminate_process(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    if pid == 0 {
+        return Err("无效的 PID".to_string());
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            return Err(format!("打开进程失败（错误码 {err}，常见原因是权限不够——试试以管理员身份运行）"));
+        }
+        let ok = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+        if ok == 0 {
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            return Err(format!("结束进程失败（错误码 {err}）"));
+        }
+    }
+    crate::applog::log(&format!("[file_ops] 已结束进程 PID {pid}"));
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn terminate_process(_pid: u32) -> Result<(), String> {
+    Err("仅支持 Windows".to_string())
+}
+
+/// 停止一个 Windows 服务（`ControlService` + `SERVICE_CONTROL_STOP`，相当于
+/// 服务管理器里右键"停止"）。`service_name` 要用服务的短名字（`sc query`/
+/// 服务属性里的"服务名称"，不是显示名称）——`find_locking_processes` 返回的
+/// `LockingProcess.service_name` 就是这个格式，直接传进来就行。
+///
+/// 只发停止请求、不等待/轮询服务真正停下来——`ControlService` 本身是异步的
+/// （发出请求后服务需要时间处理），调用方如果需要"确认已经停了"，应该稍等
+/// 一下再重新调用"检测占用"验证，而不是指望这个函数返回时服务已经停妥。
+#[cfg(windows)]
+pub fn stop_service(service_name: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_CONTROL_STOP, SERVICE_STATUS, SERVICE_STOP,
+    };
+
+    if service_name.is_empty() {
+        return Err("服务名为空".to_string());
+    }
+    let name_wide: Vec<u16> = std::ffi::OsStr::new(service_name).encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            return Err(format!("打开服务控制管理器失败（错误码 {err}，常见原因是权限不够——试试以管理员身份运行）"));
+        }
+        let svc = OpenServiceW(scm, name_wide.as_ptr(), SERVICE_STOP);
+        if svc.is_null() {
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            CloseServiceHandle(scm);
+            return Err(format!("打开服务失败（错误码 {err}）"));
+        }
+        let mut status: SERVICE_STATUS = std::mem::zeroed();
+        let ok = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        if ok == 0 {
+            let err = windows_sys::Win32::Foundation::GetLastError();
+            // 1051 = ERROR_DEPENDENT_SERVICES_RUNNING：有别的服务依赖这个服务，
+            // 得先停依赖它的服务——这个场景给个专门的提示，比甩一个错误码有用。
+            if err == 1051 {
+                return Err("有其它服务依赖这个服务，需要先停掉那些服务（可以打开系统自带的\"服务\"管理器，找到这个服务，在\"依存关系\"标签页里看依赖它的服务有哪些）".to_string());
+            }
+            return Err(format!("停止服务失败（错误码 {err}）"));
+        }
+    }
+    crate::applog::log(&format!("[file_ops] 已发送停止请求给服务: {service_name}"));
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn stop_service(_service_name: &str) -> Result<(), String> {
+    Err("仅支持 Windows".to_string())
+}

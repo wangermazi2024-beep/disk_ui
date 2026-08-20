@@ -45,6 +45,9 @@ windows-sys = { version = "0.59", features = [
     # API（资源管理器"文件正在使用"弹窗、Windows Installer 更新前检测占用，
     # 用的都是同一套 API），见 file_ops.rs 顶部注释。
     "Win32_System_RestartManager",
+    # "结束进程"用 Win32_System_Threading 里的 OpenProcess/TerminateProcess
+    # （已经在下面列了）；"停止服务"需要单独的服务控制管理器 API。
+    "Win32_System_Services",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

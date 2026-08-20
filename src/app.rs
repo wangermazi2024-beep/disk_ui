@@ -71,33 +71,68 @@ enum DeleteSource {
 /// "检测占用"的结果，`show_lock_check_modal` 展示它、有值就弹窗，`None` 就
 /// 不弹——和 `pending_delete` 是同一套"有 Some 就弹窗"的模式。
 struct LockCheckResult {
+    /// 重新检测要用到的原始请求参数——点了"结束进程"/"停止服务"之后自动
+    /// 重新查一遍，好让用户立刻看到"是不是已经解除占用了"，不用自己再手动
+    /// 右键点一次"检测占用"。
+    request: LockCheckRequest,
     name: String,
     is_folder: bool,
-    /// 实际检查了多少个路径（文件本身是 1；文件夹是"它自己 + 收集到的子孙
-    /// 文件数"，受 `LOCK_CHECK_LIMIT` 限制，不一定等于文件夹里的真实文件总数）。
+    /// 实际检查了多少个路径（文件本身是 1；文件夹是收集到的子孙文件数，
+    /// 受 `LOCK_CHECK_LIMIT` 限制，不一定等于文件夹里的真实文件总数）。
     checked_count: usize,
     /// 文件夹里的文件数超过了检查上限，只查了前面一部分——结果窗口要如实
     /// 告诉用户"没查全"，不能让人误以为"查过了、没事"就真的没事。
     truncated: bool,
     procs: Vec<crate::file_ops::LockingProcess>,
     error: Option<String>,
+    /// 点了"结束进程"/"停止服务"之后，操作本身的结果提示（成功/失败），
+    /// 展示在结果列表上方，和"重新检测出来的最新占用列表"分开——操作反馈
+    /// 和查询结果是两回事，操作即使失败了，下面的列表也应该是刷新过的。
+    action_feedback: Option<String>,
+}
+
+/// 触发一次"检测占用"需要的全部上下文，`execute_pending_delete`/首次检测/
+/// 结束进程或服务后的自动刷新，都是同一份逻辑（`run_lock_check`）在跑，
+/// 存这么一份方便重复调用，不用每次都重新拆一遍 `TreeAction`。
+#[derive(Clone)]
+struct LockCheckRequest {
+    tab_idx: usize,
+    is_view_tab: bool,
+    abs_path: NodePath,
+    name: String,
+    full_path: String,
+    is_folder: bool,
 }
 
 /// 从某个节点开始（文件直接算它自己，文件夹递归算它和所有子孙），收集用于
 /// "检测占用"的完整路径列表，最多收集 `limit` 个——复用的是已经扫描好、存在
 /// 内存里的树数据，不用重新走一遍文件系统，收集这一步本身很快。
+/// 从某个节点开始收集用于"检测占用"的完整路径列表，最多收集 `limit` 个。
+///
+/// **只收集文件路径，不收集文件夹路径本身**——查过资料才发现 Restart
+/// Manager 压根不支持检测目录本身的占用：给它一个不带反斜杠结尾的目录路径，
+/// `RmGetList` 会直接返回 `ERROR_ACCESS_DENIED`（错误码 5，这个错误码甚至
+/// 不在官方文档列出的 `RmGetList` 错误码里）；带反斜杠结尾的话又只会返回
+/// 空列表，查了但什么都查不到——不管哪种，都拿不到"这个文件夹本身被谁占用"
+/// 这个问题的真实答案，这就是之前测试文件夹会失败的根因。所以这里只把
+/// 文件夹里的**文件**收集起来去查，文件夹本身完全不参与查询；如果一个
+/// 文件夹递归下来一个文件都没有（空文件夹，或者全是子文件夹但没有文件），
+/// 调用方要能识别这种情况、给用户一个说得清楚的提示，而不是硬查一个空
+/// 列表/ 硬查文件夹本身然后报一个看不懂的错误码 5。
 fn collect_paths_for_lock_check(node: &Node, base_path: &str, limit: usize, out: &mut Vec<String>) {
     if out.len() >= limit {
         return;
     }
-    out.push(base_path.to_string());
-    if node.kind == NodeKind::Folder {
-        for child in &node.children {
-            if out.len() >= limit {
-                return;
+    match node.kind {
+        NodeKind::File => out.push(base_path.to_string()),
+        NodeKind::Folder => {
+            for child in &node.children {
+                if out.len() >= limit {
+                    return;
+                }
+                let child_path = format!("{base_path}\\{}", child.name);
+                collect_paths_for_lock_check(child, &child_path, limit, out);
             }
-            let child_path = format!("{base_path}\\{}", child.name);
-            collect_paths_for_lock_check(child, &child_path, limit, out);
         }
     }
 }
@@ -555,42 +590,61 @@ impl DiskUiApp {
                 self.pending_delete = Some(PendingDelete { source, abs_path, name, full_path, is_folder });
             }
             TreeAction::RequestCheckLock { abs_path, name, full_path, is_folder } => {
-                self.run_lock_check(tab_idx, is_view_tab, abs_path, name, full_path, is_folder);
+                let request = LockCheckRequest { tab_idx, is_view_tab, abs_path, name, full_path, is_folder };
+                self.run_lock_check(request);
             }
         }
     }
 
-    /// "检测占用"：文件直接查它自己；文件夹的话，把它自己 + 子孙文件的路径都
-    /// 收集起来一起查（复用已经扫描好的树数据，不用重新走一遍文件系统）——
-    /// 一次性把一批路径都交给 Restart Manager 查，比一个个查快得多。文件夹
-    /// 太大的话有个数量上限（见 `LOCK_CHECK_LIMIT`），不然一次塞几十万个路径
-    /// 给 Restart Manager 既没必要也可能很慢；超过上限会在结果里提示"只查了
-    /// 前 N 个"，不会假装查了全部。
+    /// "检测占用"：文件直接查它自己；文件夹的话，把它包含的所有文件路径都
+    /// 收集起来一起查（复用已经扫描好的树数据，不用重新走一遍文件系统，
+    /// 也不查文件夹路径本身——见 `collect_paths_for_lock_check` 上的说明，
+    /// Restart Manager 根本不支持那么查）。一次性把一批路径都交给 Restart
+    /// Manager 查，比一个个查快得多。文件夹太大的话有个数量上限（见
+    /// `LOCK_CHECK_LIMIT`），超过上限会在结果里提示"只查了前面一部分"。
     ///
-    /// 这是个同步调用（不像扫描/重复文件查找那样起后台线程）——单个文件的
-    /// 查询很快，加了数量上限之后文件夹的查询也不会等太久，作为一次性的
-    /// "手动点一下看看"的诊断功能，可以接受这点等待；如果以后发现大文件夹
-    /// 查起来确实明显卡顿，再挪到后台线程也不迟。
-    fn run_lock_check(&mut self, tab_idx: usize, is_view_tab: bool, abs_path: NodePath, name: String, full_path: String, is_folder: bool) {
+    /// 同步调用（不像扫描/重复文件查找那样起后台线程）——单个文件的查询
+    /// 很快，加了数量上限之后文件夹的查询也不会等太久，作为"手动点一下
+    /// 看看"或者"结束进程后自动刷新一次"的诊断功能，可以接受这点等待。
+    fn run_lock_check(&mut self, request: LockCheckRequest) {
         const LOCK_CHECK_LIMIT: usize = 2000;
+        let is_folder = request.is_folder;
         let mut paths: Vec<String> = Vec::new();
         if is_folder {
-            let node = if is_view_tab {
-                self.tabs.get(tab_idx).and_then(|t| match t {
-                    Tab::Extensions { root, .. } | Tab::Duplicates { root, .. } => root.get_at_path(&abs_path[1..]),
+            let node = if request.is_view_tab {
+                self.tabs.get(request.tab_idx).and_then(|t| match t {
+                    Tab::Extensions { root, .. } | Tab::Duplicates { root, .. } => root.get_at_path(&request.abs_path[1..]),
                     Tab::Main => None,
                 })
             } else {
-                abs_path.first().and_then(|&pi| self.partitions.get(pi)).and_then(|p| p.get_at_path(&abs_path[1..]))
+                request.abs_path.first().and_then(|&pi| self.partitions.get(pi)).and_then(|p| p.get_at_path(&request.abs_path[1..]))
             };
-            match node {
-                Some(node) => collect_paths_for_lock_check(node, &full_path, LOCK_CHECK_LIMIT, &mut paths),
-                // 树上找不到这个节点了（比如查询之间被删掉了），退化成只查
-                // 文件夹本身这一个路径，好歹给个结果，不要什么都不做。
-                None => paths.push(full_path.clone()),
+            if let Some(node) = node {
+                collect_paths_for_lock_check(node, &request.full_path, LOCK_CHECK_LIMIT, &mut paths);
             }
+            // 树上找不到这个节点了（比如查询之间被删掉了）就什么都不做，`paths`
+            // 保持空——不能退化成"查文件夹路径本身"，Restart Manager 根本不支持
+            // 这么查（见 `collect_paths_for_lock_check` 上的说明），硬查只会
+            // 重新触发那个错误码 5 的老问题。
         } else {
-            paths.push(full_path.clone());
+            paths.push(request.full_path.clone());
+        }
+
+        // 文件夹递归下来一个文件都没有：不是"没有占用"，是压根没法查（空文件夹，
+        // 或者全是子文件夹但没有文件——Restart Manager 不支持直接检测目录本身）。
+        // 这种情况不调用 Win32 API，直接给一个说得清楚的提示，不要给"查过了、
+        // 没事"这种误导性的结论。
+        if paths.is_empty() {
+            let name = request.name.clone();
+            self.lock_check_result = Some(LockCheckResult {
+                request, name, is_folder, checked_count: 0, truncated: false, procs: Vec::new(), action_feedback: None,
+                error: if is_folder {
+                    Some("这个文件夹不含文件（是空文件夹，或者里面全是空的子文件夹），无法用这种方式检测占用——Windows 的检测机制本身就不支持直接查\"文件夹本身\"有没有被占用，只能查具体文件。如果这个文件夹删不掉/移动不了，很可能是有程序把它当作当前正在浏览/使用的目录（比如资源管理器地址栏正停在这里、或者某个程序的\"打开\"对话框正显示着这个目录），试着关闭那些窗口再试。".to_string())
+                } else {
+                    None
+                },
+            });
+            return;
         }
 
         let truncated = paths.len() >= LOCK_CHECK_LIMIT;
@@ -599,30 +653,84 @@ impl DiskUiApp {
             Ok(procs) => (procs, None),
             Err(e) => (Vec::new(), Some(e)),
         };
-        self.lock_check_result = Some(LockCheckResult { name, is_folder, checked_count: paths.len(), truncated, procs, error });
+        let name = request.name.clone();
+        let checked_count = paths.len();
+        self.lock_check_result = Some(LockCheckResult { request, name, is_folder, checked_count, truncated, procs, error, action_feedback: None });
+    }
+
+    /// 结果窗口里点了"结束进程"：直接执行（这个功能本来就是主打"一键处理完
+    /// 占用就能继续删除/创建符号链接"，按钮上已经明确写着进程名和 PID，
+    /// 没有再加一层二次确认弹窗——见 `show_lock_check_modal` 里的取舍说明）。
+    /// 执行完不管成功失败都会自动重新检测一次，让用户立刻看到最新状态，
+    /// 不用自己再点一次"检测占用"。
+    fn lock_check_terminate_process(&mut self, pid: u32) {
+        let feedback = match crate::file_ops::terminate_process(pid) {
+            Ok(()) => format!("已结束进程 PID {pid}。"),
+            Err(e) => format!("结束进程失败：{e}"),
+        };
+        self.refresh_lock_check(Some(feedback));
+    }
+
+    /// 结果窗口里点了"停止服务"：道理和结束进程一样，直接执行 + 执行后自动刷新。
+    fn lock_check_stop_service(&mut self, service_name: String) {
+        let feedback = match crate::file_ops::stop_service(&service_name) {
+            Ok(()) => format!("已发送停止请求给服务 {service_name}（服务真正停下来可能要几秒，如果刷新后还在列表里，稍等一下再检测一次）。"),
+            Err(e) => format!("停止服务失败：{e}"),
+        };
+        self.refresh_lock_check(Some(feedback));
+    }
+
+    /// 用上一次的请求参数重新跑一遍"检测占用"，`feedback` 是这次刷新之前
+    /// 那个操作（结束进程/停止服务）的结果提示，跑完之后会带到新的结果里
+    /// 继续展示——不然重新检测一刷新，"刚才那个操作到底成没成功"这条反馈
+    /// 就没地方看了。
+    fn refresh_lock_check(&mut self, feedback: Option<String>) {
+        let Some(prev) = &self.lock_check_result else { return };
+        let request = prev.request.clone();
+        self.run_lock_check(request);
+        if let Some(result) = &mut self.lock_check_result {
+            result.action_feedback = feedback;
+        }
     }
 
     /// "检测占用"的结果窗口。
+    /// "检测占用"的结果窗口：简单列表 + 每行直接带"结束进程"/"停止服务"按钮，
+    /// 目标是新手也能一眼看懂、一键处理完就能回去继续删除/创建符号链接，
+    /// 不用先去弄明白"这个进程名对应哪个程序""服务管理器在哪"这些额外知识。
+    ///
+    /// 特意没有在点按钮之后再弹一层"确定要结束吗"的二次确认——按钮上已经
+    /// 完整写着"结束进程 XXX.exe（PID 1234）"，要结束的是谁清清楚楚摆在
+    /// 眼前，再加一层确认对着重"一键"体验的新手用户只是多一次点击、没有
+    /// 实质上更安全。真正的安全网是"直接、清楚地展示要操作的对象"本身。
     fn show_lock_check_modal(&mut self, ctx: &egui::Context) {
         let Some(result) = &self.lock_check_result else { return };
         let mut close = false;
+        let mut terminate_pid: Option<u32> = None;
+        let mut stop_service_name: Option<String> = None;
+        let mut refresh = false;
         egui::Window::new("检测占用")
             .id(egui::Id::new("lock_check_modal"))
             .collapsible(false)
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.set_min_width(380.0);
+                ui.set_min_width(420.0);
                 let kind = if result.is_folder { "文件夹" } else { "文件" };
-                ui.label(format!("{kind}："));
-                ui.label(egui::RichText::new(&result.name).strong());
-                if result.is_folder {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{kind}："));
+                    ui.label(egui::RichText::new(&result.name).strong());
+                });
+                if result.is_folder && result.error.is_none() {
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new(format!(
-                        "已检查这个文件夹自己 + 里面 {} 个文件/子文件夹{}",
-                        result.checked_count.saturating_sub(1),
+                        "已检查里面 {} 个文件{}",
+                        result.checked_count,
                         if result.truncated { "（超过上限，只查了前面一部分，不代表后面的一定没被占用）" } else { "" },
                     )).small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+                }
+                if let Some(fb) = &result.action_feedback {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(0x4C, 0x8B, 0xF5), fb);
                 }
                 ui.add_space(8.0);
                 ui.separator();
@@ -630,32 +738,57 @@ impl DiskUiApp {
                 if let Some(e) = &result.error {
                     ui.colored_label(Color32::from_rgb(0xE0, 0x60, 0x60), format!("检测失败：{e}"));
                 } else if result.procs.is_empty() {
-                    ui.colored_label(Color32::from_rgb(0x34, 0xC7, 0x59), "✓ 没有检测到占用，可以放心操作。");
+                    ui.colored_label(Color32::from_rgb(0x34, 0xC7, 0x59), "✓ 没有检测到占用，可以放心删除/创建符号链接了。");
                 } else {
-                    ui.colored_label(Color32::from_rgb(0xF5, 0xA6, 0x23), format!("⚠ 检测到 {} 个进程/服务正在占用：", result.procs.len()));
+                    ui.colored_label(Color32::from_rgb(0xF5, 0xA6, 0x23), format!("⚠ 检测到 {} 个进程/服务正在占用，处理完下面这些就能继续了：", result.procs.len()));
                     ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                         for p in &result.procs {
                             ui.horizontal(|ui| {
-                                ui.label("•");
-                                ui.label(egui::RichText::new(&p.app_name).strong());
-                                ui.label(format!("(PID {})", p.pid));
-                                if let Some(svc) = &p.service_name {
-                                    ui.label(egui::RichText::new(format!("服务: {svc}")).small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
-                                }
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(&p.app_name).strong());
+                                    let sub = match &p.service_name {
+                                        Some(svc) => format!("PID {} · 服务: {svc}", p.pid),
+                                        None => format!("PID {}", p.pid),
+                                    };
+                                    ui.label(egui::RichText::new(sub).small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    // 是服务的话优先给"停止服务"（更精确、只影响这一个服务，
+                                    // 不会像直接杀掉宿主进程那样可能牵连同一个 svchost.exe
+                                    // 进程里跑着的其它无关服务）；同时依然保留"结束进程"，
+                                    // 有些占用场景下停服务不一定能真正解除占用（比如占用的
+                                    // 其实是进程自己打开的句柄，不是服务本身的），两个选项
+                                    // 都给，让用户自己选。
+                                    if ui.add(egui::Button::new(egui::RichText::new("结束进程").color(Color32::WHITE))
+                                        .fill(Color32::from_rgb(0xC0, 0x40, 0x40))).clicked()
+                                    {
+                                        terminate_pid = Some(p.pid);
+                                    }
+                                    if let Some(svc) = &p.service_name {
+                                        if ui.button("停止服务").clicked() {
+                                            stop_service_name = Some(svc.clone());
+                                        }
+                                    }
+                                });
                             });
+                            ui.separator();
                         }
                     });
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("关掉上面这些程序/服务之后再试一次删除/迁移操作。")
-                        .small().color(Color32::from_rgb(0xA0, 0xA0, 0xA0)));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("关闭").clicked() { close = true; }
+                    if ui.button("🔄 重新检测").clicked() { refresh = true; }
                 });
             });
-        if close {
+        if let Some(pid) = terminate_pid {
+            self.lock_check_terminate_process(pid);
+        } else if let Some(svc) = stop_service_name {
+            self.lock_check_stop_service(svc);
+        } else if refresh {
+            self.refresh_lock_check(None);
+        } else if close {
             self.lock_check_result = None;
         }
     }
